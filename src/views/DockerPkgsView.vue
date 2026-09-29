@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog'
@@ -19,9 +19,12 @@ const loading = ref(false)
 const importArch = ref('amd64')
 const importing = ref(false)
 
-// 在线下载
+// 在线下载（版本从官方源拉取列表选择）
 const downloadArch = ref('amd64')
 const downloadVersion = ref('')
+const dockerVersions = ref<string[]>([])
+const versionsLoading = ref(false)
+const versionsError = ref('')
 const downloading = ref(false)
 const downloadLogs = ref<string[]>([])
 
@@ -29,6 +32,7 @@ let unlistenDownload: UnlistenFn | null = null
 let disposed = false
 
 onMounted(async () => {
+  loadDockerVersions(downloadArch.value)
   await refresh()
   try {
     const fn = await listen<DockerPkgDownloadEvent>('docker-pkg-download', (e) => {
@@ -45,6 +49,34 @@ onUnmounted(() => {
   disposed = true
   unlistenDownload?.()
 })
+
+// 切换架构自动刷新官方版本列表，默认选最新
+watch(downloadArch, (arch) => {
+  downloadVersion.value = ''
+  loadDockerVersions(arch)
+})
+
+async function loadDockerVersions(arch: string) {
+  if (!OFFICIAL_DOCKER_ARCHES.includes(arch)) {
+    dockerVersions.value = []
+    versionsError.value = ''
+    return
+  }
+  versionsLoading.value = true
+  versionsError.value = ''
+  try {
+    const list = await backend.listDockerVersions(arch)
+    dockerVersions.value = list
+    if (list.length && !downloadVersion.value) {
+      downloadVersion.value = list[0]
+    }
+  } catch (e) {
+    dockerVersions.value = []
+    versionsError.value = toAppError(e).message
+  } finally {
+    versionsLoading.value = false
+  }
+}
 
 async function refresh() {
   loading.value = true
@@ -206,7 +238,7 @@ const totalSize = computed(() => pkgs.value.reduce((s, p) => s + p.sizeBytes, 0)
           <h3 class="text-sm font-headline font-bold text-primary uppercase tracking-widest mb-3">
             在线下载（官方源）
           </h3>
-          <div class="flex gap-2 mb-2">
+          <div class="flex gap-2 mb-2 items-center">
             <el-select v-model="downloadArch" size="small" class="w-32">
               <el-option
                 v-for="a in OFFICIAL_DOCKER_ARCHES"
@@ -215,23 +247,39 @@ const totalSize = computed(() => pkgs.value.reduce((s, p) => s + p.sizeBytes, 0)
                 :label="a"
               />
             </el-select>
-            <el-input
+            <el-select
               v-model="downloadVersion"
               size="small"
-              placeholder="版本，如 27.5.1"
+              filterable
+              allow-create
+              default-first-option
+              :loading="versionsLoading"
+              placeholder="从官方源获取版本列表…"
               class="flex-1"
-              @keyup.enter="handleDownloadStatic"
-            />
+            >
+              <el-option v-for="v in dockerVersions" :key="v" :value="v" :label="v" />
+            </el-select>
             <button
               class="px-3 py-1 rounded-lg text-xs font-bold bg-gradient-to-br from-primary to-primary-dim text-on-primary hover:opacity-90 transition-all shrink-0"
-              :disabled="downloading"
+              :disabled="downloading || !downloadVersion"
               @click="handleDownloadStatic"
             >
               下载静态包
             </button>
           </div>
+          <div v-if="versionsError" class="text-xs text-error mb-1">
+            官方版本列表获取失败：{{ versionsError }}
+            <button
+              class="text-primary hover:underline ml-1"
+              @click="loadDockerVersions(downloadArch)"
+            >
+              重试
+            </button>
+            （可直接在版本框手动输入）
+          </div>
           <div class="text-[10px] text-on-surface-variant/50">
-            官方静态包适用所有 Linux 发行版；信创架构请从厂商源下载后本地导入
+            版本列表来自 download.docker.com 官方目录（默认最新版，可输入过滤或手输）；静态包适用所有
+            Linux 发行版；信创架构请从厂商源下载后本地导入
           </div>
         </div>
       </div>
