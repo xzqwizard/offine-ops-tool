@@ -1,65 +1,57 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { VueFlow, type Node, type Edge } from '@vue-flow/core'
+import { VueFlow, type Node, type Edge, type NodeProps } from '@vue-flow/core'
 import '@vue-flow/core/dist/style.css'
 import '@vue-flow/core/dist/theme-default.css'
 import { useProjectStore } from '@/stores/project'
 
 const store = useProjectStore()
 
+interface ServerNodeData {
+  name: string
+  arch: string
+  ip: string
+  instances: string
+  ports: string
+}
+
 const servers = computed(() => store.project?.servers ?? [])
 const rules = computed(() => store.project?.networkRules ?? [])
 
-const nodes = computed<Node[]>(() => {
+const nodes = computed<Node<ServerNodeData>[]>(() => {
   const perRow = 3
   return servers.value.map((s, i) => {
     const instances = store.project?.instances.filter((x) => x.serverId === s.id) ?? []
-    const exposed = instances
+    const ports = instances
       .flatMap((x) => x.ports.filter((p) => p.expose).map((p) => `${p.host}/${p.protocol}`))
       .join('  ')
-    const lines = [
-      `<b>${s.name}</b>`,
-      `<span style="opacity:.7;font-family:monospace;font-size:10px">${s.arch} · ${s.ip || '无IP'}</span>`,
-      instances.length
-        ? `<span style="font-size:10px;opacity:.8">${instances.map((x) => x.instanceName).join(' / ')}</span>`
-        : `<span style="font-size:10px;opacity:.4">（无实例）</span>`,
-      exposed ? `<span style="font-family:monospace;font-size:10px;opacity:.8">${exposed}</span>` : ''
-    ].filter(Boolean)
     return {
       id: s.id,
-      type: 'input',
-      position: { x: (i % perRow) * 260, y: Math.floor(i / perRow) * 200 },
-      data: { label: lines.join('<br/>') },
-      style: {
-        background: 'var(--t-surface-container)',
-        color: 'var(--t-on-surface)',
-        border: '1px solid var(--t-outline-variant)',
-        borderRadius: '12px',
-        padding: '10px 14px',
-        width: '220px',
-        fontSize: '12px',
-        textAlign: 'left'
+      type: 'server',
+      position: { x: (i % perRow) * 260, y: Math.floor(i / perRow) * 210 },
+      data: {
+        name: s.name,
+        arch: s.arch,
+        ip: s.ip || '无IP',
+        instances: instances.length
+          ? instances.map((x) => x.instanceName).join(' / ')
+          : '（无实例）',
+        ports
       }
-    } as Node
+    } as Node<ServerNodeData>
   })
 })
 
 const edges = computed<Edge[]>(() => {
-  // 同一对服务器聚合成一条边，标注端口列表
-  const grouped = new Map<string, { from: string; to: string; ports: Set<number>; desc: Set<string> }>()
+  // 同一对服务器聚合成一条边；自指规则（from==to）无拓扑意义，跳过
+  const grouped = new Map<string, { from: string; to: string; ports: Set<number> }>()
   for (const r of rules.value) {
+    if (r.fromServerId === r.toServerId) continue
     const key = `${r.fromServerId}->${r.toServerId}`
     if (!grouped.has(key)) {
-      grouped.set(key, {
-        from: r.fromServerId,
-        to: r.toServerId,
-        ports: new Set(),
-        desc: new Set()
-      })
+      grouped.set(key, { from: r.fromServerId, to: r.toServerId, ports: new Set() })
     }
-    const g = grouped.get(key)!
-    g.ports.add(r.toPort)
-    if (r.description) g.desc.add(r.description)
+    grouped.get(key)!.ports.add(r.toPort)
   }
   return Array.from(grouped.values()).map((g, i) => ({
     id: `e-${i}`,
@@ -72,6 +64,19 @@ const edges = computed<Edge[]>(() => {
     style: { stroke: 'var(--t-primary)', strokeWidth: 1.5 }
   })) as Edge[]
 })
+
+function nodeStyle(p: NodeProps<ServerNodeData>) {
+  return {
+    background: 'var(--t-surface-container)',
+    color: 'var(--t-on-surface)',
+    border: '1px solid var(--t-outline-variant)',
+    borderRadius: '12px',
+    padding: '10px 14px',
+    width: '220px',
+    fontSize: '12px',
+    textAlign: 'left' as const
+  }
+}
 </script>
 
 <template>
@@ -85,12 +90,13 @@ const edges = computed<Edge[]>(() => {
       :zoom-on-scroll="true"
       :pan-on-drag="true"
     >
-      <template #node-input="nodeProps">
-        <div
-          :style="(nodeProps as any).node.style"
-          class="vue-flow-node-custom"
-          v-html="(nodeProps as any).node.data.label"
-        />
+      <template #node-server="props">
+        <div :style="nodeStyle(props)" class="server-node">
+          <div class="font-bold">{{ props.data.name }}</div>
+          <div class="mono dim">{{ props.data.arch }} · {{ props.data.ip }}</div>
+          <div class="small">{{ props.data.instances }}</div>
+          <div v-if="props.data.ports" class="mono dim">{{ props.data.ports }}</div>
+        </div>
       </template>
     </VueFlow>
     <div v-else class="h-full flex items-center justify-center text-sm text-on-surface-variant">
@@ -100,16 +106,22 @@ const edges = computed<Edge[]>(() => {
 </template>
 
 <style scoped>
-.vue-flow-node-custom {
+.server-node {
   cursor: grab;
+}
+.server-node .mono {
+  font-family: 'Fira Code', Consolas, monospace;
+}
+.server-node .dim {
+  opacity: 0.7;
+}
+.server-node .small {
+  font-size: 10px;
 }
 :deep(.vue-flow__handle) {
   background: var(--t-primary);
   border: none;
   width: 6px;
   height: 6px;
-}
-:deep(.vue-flow__edge-path) {
-  stroke: var(--t-primary);
 }
 </style>

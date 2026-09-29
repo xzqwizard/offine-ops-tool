@@ -78,6 +78,8 @@ const tagsLoading = ref(false)
 const tagsLoaded = ref(false)
 const inspect = ref<ImageInspect | null>(null)
 const inspecting = ref(false)
+/** 编辑实例时保留原 digest（避免编辑一次就丢失已锁定的 sha256） */
+const editingDigest = ref('')
 
 async function loadOnlineTags() {
   if (!selectedTemplate.value) return
@@ -135,6 +137,13 @@ watch(
 function init() {
   keyword.value = ''
   category.value = '全部'
+  // 在线检查/在线 tag 状态必须随弹窗重置：残留的旧结论会用旧镜像的
+  // 架构检查结果阻断本次保存，旧 tag 列表会混入当前模板的版本下拉
+  inspect.value = null
+  inspecting.value = false
+  onlineTags.value = []
+  tagsLoaded.value = false
+  tagsLoading.value = false
   const editing = props.editingId
     ? store.project?.instances.find((i) => i.id === props.editingId)
     : null
@@ -150,6 +159,7 @@ function init() {
       Object.entries(editing.params).map(([k, v]) => [k, String(v ?? '')])
     )
     localImageTar.value = editing.localImageTar
+    editingDigest.value = editing.digest
   } else {
     formServerId.value = props.servers[0]?.id ?? ''
     mode.value = 'catalog'
@@ -160,6 +170,7 @@ function init() {
     params.value = {}
     localImageTar.value = ''
     customImage.value = ''
+    editingDigest.value = ''
   }
 }
 
@@ -264,7 +275,11 @@ function handleSave() {
     serverId: formServerId.value,
     templateId: mode.value === 'custom' ? 'custom' : selectedTemplate.value!.id,
     image,
-    digest: '',
+    // 编辑保留原 digest；在线检查成功且镜像未变时更新为查询到的 digest
+    digest:
+      inspect.value && inspect.value.source && currentReference.value === image
+        ? inspect.value.digest || editingDigest.value
+        : editingDigest.value,
     instanceName: instanceName.value.trim(),
     params: cleanParams,
     ports: JSON.parse(JSON.stringify(ports.value)),

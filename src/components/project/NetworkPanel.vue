@@ -108,6 +108,10 @@ async function handleSave() {
     ElMessage.warning('请选择来源与目标服务器')
     return
   }
+  if (f.fromServerId === f.toServerId) {
+    ElMessage.warning('来源与目标不能是同一台服务器（本机服务互访无需开通规则）')
+    return
+  }
   if (!f.toPort) {
     ElMessage.warning('请选择目标端口')
     return

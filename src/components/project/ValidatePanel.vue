@@ -9,6 +9,7 @@ import { ElMessage } from 'element-plus'
 const store = useProjectStore()
 const templates = ref<MiddlewareTemplate[]>([])
 const issues = ref<ValidationIssue[] | null>(null)
+const checkedRevision = ref(-1)
 const checking = ref(false)
 
 onMounted(async () => {
@@ -23,15 +24,14 @@ function runCheck() {
   checking.value = true
   try {
     issues.value = store.project ? validateProject(store.project, templates.value) : []
+    checkedRevision.value = store.revision
   } finally {
     checking.value = false
   }
 }
 
-// 数据变化后标记结果过期
-const stale = computed(
-  () => issues.value !== null && (store.project?.servers.length ?? -1) >= 0 && store.dirty
-)
+// 任何修改（防抖/commit 保存均会自增 revision）后提示结果过期
+const stale = computed(() => issues.value !== null && checkedRevision.value >= 0 && checkedRevision.value !== store.revision)
 
 const errors = computed(() => issues.value?.filter((i) => i.level === 'error') ?? [])
 const warnings = computed(() => issues.value?.filter((i) => i.level === 'warning') ?? [])

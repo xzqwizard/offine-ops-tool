@@ -18,19 +18,23 @@ const pulling = ref(false)
 const pullLogs = ref<string[]>([])
 
 let unlistenPull: UnlistenFn | null = null
+let disposed = false
 
 onMounted(async () => {
   await Promise.all([refreshEngine(), refreshCache()])
   try {
-    unlistenPull = await listen<ImagePullEvent>('image-pull', (e) => {
+    const fn = await listen<ImagePullEvent>('image-pull', (e) => {
       pullLogs.value.push(e.payload.detail)
     })
+    if (disposed) fn()
+    else unlistenPull = fn
   } catch {
     /* 非 Tauri 环境忽略 */
   }
 })
 
 onUnmounted(() => {
+  disposed = true
   unlistenPull?.()
 })
 

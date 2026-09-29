@@ -31,6 +31,7 @@ const testing = ref(false)
 const testItems = reactive<TestItem[]>([])
 const testProxyUsed = ref<string | null>(null)
 let unlistenNetTest: UnlistenFn | null = null
+let disposed = false
 
 function labelOf(target: string): string {
   if (target.includes('www.google.com')) return '代理通道（google.com）'
@@ -91,7 +92,7 @@ async function loadAll() {
 onMounted(async () => {
   await loadAll()
   try {
-    unlistenNetTest = await listen<NetTestEvent>('net-test', (e) => {
+    const fn = await listen<NetTestEvent>('net-test', (e) => {
       const { target, state, result } = e.payload
       const item = testItems.find((t) => t.label === labelOf(target))
       if (!item) return
@@ -103,12 +104,18 @@ onMounted(async () => {
         item.error = result.ok ? '' : result.error || '不可达'
       }
     })
+    // 竞态防护：await 期间组件可能已卸载，立即注销
+    if (disposed) fn()
+    else unlistenNetTest = fn
   } catch {
     /* 非 Tauri 环境忽略 */
   }
 })
 
-onUnmounted(() => unlistenNetTest?.())
+onUnmounted(() => {
+  disposed = true
+  unlistenNetTest?.()
+})
 
 async function handleSave() {
   if (!settings.value) return
@@ -145,11 +152,11 @@ async function runTest() {
   try {
     const report = await backend.testNetwork(snapshot)
     testProxyUsed.value = report.proxyUsed
-    // 事件丢失时以最终报告兜底刷新
+    // 事件丢失/乱序时以最终报告兜底刷新：仅跳过已有结论（ok/fail）的项，
+    // pending/running 项必须用报告结果覆盖，否则会永久卡在"等待中"
     for (const r of report.results) {
       const item = testItems.find((t) => t.label === labelOf(r.target))
-      if (item && item.state !== 'running') continue
-      if (item) {
+      if (item && item.state !== 'ok' && item.state !== 'fail') {
         item.state = r.ok ? 'ok' : 'fail'
         item.latencyMs = r.latencyMs
         item.error = r.ok ? '' : r.error || '不可达'

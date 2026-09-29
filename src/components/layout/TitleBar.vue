@@ -10,6 +10,7 @@ const appWindow = inTauri ? getCurrentWindow() : null
 
 const isMaximized = ref(false)
 let unlisten: (() => void) | null = null
+let disposed = false
 
 async function refreshMaxState() {
   if (!appWindow) return
@@ -24,13 +25,16 @@ onMounted(async () => {
   await refreshMaxState()
   if (!appWindow) return
   try {
-    unlisten = await appWindow.onResized(refreshMaxState)
+    const fn = await appWindow.onResized(refreshMaxState)
+    if (disposed) fn()
+    else unlisten = fn
   } catch {
     /* ignore */
   }
 })
 
 onUnmounted(() => {
+  disposed = true
   unlisten?.()
 })
 

@@ -66,6 +66,7 @@ function validateForm(): string | null {
   if (!f.name.trim()) return '服务器名称不能为空'
   if (!f.ip.trim()) return 'IP 地址不能为空（防火墙规则/端口矩阵依赖 IP 对应）'
   if (!IP_RE.test(f.ip.trim())) return `IP 格式不正确: ${f.ip}`
+  if (!f.dockerVersion.trim()) return 'Docker 版本不能为空（从官方列表选择或手动输入）'
   if (f.cpuCores <= 0) return 'CPU 核数需大于 0'
   if (f.memoryGb <= 0) return '内存需大于 0'
   // R1：同方案内名称 / 主机名 / IP 唯一
@@ -90,7 +91,8 @@ async function loadDockerVersions(arch: string) {
   try {
     const list = await backend.listDockerVersions(arch)
     dockerVersions.value = list
-    if (list.length && !list.includes(form.value.dockerVersion)) {
+    // 仅新增模式自动选最新版；编辑模式绝不静默覆盖用户已填版本
+    if (list.length && editingIndex.value < 0 && !form.value.dockerVersion) {
       form.value.dockerVersion = list[0]
     }
   } catch (e) {

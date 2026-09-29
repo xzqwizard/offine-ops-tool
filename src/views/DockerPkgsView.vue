@@ -26,19 +26,25 @@ const downloading = ref(false)
 const downloadLogs = ref<string[]>([])
 
 let unlistenDownload: UnlistenFn | null = null
+let disposed = false
 
 onMounted(async () => {
   await refresh()
   try {
-    unlistenDownload = await listen<DockerPkgDownloadEvent>('docker-pkg-download', (e) => {
+    const fn = await listen<DockerPkgDownloadEvent>('docker-pkg-download', (e) => {
       downloadLogs.value.push(`[${e.payload.step}] ${e.payload.detail}`)
     })
+    if (disposed) fn()
+    else unlistenDownload = fn
   } catch {
     /* 非 Tauri 环境忽略 */
   }
 })
 
-onUnmounted(() => unlistenDownload?.())
+onUnmounted(() => {
+  disposed = true
+  unlistenDownload?.()
+})
 
 async function refresh() {
   loading.value = true

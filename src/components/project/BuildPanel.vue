@@ -15,6 +15,7 @@ const building = ref(false)
 const logs = ref<string[]>([])
 const result = ref<BuildResult | null>(null)
 let unlisten: UnlistenFn | null = null
+let disposed = false
 
 onMounted(async () => {
   try {
@@ -29,10 +30,17 @@ onMounted(async () => {
     const icon =
       step === 'error' ? '✗' : step === 'done' ? '✓' : step === 'image' || step === 'package' ? '  ' : '→'
     logs.value.push(`${icon} ${detail}`)
-  }).then((fn) => (unlisten = fn))
+  }).then((fn) => {
+    // 竞态防护：await 期间组件可能已卸载，立即注销
+    if (disposed) fn()
+    else unlisten = fn
+  })
 })
 
-onUnmounted(() => unlisten?.())
+onUnmounted(() => {
+  disposed = true
+  unlisten?.()
+})
 
 const format = computed({
   get: () => store.project?.buildConfig.packageFormat ?? 'tar.gz',
@@ -111,7 +119,6 @@ async function copyOutputDir() {
           <div class="text-xs text-on-surface-variant mb-1.5">打包格式</div>
           <el-select v-model="format">
             <el-option value="tar.gz" label="tar.gz（推荐，保留权限）" />
-            <el-option value="tar" label="tar（仅归档不压缩）" />
             <el-option value="dir" label="dir（仅目录，不打包）" />
           </el-select>
         </div>
