@@ -7,6 +7,7 @@ import type {
   StorageInfo
 } from '@/types/project'
 import type { CatalogFile } from '@/types/catalog'
+import type { BuildResult } from '@/types/build'
 
 /**
  * 后端适配层：前端唯一的后端调用入口。
@@ -47,6 +48,10 @@ export const backend = {
 
   async listCatalog(): Promise<CatalogFile> {
     return invoke<CatalogFile>('list_catalog')
+  },
+
+  async buildOfflinePackage(project: Project): Promise<BuildResult> {
+    return invoke<BuildResult>('build_offline_package', { project })
   }
 }
 

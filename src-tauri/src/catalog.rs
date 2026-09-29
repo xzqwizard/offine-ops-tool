@@ -76,7 +76,12 @@ fn default_tcp() -> String {
 
 const PRESET: &str = include_str!("../../catalog/preset.json");
 
+/// 内置目录（builder 复用）
+pub fn preset() -> AppResult<CatalogFile> {
+    Ok(serde_json::from_str(PRESET)?)
+}
+
 #[tauri::command]
 pub fn list_catalog() -> AppResult<CatalogFile> {
-    Ok(serde_json::from_str(PRESET)?)
+    preset()
 }

@@ -1,0 +1,29 @@
+# ============================================================
+# Docker Compose 编排 - 由离线部署运维工具生成（勿手改）
+# 方案: {{ project_name }} | 服务器: {{ server.name }} ({{ server.arch }})
+# 构建: {{ build_id }} | 生成时间: {{ generated_at }}
+# 数据目录: ./data/<服务名>/ （相对本文件，位于 stack/ 下）
+# ============================================================
+name: {{ stack_name }}
+
+services:
+{% for inst in instances %}
+  {{ inst.instance_name }}:
+    image: {{ inst.image }}
+    container_name: {{ inst.instance_name }}
+    restart: unless-stopped
+{% if inst.ports %}
+    ports:
+{% for p in inst.ports %}{% if p.expose %}      - "{{ p.host }}:{{ p.container }}"
+{% endif %}{% endfor %}{% endif %}
+{% if inst.env %}
+    environment:
+{% for k, v in inst.env %}      {{ k }}: "{{ v }}"
+{% endfor %}{% endif %}
+    volumes:
+      - ./data/{{ inst.instance_name }}:{{ inst.data_volume }}
+{% if inst.mem_limit_mb %}
+    mem_limit: {{ inst.mem_limit_mb }}m
+{% endif %}
+
+{% endfor %}

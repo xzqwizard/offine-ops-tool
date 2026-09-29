@@ -1,0 +1,69 @@
+# 部署指引 - {{ project_name }} / {{ server.name }}
+
+> 本文档由离线部署运维工具于 {{ generated_at }} 自动生成（构建 {{ build_id }}），
+> 与包内配置强一致；手工修改编排后请同步更新。
+
+## 1. 本机部署内容
+
+| 项 | 值 |
+|---|---|
+| CPU 架构 | {{ server.arch }}（`uname -m` 应为 {{ uname_arch }}） |
+| 操作系统 | {{ server.os_family }} {{ server.os_version }} |
+| Docker 目标版本 | {{ server.docker_version }} |
+| Docker 数据目录 | {{ server.docker_data_root }} |
+| 部署目录 | {{ server.deploy_base_dir }}（建议将本包解压至该目录） |
+| 服务清单 | {{ services_csv }} |
+
+## 2. 部署步骤
+
+```bash
+# 0) 摆渡校验：确认包完整（可选，防介质损坏/篡改）
+sha256sum -c SHA256SUMS
+
+# 1) 解压到部署目录（示例）
+sudo mkdir -p {{ server.deploy_base_dir }}
+sudo tar -xzf {{ dir_name }}.tar.gz -C {{ server.deploy_base_dir }}
+cd {{ server.deploy_base_dir }}/{{ dir_name }}
+
+# 2) 环境预检（可独立先跑，输出 ✅/⚠️/❌ 报告）
+bash scripts/precheck.sh
+
+# 3) 一键部署（预检 → 装 Docker → 导镜像 → 起服务 → 健康检查）
+bash scripts/deploy.sh
+
+# 4) 验证
+bash scripts/ops.sh status
+docker compose -f stack/docker-compose.yml ps
+```
+
+> U 盘提示：镜像 tar 常超过 4GB，请使用 exFAT/NTFS 格式介质，勿用 FAT32。
+
+## 3. 日常运维
+
+```bash
+bash scripts/ops.sh            # 交互菜单
+bash scripts/ops.sh status     # 服务总览
+bash scripts/ops.sh logs mysql --tail 200 -f
+bash scripts/ops.sh restart redis
+bash scripts/ops.sh doctor     # 全面诊断
+bash scripts/ops.sh backup     # 数据卷备份
+```
+
+详见 `docs/OPS-GUIDE.md`（常用指令与故障排查）与 `docs/PORT-MATRIX.md`（端口开通）。
+
+## 4. 目录结构
+
+```text
+{{ dir_name }}/
+├── manifest.json        # 本包清单（镜像/端口/实例摘要）
+├── SHA256SUMS           # 完整性校验
+├── README.md            # 本文档
+├── docker-offline/      # Docker 离线安装材料（如已配置）
+├── images/              # 镜像 tar（docker save 格式）
+├── stack/
+│   ├── docker-compose.yml
+│   └── data/<服务名>/   # 运行后产生的数据（备份重点）
+├── scripts/             # deploy.sh / ops.sh / precheck.sh / apply-firewall.sh
+├── firewall/
+└── docs/                # OPS-GUIDE.md / PORT-MATRIX.md
+```

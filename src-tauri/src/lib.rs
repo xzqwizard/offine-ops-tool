@@ -1,3 +1,4 @@
+mod builder;
 mod catalog;
 mod commands;
 mod error;
@@ -17,6 +18,7 @@ pub fn run() {
             commands::save_settings,
             commands::get_storage_info,
             catalog::list_catalog,
+            builder::build_offline_package,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,0 +1,660 @@
+use crate::catalog;
+use crate::error::{AppError, AppResult};
+use crate::models::*;
+use crate::store;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use minijinja::Environment;
+use serde::Serialize;
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use tauri::{AppHandle, Emitter};
+
+// ==================== 构建结果 ====================
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildImageInfo {
+    pub reference: String,
+    pub file: String,
+    pub sha256: Option<String>,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildServerResult {
+    pub name: String,
+    pub arch: String,
+    pub dir_name: String,
+    pub package_file: Option<String>,
+    pub size_bytes: u64,
+    pub images: Vec<BuildImageInfo>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildResult {
+    pub build_id: String,
+    pub output_dir: String,
+    pub generated_at: String,
+    pub servers: Vec<BuildServerResult>,
+    pub warnings: Vec<String>,
+}
+
+// ==================== 模板注册 ====================
+
+const TEMPLATES: &[(&str, &str)] = &[
+    (
+        "scripts/precheck.sh.j2",
+        include_str!("../../engine-templates/scripts/precheck.sh.j2"),
+    ),
+    (
+        "scripts/deploy.sh.j2",
+        include_str!("../../engine-templates/scripts/deploy.sh.j2"),
+    ),
+    (
+        "scripts/ops.sh.j2",
+        include_str!("../../engine-templates/scripts/ops.sh.j2"),
+    ),
+    (
+        "scripts/apply-firewall.sh.j2",
+        include_str!("../../engine-templates/scripts/apply-firewall.sh.j2"),
+    ),
+    (
+        "install/install-docker.sh.j2",
+        include_str!("../../engine-templates/install/install-docker.sh.j2"),
+    ),
+    (
+        "compose/docker-compose.yml.j2",
+        include_str!("../../engine-templates/compose/docker-compose.yml.j2"),
+    ),
+    (
+        "docs/README.md.j2",
+        include_str!("../../engine-templates/docs/README.md.j2"),
+    ),
+    (
+        "docs/OPS-GUIDE.md.j2",
+        include_str!("../../engine-templates/docs/OPS-GUIDE.md.j2"),
+    ),
+    (
+        "docs/PORT-MATRIX.md.j2",
+        include_str!("../../engine-templates/docs/PORT-MATRIX.md.j2"),
+    ),
+];
+
+fn template_env() -> AppResult<Environment<'static>> {
+    let mut env = Environment::new();
+    for (name, src) in TEMPLATES {
+        env.add_template(name, src)
+            .map_err(|e| AppError::Serialize(format!("模板 {name} 解析失败: {e}")))?;
+    }
+    Ok(env)
+}
+
+fn render(env: &Environment<'_>, name: &str, ctx: &serde_json::Value) -> AppResult<String> {
+    let tpl = env
+        .get_template(name)
+        .map_err(|e| AppError::Serialize(format!("模板 {name} 缺失: {e}")))?;
+    tpl.render(ctx)
+        .map_err(|e| AppError::Serialize(format!("模板 {name} 渲染失败: {e}")))
+}
+
+// ==================== 工具函数 ====================
+
+/// 名称转文件/目录安全的片段
+fn sanitize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.trim().chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c)
+        } else {
+            out.push('-')
+        }
+    }
+    let t = out.trim_matches('-').to_string();
+    if t.is_empty() {
+        "unnamed".into()
+    } else {
+        t
+    }
+}
+
+fn sha256_file(path: &Path) -> AppResult<String> {
+    let mut f = BufReader::new(File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = fs::read_dir(path) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                total += dir_size(&p);
+            } else if let Ok(md) = e.metadata() {
+                total += md.len();
+            }
+        }
+    }
+    total
+}
+
+/// 递归计算目录内全部文件 sha256，写 SHA256SUMS（相对路径）
+fn write_sha256_sums(dir: &Path) -> AppResult<()> {
+    let mut lines: Vec<String> = Vec::new();
+    collect_sums(dir, dir, &mut lines)?;
+    lines.sort();
+    let mut out = File::create(dir.join("SHA256SUMS"))?;
+    out.write_all(lines.join("\n").as_bytes())?;
+    out.write_all(b"\n")?;
+    Ok(())
+}
+
+fn collect_sums(root: &Path, dir: &Path, lines: &mut Vec<String>) -> AppResult<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let p = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "SHA256SUMS" {
+            continue;
+        }
+        if p.is_dir() {
+            collect_sums(root, &p, lines)?;
+        } else {
+            let rel = p
+                .strip_prefix(root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let sum = sha256_file(&p)?;
+            lines.push(format!("{sum}  {rel}"));
+        }
+    }
+    Ok(())
+}
+
+fn uname_of(arch: &str) -> &'static str {
+    match arch {
+        "amd64" => "x86_64",
+        "arm64" => "aarch64",
+        other => match other {
+            "loongarch64" => "loongarch64",
+            "mips64el" => "mips64el",
+            _ => "unknown",
+        },
+    }
+}
+
+/// 各中间件的逻辑备份提示（写入手册第 4 章）
+fn backup_hint(template_id: &str) -> &'static str {
+    match template_id {
+        "mysql-8.0" => {
+            "```bash\ndocker exec mysql sh -c 'mysqldump -uroot -p\"$MYSQL_ROOT_PASSWORD\" --single-transaction --all-databases' | gzip > backup/mysql-$(date +%F).sql.gz\n```"
+        }
+        "postgresql-16" => {
+            "```bash\ndocker exec pgsql sh -c 'pg_dumpall -U postgres' | gzip > backup/pgsql-$(date +%F).sql.gz\n```"
+        }
+        "redis-7" => {
+            "```bash\ndocker exec redis redis-cli -a \"$REDIS_PASSWORD\" BGSAVE\ncp stack/data/redis/dump.rdb backup/redis-$(date +%F).rdb\n```"
+        }
+        "mongodb-7" => {
+            "```bash\ndocker exec mongo sh -c 'mongodump --archive --gzip' > backup/mongo-$(date +%F).archive.gz\n```"
+        }
+        _ => "",
+    }
+}
+
+// ==================== 主流程 ====================
+
+#[tauri::command]
+pub fn build_offline_package(app: AppHandle, project: Project) -> AppResult<BuildResult> {
+    let r = build(&app, &project);
+    match &r {
+        Ok(res) => emit(&app, "done", &format!("构建完成: {}", res.build_id)),
+        Err(e) => emit(&app, "error", &e.to_string()),
+    }
+    r
+}
+
+fn emit(app: &AppHandle, step: &str, detail: &str) {
+    let _ = app.emit("build-progress", json!({ "step": step, "detail": detail }));
+}
+
+fn build(app: &AppHandle, project: &Project) -> AppResult<BuildResult> {
+    let now = store::now_rfc3339();
+    let build_id = format!("b-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
+    let catalog = catalog::preset()?;
+
+    let storage = store::effective_storage(app)?;
+    let out_root = PathBuf::from(&storage.artifact_root)
+        .join(sanitize(&project.name))
+        .join(&build_id);
+    fs::create_dir_all(&out_root)?;
+
+    let env = template_env()?;
+    let mut result = BuildResult {
+        build_id: build_id.clone(),
+        output_dir: out_root.to_string_lossy().into_owned(),
+        generated_at: now.clone(),
+        servers: Vec::new(),
+        warnings: Vec::new(),
+    };
+
+    emit(app, "start", &format!("开始构建 {}（{} 台服务器）", project.name, project.servers.len()));
+
+    if project.servers.is_empty() {
+        return Err(AppError::Invalid("方案中没有服务器，无法构建".into()));
+    }
+
+    for server in &project.servers {
+        emit(app, "server", &format!("处理服务器: {} ({})", server.name, server.arch));
+        let sr = build_server(app, project, server, &catalog, &env, &out_root, &build_id, &now)?;
+        result.warnings.extend(sr.warnings.clone());
+        result.servers.push(sr);
+    }
+
+    // ---- 全局端口矩阵 ----
+    let mut matrix = String::from("# 全网端口矩阵\n\n");
+    matrix.push_str(&format!("> 方案: {} | 构建: {} | 生成: {}\n\n", project.name, build_id, now));
+    for rule in &project.network_rules {
+        let from = project.servers.iter().find(|s| s.id == rule.from_server_id);
+        let to = project.servers.iter().find(|s| s.id == rule.to_server_id);
+        matrix.push_str(&format!(
+            "| {} | → | {}:{} | {} | {} |\n",
+            from.map(|s| s.name.as_str()).unwrap_or("?"),
+            to.map(|s| s.name.as_str()).unwrap_or("?"),
+            rule.to_port,
+            rule.protocol,
+            rule.description
+        ));
+    }
+    if project.network_rules.is_empty() {
+        matrix.push_str("（未定义跨服务器访问规则）\n");
+    }
+    fs::write(out_root.join("PORT-MATRIX.md"), &matrix)?;
+
+    // ---- 构建报告 ----
+    let mut report = String::from("# 构建报告\n\n");
+    report.push_str(&format!("- 方案: {}（{}）\n", project.name, project.customer));
+    report.push_str(&format!("- 构建: {}\n- 时间: {}\n", build_id, now));
+    report.push_str(&format!("- 输出目录: {}\n\n## 服务器产物\n\n", result.output_dir));
+    for s in &result.servers {
+        report.push_str(&format!(
+            "### {} ({})\n- 包: {}\n- 体积: {:.2} MB\n- 镜像: {} 个\n",
+            s.name,
+            s.arch,
+            s.package_file.as_deref().unwrap_or("（目录模式，未打包）"),
+            s.size_bytes as f64 / 1048576.0,
+            s.images.len()
+        ));
+        for w in &s.warnings {
+            report.push_str(&format!("- ⚠ {w}\n"));
+        }
+        report.push('\n');
+    }
+    if !result.warnings.is_empty() {
+        report.push_str("## 全局警告\n\n");
+        for w in &result.warnings {
+            report.push_str(&format!("- ⚠ {w}\n"));
+        }
+    }
+    fs::write(out_root.join("build-report.md"), &report)?;
+
+    emit(app, "done", &format!("产物输出: {}", result.output_dir));
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_server(
+    app: &AppHandle,
+    project: &Project,
+    server: &ServerInfo,
+    catalog: &catalog::CatalogFile,
+    env: &Environment<'_>,
+    out_root: &Path,
+    build_id: &str,
+    now: &str,
+) -> AppResult<BuildServerResult> {
+    let tpl_of = |id: &str| catalog.templates.iter().find(|t| t.id == id);
+    let dir_name = format!("{}_{}", sanitize(&server.name), server.arch);
+    let sdir = out_root.join(&dir_name);
+    for d in ["stack", "images", "scripts", "docker-offline/packages", "docs", "firewall", "logs"] {
+        fs::create_dir_all(sdir.join(d))?;
+    }
+
+    let instances: Vec<_> = project
+        .instances
+        .iter()
+        .filter(|i| i.server_id == server.id)
+        .collect();
+
+    // ---- 实例渲染上下文 ----
+    let inst_ctx: Vec<serde_json::Value> = instances
+        .iter()
+        .map(|inst| {
+            let tpl = tpl_of(&inst.template_id);
+            let env_map: BTreeMap<String, String> = inst
+                .params
+                .iter()
+                .map(|(k, v)| (k.clone(), value_to_plain_string(v)))
+                .collect();
+            let ports_csv = inst
+                .ports
+                .iter()
+                .map(|p| format!("{}→{}", p.host, p.container))
+                .collect::<Vec<_>>()
+                .join(",");
+            let data_volume = tpl
+                .and_then(|t| {
+                    if t.data_volume.is_empty() {
+                        None
+                    } else {
+                        Some(t.data_volume.clone())
+                    }
+                })
+                .unwrap_or_else(|| "/data".into());
+            let health_cmd: Option<Vec<String>> = tpl
+                .and_then(|t| t.health_check.as_ref())
+                .and_then(|h| {
+                    if h.r#type == "exec" && !h.cmd.is_empty() {
+                        Some(h.cmd.clone())
+                    } else {
+                        None
+                    }
+                });
+            json!({
+                "instance_name": inst.instance_name,
+                "image": inst.image,
+                "env": env_map,
+                "ports": inst.ports.iter().map(|p| json!({
+                    "host": p.host, "container": p.container,
+                    "protocol": p.protocol, "expose": p.expose
+                })).collect::<Vec<_>>(),
+                "data_volume": data_volume,
+                "health_cmd": health_cmd,
+                "ports_csv": ports_csv,
+                "backup_hint": backup_hint(&inst.template_id),
+                "min_memory_gb": tpl.map(|t| t.min_memory_gb).unwrap_or(0.5),
+            })
+        })
+        .collect();
+
+    let services_csv = instances
+        .iter()
+        .map(|i| i.instance_name.clone())
+        .collect::<Vec<_>>()
+        .join(",");
+    let exposed: Vec<_> = instances
+        .iter()
+        .flat_map(|i| i.ports.iter().filter(|p| p.expose).map(|p| p.host).collect::<Vec<_>>())
+        .collect();
+    let exposed_ports_csv = exposed
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // 访问规则（指向本机）
+    let allowed_rules: Vec<serde_json::Value> = project
+        .network_rules
+        .iter()
+        .filter(|r| r.to_server_id == server.id)
+        .map(|r| {
+            let from = project.servers.iter().find(|s| s.id == r.from_server_id);
+            json!({
+                "from_name": from.map(|s| s.name.clone()).unwrap_or_default(),
+                "from_ip": from.map(|s| s.ip.clone()).unwrap_or_default(),
+                "to_port": r.to_port,
+                "protocol": r.protocol,
+                "description": r.description,
+            })
+        })
+        .collect();
+
+    // 本机端口表（含放行来源）
+    let local_ports: Vec<serde_json::Value> = instances
+        .iter()
+        .flat_map(|i| {
+            i.ports
+                .iter()
+                .filter(|p| p.expose)
+                .map(|p| {
+                    let sources = project
+                        .network_rules
+                        .iter()
+                        .filter(|r| r.to_server_id == server.id && r.to_port == p.host)
+                        .map(|r| {
+                            project
+                                .servers
+                                .iter()
+                                .find(|s| s.id == r.from_server_id)
+                                .map(|s| s.ip.clone())
+                                .unwrap_or_default()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    json!({
+                        "host": p.host, "container": p.container,
+                        "protocol": p.protocol, "instance_name": i.instance_name,
+                        "sources": if sources.is_empty() { "（本机/按需）".to_string() } else { sources },
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let mem_need_gb: u32 = inst_ctx
+        .iter()
+        .map(|v| {
+            let g = v.get("min_memory_gb").and_then(|x| x.as_f64()).unwrap_or(0.5);
+            g.ceil() as u32
+        })
+        .sum();
+    let kernel_reqs: Vec<String> = instances
+        .iter()
+        .filter_map(|i| tpl_of(&i.template_id).map(|t| t.kernel_reqs.clone()))
+        .flatten()
+        .collect();
+    let kernel_reqs_raw = kernel_reqs.join(",");
+
+    let server_ctx = json!({
+        "name": server.name, "arch": server.arch,
+        "os_family": server.os_family, "os_version": server.os_version,
+        "ip": server.ip, "docker_version": server.docker_version,
+        "docker_data_root": server.docker_data_root,
+        "deploy_base_dir": server.deploy_base_dir,
+    });
+    let base_ctx = json!({
+        "project_name": project.name,
+        "build_id": build_id,
+        "generated_at": now,
+        "server": server_ctx,
+        "instances": inst_ctx,
+        "services_csv": services_csv,
+        "exposed_ports_csv": exposed_ports_csv,
+        "allowed_rules": allowed_rules,
+        "local_ports": local_ports,
+        "uname_arch": uname_of(&server.arch),
+        "dir_name": dir_name,
+        "stack_name": sanitize(&project.name),
+        "mem_need_gb": std::cmp::max(mem_need_gb, 1),
+        "disk_need_mb": 15360u32, // M0 预估：系统 10G + 镜像余量
+        "kernel_reqs": kernel_reqs,
+        "kernel_reqs_raw": kernel_reqs_raw,
+    });
+
+    // ---- 镜像复制 ----
+    let mut images_info: Vec<BuildImageInfo> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    for inst in &instances {
+        if inst.local_image_tar.trim().is_empty() {
+            warnings.push(format!(
+                "「{}」未指定本地镜像 tar，本包 images/ 不含该镜像（需现场自行 docker load {}）",
+                inst.instance_name, inst.image
+            ));
+            continue;
+        }
+        let src = PathBuf::from(inst.local_image_tar.trim());
+        if !src.is_file() {
+            warnings.push(format!(
+                "「{}」本地镜像 tar 不存在: {}",
+                inst.instance_name,
+                src.display()
+            ));
+            continue;
+        }
+        let file_name = format!("{}_{}.tar", sanitize(&inst.instance_name), sanitize(&image_tag_of(&inst.image)));
+        let dst = sdir.join("images").join(&file_name);
+        copy_file_with_progress(app, &src, &dst, &inst.instance_name)?;
+        let sha = sha256_file(&dst).ok();
+        let size = dst.metadata().map(|m| m.len()).unwrap_or(0);
+        images_info.push(BuildImageInfo {
+            reference: inst.image.clone(),
+            file: format!("images/{file_name}"),
+            sha256: sha,
+            size_bytes: size,
+        });
+    }
+
+    // ---- 渲染并写文件 ----
+    let mut ctx = base_ctx.clone();
+    ctx["images"] = json!(images_info
+        .iter()
+        .map(|i| json!({ "file": i.file, "reference": i.reference }))
+        .collect::<Vec<_>>());
+
+    let writes: Vec<(&str, PathBuf)> = vec![
+        ("compose/docker-compose.yml.j2", sdir.join("stack/docker-compose.yml")),
+        ("scripts/precheck.sh.j2", sdir.join("scripts/precheck.sh")),
+        ("scripts/deploy.sh.j2", sdir.join("scripts/deploy.sh")),
+        ("scripts/ops.sh.j2", sdir.join("scripts/ops.sh")),
+        ("scripts/apply-firewall.sh.j2", sdir.join("scripts/apply-firewall.sh")),
+        ("install/install-docker.sh.j2", sdir.join("docker-offline/install-docker.sh")),
+        ("docs/README.md.j2", sdir.join("README.md")),
+        ("docs/OPS-GUIDE.md.j2", sdir.join("docs/OPS-GUIDE.md")),
+        ("docs/PORT-MATRIX.md.j2", sdir.join("docs/PORT-MATRIX.md")),
+    ];
+    for (tpl, path) in writes {
+        let content = render(env, tpl, &ctx)?;
+        let mut f = File::create(&path)?;
+        f.write_all(content.as_bytes())?;
+    }
+
+    // ---- manifest.json ----
+    let manifest = json!({
+        "buildId": build_id,
+        "project": { "name": project.name, "customer": project.customer },
+        "server": {
+            "name": server.name, "arch": server.arch,
+            "os": format!("{} {}", server.os_family, server.os_version),
+            "dockerVersion": server.docker_version,
+        },
+        "images": images_info,
+        "instances": instances.iter().map(|i| json!({
+            "name": i.instance_name, "image": i.image,
+            "ports": i.ports.iter().map(|p| format!("{}:{}", p.host, p.container)).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "generatedAt": now,
+    });
+    fs::write(
+        sdir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+
+    // ---- SHA256SUMS ----
+    write_sha256_sums(&sdir)?;
+
+    // ---- 打包 ----
+    let mut sr = BuildServerResult {
+        name: server.name.clone(),
+        arch: server.arch.clone(),
+        dir_name: dir_name.clone(),
+        package_file: None,
+        size_bytes: 0,
+        images: images_info,
+        warnings,
+    };
+
+    if project.build_config.package_format != "dir" {
+        let pkg_path = out_root.join(format!("{dir_name}.tar.gz"));
+        emit(app, "package", &format!("打包: {}", pkg_path.display()));
+        let file = File::create(&pkg_path)?;
+        let level = if project.build_config.recompress_images {
+            Compression::default()
+        } else {
+            Compression::none() // 镜像层已压缩，store 模式加速
+        };
+        let gz = GzEncoder::new(file, level);
+        let mut tar = tar::Builder::new(gz);
+        tar.append_dir_all(&dir_name, &sdir)
+            .map_err(|e| AppError::Io(format!("tar 打包失败: {e}")))?;
+        tar.into_inner()
+            .map_err(|e| AppError::Io(format!("tar 收尾失败: {e}")))?
+            .finish()
+            .map_err(|e| AppError::Io(format!("gzip 收尾失败: {e}")))?;
+        sr.package_file = Some(pkg_path.to_string_lossy().into_owned());
+        sr.size_bytes = pkg_path.metadata().map(|m| m.len()).unwrap_or(0);
+        fs::remove_dir_all(&sdir)?;
+    } else {
+        sr.size_bytes = dir_size(&sdir);
+    }
+
+    Ok(sr)
+}
+
+fn copy_file_with_progress(app: &AppHandle, src: &Path, dst: &Path, label: &str) -> AppResult<()> {
+    let mut reader = BufReader::new(File::open(src)?);
+    let mut writer = File::create(dst)?;
+    let mut buf = [0u8; 4 * 1024 * 1024];
+    let mut copied = 0u64;
+    let total = src.metadata().map(|m| m.len()).unwrap_or(0);
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        copied += n as u64;
+        if total > 0 && (copied % (64 * 1024 * 1024) == 0 || copied == total) {
+            emit(
+                app,
+                "image",
+                &format!("复制镜像 {label}: {} / {} MB", copied / 1048576, total / 1048576),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn value_to_plain_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn image_tag_of(image: &str) -> String {
+    let base = image.split('@').next().unwrap_or(image);
+    match base.rsplit_once(':') {
+        Some((before, tag)) if tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') && before.contains('/') => {
+            tag.to_string()
+        }
+        _ => "latest".into(),
+    }
+}

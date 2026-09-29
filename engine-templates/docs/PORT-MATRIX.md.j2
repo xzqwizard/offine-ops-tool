@@ -1,0 +1,35 @@
+# 端口矩阵 - {{ server.name }}
+
+> 由离线部署运维工具生成（构建 {{ build_id }}）。本文件同时用于防火墙开通与网络组申请。
+
+## 1. 本机监听端口
+
+| 端口 | 协议 | 服务 | 容器端口 | 放行来源 |
+|---|---|---|---|---|
+{% for p in local_ports %}
+| {{ p.host }} | {{ p.protocol }} | {{ p.instance_name }} | {{ p.container }} | {{ p.sources }} |
+{% endfor %}
+
+## 2. 跨服务器访问规则（来源 → 本机）
+
+{% if allowed_rules %}
+| 来源服务器 | 来源 IP | 目标端口 | 协议 | 用途 |
+|---|---|---|---|---|
+{% for r in allowed_rules %}| {{ r.from_name }} | {{ r.from_ip }} | {{ r.to_port }} | {{ r.protocol }} | {{ r.description }} |
+{% endfor %}
+{% else %}
+（无）
+{% endif %}
+
+## 3. 防火墙操作
+
+```bash
+# 自动应用上述规则（firewalld 优先，退化 iptables）
+sudo bash scripts/apply-firewall.sh
+
+# 查看已生效规则
+sudo firewall-cmd --list-rich-rules
+```
+
+若本环境端口由上级网络设备统一管控：请将第 1、2 节表格提交网络组申请开通，
+本机不执行防火墙变更。

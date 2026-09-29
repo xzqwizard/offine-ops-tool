@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# ============================================================
+# 防火墙规则应用脚本 - 由离线部署运维工具生成（勿手改）
+# 依据: 端口矩阵（方案 {{ project_name }}，构建 {{ build_id }}）
+# 说明: 仅放行「其它服务器 → 本机端口」的访问；本机服务间互访不受限
+# ============================================================
+set -euo pipefail
+
+[ "$(id -u)" -eq 0 ] || { echo "需要 root 权限"; exit 1; }
+
+{% if allowed_rules | length == 0 %}
+echo "本方案未定义跨服务器访问规则，无需变更防火墙。"
+exit 0
+{% endif %}
+
+if systemctl is-active firewalld >/dev/null 2>&1; then
+  echo "使用 firewalld 应用规则..."
+  {% for r in allowed_rules %}
+  firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address="{{ r.from_ip }}" port port="{{ r.to_port }}" protocol="{{ r.protocol }}" accept' && echo "  [+] {{ r.from_name }}({{ r.from_ip }}) -> :{{ r.to_port }}/{{ r.protocol }}"
+  {% endfor %}
+  firewall-cmd --reload
+  echo "完成。查看: firewall-cmd --list-rich-rules"
+elif command -v iptables >/dev/null 2>&1; then
+  echo "firewalld 未运行，使用 iptables 应用规则（注意持久化）..."
+  {% for r in allowed_rules %}
+  iptables -I INPUT -p {{ r.protocol }} -s {{ r.from_ip }} --dport {{ r.to_port }} -j ACCEPT && echo "  [+] {{ r.from_name }}({{ r.from_ip }}) -> :{{ r.to_port }}/{{ r.protocol }}"
+  {% endfor %}
+  echo "提示: iptables 规则重启后失效，请按 OS 执行持久化（如 iptables-save > /etc/sysconfig/iptables）"
+else
+  echo "无 firewalld/iptables 可用。若端口由上级网络统一管控，请提交 docs/PORT-MATRIX.md 中的端口开通申请表。"
+fi
