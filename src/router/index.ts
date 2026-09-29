@@ -19,6 +19,11 @@ const router = createRouter({
           component: () => import('@/views/ProjectsView.vue')
         },
         {
+          path: 'project/:id',
+          name: 'project-edit',
+          component: () => import('@/views/ProjectEditView.vue')
+        },
+        {
           path: 'images',
           name: 'images',
           component: () => import('@/views/ImagesView.vue')

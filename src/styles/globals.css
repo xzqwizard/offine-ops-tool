@@ -81,6 +81,7 @@
   --color-error-container: var(--t-error-container);
   --color-glass-header: var(--t-glass-header);
   --color-success: var(--t-success);
+  --color-warning: var(--t-warning, #e6a23c);
 }
 
 /* === Material Symbols === */
