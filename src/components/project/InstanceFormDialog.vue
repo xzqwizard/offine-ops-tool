@@ -2,7 +2,9 @@
 import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
+import { backend, toAppError } from '@/api/backend'
 import type { MiddlewareTemplate } from '@/types/catalog'
+import type { ImageInspect } from '@/types/images'
 import type { MiddlewareInstance, PortBinding, ServerInfo } from '@/types/project'
 import { genId } from '@/utils/id'
 
@@ -60,6 +62,67 @@ const archMismatch = computed(() => {
   if (!selectedServer.value || !selectedTemplate.value) return false
   if (!selectedTemplate.value.supportedArches.length) return false
   return !selectedTemplate.value.supportedArches.includes(selectedServer.value.arch)
+})
+
+// 在线检查结果插入：目录模式在版本 tag 之后，手动模式在镜像引用之后
+const tagOptions = computed(() => {
+  if (!selectedTemplate.value) return []
+  if (!tagsLoaded.value) return selectedTemplate.value.recommendedTags
+  // 推荐置顶 + 在线列表
+  const rec = selectedTemplate.value.recommendedTags
+  return [...rec, ...onlineTags.value.filter((t) => !rec.includes(t))]
+})
+// ---- 在线查询（tag 列表 / 架构矩阵）----
+const onlineTags = ref<string[]>([])
+const tagsLoading = ref(false)
+const tagsLoaded = ref(false)
+const inspect = ref<ImageInspect | null>(null)
+const inspecting = ref(false)
+
+async function loadOnlineTags() {
+  if (!selectedTemplate.value) return
+  tagsLoading.value = true
+  try {
+    const tags = await backend.listImageTags(selectedTemplate.value.defaultImage)
+    onlineTags.value = tags
+    tagsLoaded.value = true
+    ElMessage.success(`已获取 ${tags.length} 个版本（可输入过滤）`)
+  } catch (e) {
+    ElMessage.warning(toAppError(e).message)
+  } finally {
+    tagsLoading.value = false
+  }
+}
+
+/** 当前引用（目录模式按模板+tag，手动模式按输入） */
+const currentReference = computed(() => {
+  if (mode.value === 'custom') {
+    return customImage.value.trim() || ''
+  }
+  return selectedTemplate.value ? `${selectedTemplate.value.defaultImage}:${tag.value || 'latest'}` : ''
+})
+
+async function checkImage() {
+  const ref = currentReference.value
+  if (!ref) {
+    ElMessage.warning('请先填写镜像引用')
+    return
+  }
+  inspecting.value = true
+  inspect.value = null
+  try {
+    inspect.value = await backend.inspectImage(ref)
+  } catch (e) {
+    ElMessage.error(`镜像检查失败: ${toAppError(e).message}`)
+  } finally {
+    inspecting.value = false
+  }
+}
+
+/** 在线检查结果：所选服务器架构是否受支持（null=未检查） */
+const onlineArchOk = computed<boolean | null>(() => {
+  if (!inspect.value || !selectedServer.value) return null
+  return inspect.value.arches.includes(`linux/${selectedServer.value.arch}`)
 })
 
 watch(
@@ -154,6 +217,13 @@ function handleSave() {
     )
     return
   }
+  // 在线检查结果优先：已检查且明确不支持所选架构时阻断
+  if (onlineArchOk.value === false) {
+    ElMessage.error(
+      `在线检查确认：${currentReference.value} 不支持 linux/${selectedServer.value!.arch}`
+    )
+    return
+  }
   if (!instanceName.value.trim()) {
     ElMessage.warning('实例名不能为空')
     return
@@ -225,10 +295,42 @@ function handleSave() {
       </el-select>
     </div>
 
-    <el-radio-group v-model="mode" class="mb-4" :disabled="!!editingId">
+    <el-radio-group v-model="mode" class="mb-3" :disabled="!!editingId">
       <el-radio-button value="catalog">从目录选择</el-radio-button>
       <el-radio-button value="custom">手动输入镜像</el-radio-button>
     </el-radio-group>
+
+    <!-- 镜像在线检查（通用） -->
+    <div class="mb-3 bg-surface-container rounded-lg border border-outline-variant px-3 py-2 flex items-center gap-3 flex-wrap">
+      <span class="font-mono text-xs text-on-surface-variant truncate flex-1 min-w-40">
+        {{ currentReference || '（未填写镜像引用）' }}
+      </span>
+      <button
+        type="button"
+        class="px-3 py-1 rounded-lg text-xs font-bold border border-primary/50 text-primary hover:bg-primary/10 transition-colors shrink-0"
+        :disabled="inspecting || !currentReference"
+        @click="checkImage"
+      >
+        {{ inspecting ? '检查中…' : '在线检查镜像' }}
+      </button>
+      <template v-if="inspect">
+        <el-tag
+          v-for="a in inspect.arches"
+          :key="a"
+          size="small"
+          class="font-mono"
+          :type="selectedServer && a === `linux/${selectedServer.arch}` ? 'success' : 'info'"
+        >
+          {{ a }}{{ selectedServer && a === `linux/${selectedServer.arch}` ? ' ✓' : '' }}
+        </el-tag>
+        <span
+          v-if="onlineArchOk === false"
+          class="text-xs text-error font-bold shrink-0"
+        >
+          ⚠ 不支持当前服务器架构（{{ selectedServer?.arch }}）
+        </span>
+      </template>
+    </div>
 
     <!-- 目录模式 -->
     <div v-if="mode === 'catalog'" class="grid grid-cols-[280px_1fr] gap-5">
@@ -278,14 +380,32 @@ function handleSave() {
         >
         <el-form label-width="110px" label-position="left" @submit.prevent>
           <el-form-item label="版本 tag">
-            <el-select v-model="tag" filterable allow-create default-first-option class="w-full">
+            <el-select
+              v-model="tag"
+              filterable
+              allow-create
+              default-first-option
+              :loading="tagsLoading"
+              class="w-full"
+            >
               <el-option
-                v-for="t in selectedTemplate.recommendedTags"
+                v-for="t in tagOptions"
                 :key="t"
                 :value="t"
-                :label="t"
+                :label="tagsLoaded && !selectedTemplate!.recommendedTags.includes(t) ? t : t"
               />
             </el-select>
+            <div class="flex items-center gap-2 mt-1">
+              <button
+                type="button"
+                class="text-xs text-primary hover:underline"
+                :disabled="tagsLoading"
+                @click="loadOnlineTags"
+              >
+                {{ tagsLoading ? '获取中…' : tagsLoaded ? '刷新在线版本列表' : '获取在线版本列表' }}
+              </button>
+              <span class="text-[10px] text-on-surface-variant/50">默认仅展示推荐版本</span>
+            </div>
             <div class="text-xs text-on-surface-variant mt-1 font-mono">
               {{ selectedTemplate.defaultImage }}:{{ tag || '?' }}
             </div>

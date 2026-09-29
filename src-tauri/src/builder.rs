@@ -221,8 +221,13 @@ fn backup_hint(template_id: &str) -> &'static str {
 // ==================== 主流程 ====================
 
 #[tauri::command]
-pub fn build_offline_package(app: AppHandle, project: Project) -> AppResult<BuildResult> {
-    let r = build(&app, &project);
+pub fn build_offline_package(
+    app: AppHandle,
+    project: Project,
+    auto_pull: Option<bool>,
+) -> AppResult<BuildResult> {
+    let auto_pull = auto_pull.unwrap_or(true);
+    let r = build(&app, &project, auto_pull);
     match &r {
         Ok(res) => emit(&app, "done", &format!("构建完成: {}", res.build_id)),
         Err(e) => emit(&app, "error", &e.to_string()),
@@ -234,7 +239,7 @@ fn emit(app: &AppHandle, step: &str, detail: &str) {
     let _ = app.emit("build-progress", json!({ "step": step, "detail": detail }));
 }
 
-fn build(app: &AppHandle, project: &Project) -> AppResult<BuildResult> {
+fn build(app: &AppHandle, project: &Project, auto_pull: bool) -> AppResult<BuildResult> {
     let now = store::now_rfc3339();
     let build_id = format!("b-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
     let catalog = catalog::preset()?;
@@ -262,7 +267,7 @@ fn build(app: &AppHandle, project: &Project) -> AppResult<BuildResult> {
 
     for server in &project.servers {
         emit(app, "server", &format!("处理服务器: {} ({})", server.name, server.arch));
-        let sr = build_server(app, project, server, &catalog, &env, &out_root, &build_id, &now)?;
+        let sr = build_server(app, project, server, &catalog, &env, &out_root, &build_id, &now, auto_pull)?;
         result.warnings.extend(sr.warnings.clone());
         result.servers.push(sr);
     }
@@ -328,6 +333,7 @@ fn build_server(
     out_root: &Path,
     build_id: &str,
     now: &str,
+    auto_pull: bool,
 ) -> AppResult<BuildServerResult> {
     let tpl_of = |id: &str| catalog.templates.iter().find(|t| t.id == id);
     let dir_name = format!("{}_{}", sanitize(&server.name), server.arch);
@@ -497,27 +503,57 @@ fn build_server(
         "kernel_reqs_raw": kernel_reqs_raw,
     });
 
-    // ---- 镜像复制 ----
+    // ---- 镜像解析与复制：本地 tar > 缓存 > 在线拉取（auto_pull） ----
     let mut images_info: Vec<BuildImageInfo> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for inst in &instances {
-        if inst.local_image_tar.trim().is_empty() {
-            warnings.push(format!(
-                "「{}」未指定本地镜像 tar，本包 images/ 不含该镜像（需现场自行 docker load {}）",
-                inst.instance_name, inst.image
-            ));
-            continue;
-        }
-        let src = PathBuf::from(inst.local_image_tar.trim());
-        if !src.is_file() {
-            warnings.push(format!(
-                "「{}」本地镜像 tar 不存在: {}",
-                inst.instance_name,
-                src.display()
-            ));
-            continue;
-        }
-        let file_name = format!("{}_{}.tar", sanitize(&inst.instance_name), sanitize(&image_tag_of(&inst.image)));
+        let resolved: Option<std::path::PathBuf> = if !inst.local_image_tar.trim().is_empty() {
+            let p = PathBuf::from(inst.local_image_tar.trim());
+            if p.is_file() {
+                Some(p)
+            } else {
+                warnings.push(format!(
+                    "「{}」本地镜像 tar 不存在: {}",
+                    inst.instance_name,
+                    p.display()
+                ));
+                None
+            }
+        } else {
+            let cache = crate::images::cache_file_for(app, &inst.image, "linux", &server.arch)?;
+            if cache.is_file() {
+                Some(cache)
+            } else if auto_pull {
+                emit(
+                    app,
+                    "image",
+                    &format!("缓存未命中，在线拉取 {} (linux/{})", inst.image, server.arch),
+                );
+                match crate::images::pull_image_inner(app, &inst.image, "linux", &server.arch, &cache)
+                {
+                    Ok(_) => Some(cache),
+                    Err(e) => {
+                        warnings.push(format!(
+                            "「{}」在线拉取失败（产物不含该镜像，现场需自行 docker load）: {}",
+                            inst.instance_name, e
+                        ));
+                        None
+                    }
+                }
+            } else {
+                warnings.push(format!(
+                    "「{}」无本地 tar 且缓存未命中（未启用自动拉取），产物不含该镜像",
+                    inst.instance_name
+                ));
+                None
+            }
+        };
+        let Some(src) = resolved else { continue };
+        let file_name = format!(
+            "{}_{}.tar",
+            sanitize(&inst.instance_name),
+            sanitize(&image_tag_of(&inst.image))
+        );
         let dst = sdir.join("images").join(&file_name);
         copy_file_with_progress(app, &src, &dst, &inst.instance_name)?;
         let sha = sha256_file(&dst).ok();

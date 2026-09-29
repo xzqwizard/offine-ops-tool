@@ -44,6 +44,9 @@ const recompress = computed({
   set: (v: boolean) => store.scheduleSave((p) => (p.buildConfig.recompressImages = v))
 })
 
+/** 构建时自动拉取缺失镜像（缓存未命中时在线拉取，本次构建内存态，不入方案） */
+const autoPull = ref(true)
+
 async function handleBuild() {
   if (!store.project) return
   const issues: ValidationIssue[] = validateProject(store.project, templates.value)
@@ -63,7 +66,7 @@ async function handleBuild() {
   logs.value = []
   result.value = null
   try {
-    result.value = await backend.buildOfflinePackage(store.project)
+    result.value = await backend.buildOfflinePackage(store.project, autoPull.value)
     ElMessage.success(`构建完成: ${result.value.buildId}`)
   } catch (e) {
     ElMessage.error(`构建失败: ${toAppError(e).message}`)
@@ -96,7 +99,7 @@ async function copyOutputDir() {
       <h3 class="text-sm font-headline font-bold text-primary uppercase tracking-widest mb-4">
         构建配置
       </h3>
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+      <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-5">
         <div>
           <div class="text-xs text-on-surface-variant mb-1.5">产物输出根目录</div>
           <div class="font-mono text-xs bg-surface-container rounded-lg px-3 py-2 border border-outline-variant break-all">
@@ -117,6 +120,13 @@ async function copyOutputDir() {
           <el-switch v-model="recompress" />
           <div class="text-[10px] text-on-surface-variant/50 mt-1">
             默认关闭：docker save 层已压缩，二次压缩收益小且耗时长
+          </div>
+        </div>
+        <div>
+          <div class="text-xs text-on-surface-variant mb-1.5">缺失镜像自动拉取</div>
+          <el-switch v-model="autoPull" />
+          <div class="text-[10px] text-on-surface-variant/50 mt-1">
+            本地 tar → 缓存 → 在线拉取（需在「镜像库」安装 crane 引擎）
           </div>
         </div>
       </div>
