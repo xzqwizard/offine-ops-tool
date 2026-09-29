@@ -1,8 +1,9 @@
 use crate::error::{AppError, AppResult};
 use crate::models::*;
 use std::fs;
-use std::path::PathBuf;
-use tauri::AppHandle;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use tauri::{AppHandle, Manager};
 
 const SETTINGS_FILE: &str = "settings.json";
 const PROJECT_FILE: &str = "project.json";
@@ -51,8 +52,81 @@ fn override_or(ov: &Option<String>, default: PathBuf) -> PathBuf {
     }
 }
 
+// ==================== 旧版数据迁移（用户目录 → 软件目录 data/） ====================
+
+static MIGRATED: OnceLock<()> = OnceLock::new();
+
+/// 首次访问数据前执行一次旧版迁移（幂等、非破坏性：只复制不覆盖、不删除旧数据）。
+/// 旧位置：Windows %APPDATA%/<identifier>/（settings.json、projects/、cache/）
+pub fn ensure_migrated(app: &AppHandle) {
+    if MIGRATED.get().is_some() {
+        return;
+    }
+    let _ = MIGRATED.set(());
+    if let Err(e) = migrate_legacy_data(app) {
+        eprintln!("[迁移] 旧版数据迁移失败（不影响使用，可手动复制）: {e}");
+    }
+}
+
+fn migrate_legacy_data(app: &AppHandle) -> AppResult<()> {
+    let legacy = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppError::Io(format!("无法定位旧版数据目录: {e}")))?;
+    if !legacy.is_dir() {
+        return Ok(()); // 无旧数据
+    }
+    let new_data = app_base_dir()?.join("data");
+    fs::create_dir_all(&new_data)?;
+
+    // 1) 设置：仅当新位置尚无 settings.json 时迁移
+    let legacy_settings = legacy.join(SETTINGS_FILE);
+    let new_settings = new_data.join(SETTINGS_FILE);
+    if legacy_settings.is_file() && !new_settings.is_file() {
+        fs::copy(&legacy_settings, &new_settings)?;
+    }
+
+    // 2) 方案与镜像缓存：文件级合并且不覆盖已存在文件
+    merge_dir_recursive(&legacy.join("projects"), &new_data.join("projects"))?;
+    merge_dir_recursive(&legacy.join("cache"), &new_data.join("cache"))?;
+    Ok(())
+}
+
+/// 递归合并目录：src 中存在而 dst 中不存在的文件复制过去；已存在一律跳过。
+/// 返回 (复制文件数, 复制字节数)。src 不存在时返回 (0, 0)。
+pub fn merge_dir_recursive(src: &Path, dst: &Path) -> AppResult<(usize, u64)> {
+    if !src.is_dir() {
+        return Ok((0, 0));
+    }
+    fs::create_dir_all(dst)?;
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let s = entry.path();
+        let name = entry.file_name();
+        // 跳过临时/下载中文件与日志
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') || name_str.ends_with(".downloading") {
+            continue;
+        }
+        let d = dst.join(&name);
+        if s.is_dir() {
+            let (f, b) = merge_dir_recursive(&s, &d)?;
+            files += f;
+            bytes += b;
+        } else if !d.exists() {
+            fs::copy(&s, &d)?;
+            files += 1;
+            bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    Ok((files, bytes))
+}
+
 /// 合并设置覆盖项与默认值，得到实际生效的存储路径
 pub fn effective_storage(app: &AppHandle) -> AppResult<StorageInfo> {
+    ensure_migrated(app);
     let settings = load_settings(app)?;
     let d = default_roots(app)?;
     Ok(StorageInfo {
@@ -84,6 +158,7 @@ fn settings_path(app: &AppHandle) -> AppResult<PathBuf> {
 }
 
 pub fn load_settings(app: &AppHandle) -> AppResult<AppSettings> {
+    ensure_migrated(app);
     let path = settings_path(app)?;
     if !path.exists() {
         return Ok(AppSettings::default());

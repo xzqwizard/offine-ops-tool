@@ -7,7 +7,7 @@ mod error;
 pub mod images;
 mod models;
 mod net;
-mod store;
+pub mod store;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
