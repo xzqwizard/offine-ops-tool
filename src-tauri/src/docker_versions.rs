@@ -80,13 +80,12 @@ fn version_key(v: &str) -> (u64, u64, u64) {
 mod tests {
     use super::*;
 
-    // ⚠ 工具链坑（2026-09-29 排查结论）：本机 windows-gnu 工具链存在布局敏感
-    // bug —— 测试二进制在 stdout 为管道（cargo test 捕获输出）时以
-    // STATUS_ENTRYPOINT_NOT_FOUND 崩溃，是否触发取决于二进制布局（与链接器
-    // 无关，bfd/lld 均可复现；主程序 GUI 不受影响）。包含 parse 函数测试的
-    // 布局稳定复现，故此处仅保留 version_key 测试；parse 逻辑由 M1 在线拉取
-    // 的集成路径覆盖。若未来 cargo test 再报此错误：调整测试数据的形式/大小
-    // 或拆分 crate 即可规避，与业务代码无关。
+    // 历史"布局敏感崩溃"已定案：并非工具链 bug，而是 WebView2Loader.dll 未随
+    // deps/examples 子目录的测试二进制落位导致进程启动失败（build.rs 已自动
+    // 复制修复，详见 build.rs 注释）。parse 测试曾因排障被移除，M2 可补回。
+    // 单元测试布局受限于本机工具链的历史问题（test 目标缺 common-controls v6
+    // 清单），保持最小集；parse 测试位于 tests/images_tests.rs（build.rs 注入
+    // 清单的显式 test 目标，可任意扩展）。
     #[test]
     fn version_key_numeric_compare() {
         assert!(version_key("27.5.1") > version_key("9.03.0"));

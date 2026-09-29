@@ -510,9 +510,7 @@ fn rewrite_docker_archive(src: &Path, dst: &Path, canonical_ref: &str) -> AppRes
     Ok(())
 }
 
-/// 注意：本模块的纯函数测试因本机 windows-gnu 工具链布局敏感 bug 无法常驻
-/// cargo test（详见 docker_versions.rs 注释）。逻辑验证走临时 example
-/// （examples/verify_images_logic.rs，`cargo run --example verify_images_logic`）。
+/// 集成测试辅助（tests/images_tests.rs 使用）
 pub fn rewrite_repo_tags_for_test(body: &str, canonical_ref: &str) -> String {
     rewrite_repo_tags(body, canonical_ref)
 }
