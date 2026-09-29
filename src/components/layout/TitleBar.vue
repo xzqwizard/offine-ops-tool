@@ -4,20 +4,25 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import pkg from '../../../package.json'
 import ThemeSwitcher from './ThemeSwitcher.vue'
 
-const appWindow = getCurrentWindow()
+// 非 Tauri 环境（纯浏览器开发/预览）下禁用窗口 API，避免抛错中断渲染
+const inTauri = '__TAURI_INTERNALS__' in window
+const appWindow = inTauri ? getCurrentWindow() : null
+
 const isMaximized = ref(false)
 let unlisten: (() => void) | null = null
 
 async function refreshMaxState() {
+  if (!appWindow) return
   try {
     isMaximized.value = await appWindow.isMaximized()
   } catch {
-    /* 浏览器开发模式下无窗口 API */
+    /* ignore */
   }
 }
 
 onMounted(async () => {
   await refreshMaxState()
+  if (!appWindow) return
   try {
     unlisten = await appWindow.onResized(refreshMaxState)
   } catch {
@@ -30,6 +35,7 @@ onUnmounted(() => {
 })
 
 async function toggleMaximize() {
+  if (!appWindow) return
   try {
     await appWindow.toggleMaximize()
     await refreshMaxState()
@@ -56,26 +62,28 @@ async function toggleMaximize() {
     </div>
     <div class="flex items-center gap-1">
       <ThemeSwitcher />
-      <button
-        title="最小化"
-        class="p-2 rounded-lg text-on-surface-variant hover:bg-surface-container-high transition-colors"
-        @click="appWindow.minimize()"
-      >
-        <span class="material-symbols-outlined text-lg">remove</span>
-      </button>
-      <button
-        title="最大化/还原"
-        class="p-2 rounded-lg text-on-surface-variant hover:bg-surface-container-high transition-colors"
-        @click="toggleMaximize"
-      >
-        <span class="material-symbols-outlined text-lg">{{
-          isMaximized ? 'filter_none' : 'crop_square'
-        }}</span>
-      </button>
+      <template v-if="appWindow">
+        <button
+          title="最小化"
+          class="p-2 rounded-lg text-on-surface-variant hover:bg-surface-container-high transition-colors"
+          @click="appWindow.minimize()"
+        >
+          <span class="material-symbols-outlined text-lg">remove</span>
+        </button>
+        <button
+          title="最大化/还原"
+          class="p-2 rounded-lg text-on-surface-variant hover:bg-surface-container-high transition-colors"
+          @click="toggleMaximize"
+        >
+          <span class="material-symbols-outlined text-lg">{{
+            isMaximized ? 'filter_none' : 'crop_square'
+          }}</span>
+        </button>
+      </template>
       <button
         title="关闭"
         class="p-2 rounded-lg text-on-surface-variant hover:bg-error-container/50 hover:text-error transition-colors"
-        @click="appWindow.close()"
+        @click="appWindow?.close()"
       >
         <span class="material-symbols-outlined text-lg">close</span>
       </button>

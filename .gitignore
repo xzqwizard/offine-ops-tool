@@ -23,3 +23,6 @@ build-out/
 
 # 工具链
 .zcodeignore
+
+# playwright 调试产物
+.playwright-mcp/
