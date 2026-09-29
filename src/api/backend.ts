@@ -9,6 +9,12 @@ import type {
 } from '@/types/project'
 import type { CatalogFile } from '@/types/catalog'
 import type { BuildResult } from '@/types/build'
+import type {
+  CachedImage,
+  EngineStatus,
+  ImageInspect,
+  PullResult
+} from '@/types/images'
 
 /**
  * 后端适配层：前端唯一的后端调用入口。
@@ -51,8 +57,8 @@ export const backend = {
     return invoke<CatalogFile>('list_catalog')
   },
 
-  async buildOfflinePackage(project: Project): Promise<BuildResult> {
-    return invoke<BuildResult>('build_offline_package', { project })
+  async buildOfflinePackage(project: Project, autoPull: boolean): Promise<BuildResult> {
+    return invoke<BuildResult>('build_offline_package', { project, autoPull })
   },
 
   async listDockerVersions(arch: string): Promise<string[]> {
@@ -61,6 +67,34 @@ export const backend = {
 
   async testNetwork(): Promise<ConnectivityResult[]> {
     return invoke<ConnectivityResult[]>('test_network')
+  },
+
+  async engineStatus(): Promise<EngineStatus> {
+    return invoke<EngineStatus>('engine_status')
+  },
+
+  async engineInstall(force: boolean): Promise<EngineStatus> {
+    return invoke<EngineStatus>('engine_install', { force })
+  },
+
+  async inspectImage(image: string): Promise<ImageInspect> {
+    return invoke<ImageInspect>('inspect_image', { image })
+  },
+
+  async listImageTags(image: string): Promise<string[]> {
+    return invoke<string[]>('list_image_tags', { image })
+  },
+
+  async listImageCache(): Promise<CachedImage[]> {
+    return invoke<CachedImage[]>('list_image_cache')
+  },
+
+  async deleteCachedImage(file: string): Promise<void> {
+    return invoke<void>('delete_cached_image', { file })
+  },
+
+  async pullImage(image: string, arch: string): Promise<PullResult> {
+    return invoke<PullResult>('pull_image', { image, arch })
   }
 }
 
