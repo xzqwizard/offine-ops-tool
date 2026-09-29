@@ -6,6 +6,7 @@ import type {
   ProjectSummary,
   StorageInfo
 } from '@/types/project'
+import type { CatalogFile } from '@/types/catalog'
 
 /**
  * 后端适配层：前端唯一的后端调用入口。
@@ -42,6 +43,10 @@ export const backend = {
 
   async getStorageInfo(): Promise<StorageInfo> {
     return invoke<StorageInfo>('get_storage_info')
+  },
+
+  async listCatalog(): Promise<CatalogFile> {
+    return invoke<CatalogFile>('list_catalog')
   }
 }
 

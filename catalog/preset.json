@@ -1,0 +1,185 @@
+{
+  "version": 1,
+  "updatedAt": "2026-09-29",
+  "templates": [
+    {
+      "id": "mysql-8.0",
+      "displayName": "MySQL 8.0",
+      "category": "数据库",
+      "defaultImage": "docker.io/library/mysql",
+      "recommendedTags": ["8.0.42", "8.0.40", "8.0.36"],
+      "supportedArches": ["amd64", "arm64"],
+      "ports": [{ "name": "mysql", "container": 3306, "defaultHost": 3306, "protocol": "tcp" }],
+      "envHints": [
+        { "key": "MYSQL_ROOT_PASSWORD", "label": "root 密码", "secret": true, "required": true },
+        { "key": "MYSQL_DATABASE", "label": "初始数据库" },
+        { "key": "MYSQL_USER", "label": "业务账号" },
+        { "key": "MYSQL_PASSWORD", "label": "业务账号密码", "secret": true }
+      ],
+      "dataVolume": "/var/lib/mysql",
+      "healthCheck": { "type": "exec", "cmd": ["mysqladmin", "ping", "-h", "127.0.0.1"] },
+      "minMemoryGb": 1
+    },
+    {
+      "id": "redis-7",
+      "displayName": "Redis 7",
+      "category": "缓存",
+      "defaultImage": "docker.io/library/redis",
+      "recommendedTags": ["7.2.5", "7.2.4", "6.2.14"],
+      "supportedArches": ["amd64", "arm64"],
+      "ports": [{ "name": "redis", "container": 6379, "defaultHost": 6379, "protocol": "tcp" }],
+      "envHints": [
+        { "key": "REDIS_PASSWORD", "label": "访问密码（留空则无密码）", "secret": true }
+      ],
+      "dataVolume": "/data",
+      "healthCheck": { "type": "exec", "cmd": ["redis-cli", "ping"] },
+      "minMemoryGb": 0.5
+    },
+    {
+      "id": "postgresql-16",
+      "displayName": "PostgreSQL 16",
+      "category": "数据库",
+      "defaultImage": "docker.io/library/postgres",
+      "recommendedTags": ["16.4", "16.3", "15.8"],
+      "supportedArches": ["amd64", "arm64"],
+      "ports": [{ "name": "pgsql", "container": 5432, "defaultHost": 5432, "protocol": "tcp" }],
+      "envHints": [
+        { "key": "POSTGRES_PASSWORD", "label": "超级用户密码", "secret": true, "required": true },
+        { "key": "POSTGRES_DB", "label": "初始数据库" },
+        { "key": "POSTGRES_USER", "label": "超级用户名" }
+      ],
+      "dataVolume": "/var/lib/postgresql/data",
+      "healthCheck": { "type": "exec", "cmd": ["pg_isready", "-U", "postgres"] },
+      "minMemoryGb": 1
+    },
+    {
+      "id": "mongodb-7",
+      "displayName": "MongoDB 7",
+      "category": "数据库",
+      "defaultImage": "docker.io/library/mongo",
+      "recommendedTags": ["7.0.14", "7.0.12", "6.0.15"],
+      "supportedArches": ["amd64", "arm64"],
+      "ports": [{ "name": "mongo", "container": 27017, "defaultHost": 27017, "protocol": "tcp" }],
+      "envHints": [
+        { "key": "MONGO_INITDB_ROOT_USERNAME", "label": "root 账号" },
+        { "key": "MONGO_INITDB_ROOT_PASSWORD", "label": "root 密码", "secret": true, "required": true }
+      ],
+      "dataVolume": "/data/db",
+      "healthCheck": { "type": "exec", "cmd": ["mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"] },
+      "minMemoryGb": 1
+    },
+    {
+      "id": "nginx-1.27",
+      "displayName": "Nginx",
+      "category": "网关/入口",
+      "defaultImage": "docker.io/library/nginx",
+      "recommendedTags": ["1.27.2", "1.25.3", "1.24.0"],
+      "supportedArches": ["amd64", "arm64"],
+      "ports": [
+        { "name": "http", "container": 80, "defaultHost": 80, "protocol": "tcp" },
+        { "name": "https", "container": 443, "defaultHost": 443, "protocol": "tcp" }
+      ],
+      "envHints": [],
+      "dataVolume": "/etc/nginx/conf.d",
+      "healthCheck": { "type": "exec", "cmd": ["curl", "-sf", "http://127.0.0.1/"] },
+      "minMemoryGb": 0.25
+    },
+    {
+      "id": "minio",
+      "displayName": "MinIO 对象存储",
+      "category": "对象存储",
+      "defaultImage": "docker.io/minio/minio",
+      "recommendedTags": ["RELEASE.2025-04-22T22-12-26Z"],
+      "supportedArches": ["amd64", "arm64"],
+      "ports": [
+        { "name": "api", "container": 9000, "defaultHost": 9000, "protocol": "tcp" },
+        { "name": "console", "container": 9001, "defaultHost": 9001, "protocol": "tcp" }
+      ],
+      "envHints": [
+        { "key": "MINIO_ROOT_USER", "label": "管理员账号", "required": true },
+        { "key": "MINIO_ROOT_PASSWORD", "label": "管理员密码", "secret": true, "required": true }
+      ],
+      "dataVolume": "/data",
+      "healthCheck": { "type": "exec", "cmd": ["curl", "-sf", "http://127.0.0.1:9000/minio/health/live"] },
+      "minMemoryGb": 1
+    },
+    {
+      "id": "rabbitmq-3.13",
+      "displayName": "RabbitMQ 3.13",
+      "category": "消息队列",
+      "defaultImage": "docker.io/library/rabbitmq",
+      "recommendedTags": ["3.13.7-management", "3.12.14-management"],
+      "supportedArches": ["amd64", "arm64"],
+      "ports": [
+        { "name": "amqp", "container": 5672, "defaultHost": 5672, "protocol": "tcp" },
+        { "name": "mgmt", "container": 15672, "defaultHost": 15672, "protocol": "tcp" }
+      ],
+      "envHints": [
+        { "key": "RABBITMQ_DEFAULT_USER", "label": "默认账号" },
+        { "key": "RABBITMQ_DEFAULT_PASS", "label": "默认密码", "secret": true, "required": true }
+      ],
+      "dataVolume": "/var/lib/rabbitmq",
+      "healthCheck": { "type": "exec", "cmd": ["rabbitmq-diagnostics", "-q", "ping"] },
+      "minMemoryGb": 1
+    },
+    {
+      "id": "kafka-3.7",
+      "displayName": "Kafka 3.7 (KRaft)",
+      "category": "消息队列",
+      "defaultImage": "docker.io/bitnami/kafka",
+      "recommendedTags": ["3.7", "3.6.2"],
+      "supportedArches": ["amd64", "arm64"],
+      "ports": [{ "name": "kafka", "container": 9092, "defaultHost": 9092, "protocol": "tcp" }],
+      "envHints": [
+        { "key": "KAFKA_CFG_NODE_ID", "label": "节点 ID", "default": "0" },
+        { "key": "KAFKA_CFG_PROCESS_ROLES", "label": "节点角色", "default": "controller,broker" },
+        { "key": "KAFKA_CFG_LISTENERS", "label": "监听器", "default": "PLAINTEXT://:9092,CONTROLLER://:9093" },
+        { "key": "KAFKA_CFG_ADVERTISED_LISTENERS", "label": "对外监听器", "default": "PLAINTEXT://127.0.0.1:9092" },
+        { "key": "KAFKA_CFG_CONTROLLER_QUORUM_VOTERS", "label": "仲裁投票者", "default": "0@127.0.0.1:9093" }
+      ],
+      "dataVolume": "/bitnami/kafka",
+      "healthCheck": { "type": "tcp", "cmd": [] },
+      "minMemoryGb": 2
+    },
+    {
+      "id": "elasticsearch-8",
+      "displayName": "Elasticsearch 8",
+      "category": "搜索/观测",
+      "defaultImage": "docker.io/library/elasticsearch",
+      "recommendedTags": ["8.14.3", "8.13.4", "7.17.22"],
+      "supportedArches": ["amd64", "arm64"],
+      "ports": [
+        { "name": "http", "container": 9200, "defaultHost": 9200, "protocol": "tcp" },
+        { "name": "transport", "container": 9300, "defaultHost": 9300, "protocol": "tcp" }
+      ],
+      "envHints": [
+        { "key": "discovery.type", "label": "发现模式", "default": "single-node" },
+        { "key": "ELASTIC_PASSWORD", "label": "elastic 密码", "secret": true },
+        { "key": "ES_JAVA_OPTS", "label": "JVM 参数", "default": "-Xms2g -Xmx2g" }
+      ],
+      "dataVolume": "/usr/share/elasticsearch/data",
+      "healthCheck": { "type": "exec", "cmd": ["curl", "-sf", "http://127.0.0.1:9200/_cluster/health"] },
+      "minMemoryGb": 4,
+      "kernelReqs": ["vm.max_map_count>=262144"]
+    },
+    {
+      "id": "nacos-2",
+      "displayName": "Nacos 2 (standalone)",
+      "category": "注册/配置中心",
+      "defaultImage": "docker.io/nacos/nacos-server",
+      "recommendedTags": ["v2.4.3", "v2.3.2"],
+      "supportedArches": ["amd64", "arm64"],
+      "ports": [
+        { "name": "http", "container": 8848, "defaultHost": 8848, "protocol": "tcp" },
+        { "name": "grpc", "container": 9848, "defaultHost": 9848, "protocol": "tcp" }
+      ],
+      "envHints": [
+        { "key": "MODE", "label": "运行模式", "default": "standalone" },
+        { "key": "NACOS_AUTH_ENABLE", "label": "开启鉴权", "default": "false" }
+      ],
+      "dataVolume": "/home/nacos/data",
+      "healthCheck": { "type": "exec", "cmd": ["curl", "-sf", "http://127.0.0.1:8848/nacos/v1/console/health/readiness"] },
+      "minMemoryGb": 2
+    }
+  ]
+}
