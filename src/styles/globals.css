@@ -153,6 +153,12 @@ body {
   margin: 0;
 }
 
+/* 玻璃拟态面板（标题栏/状态栏） */
+.glass-panel {
+  backdrop-filter: blur(12px);
+  background: var(--t-glass-header);
+}
+
 /* === Scrollbar === */
 ::-webkit-scrollbar {
   width: 6px;
