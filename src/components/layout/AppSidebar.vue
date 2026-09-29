@@ -16,7 +16,7 @@ const navItems: NavItem[] = [
   { name: 'projects', label: '方案管理', icon: 'folder_open', ready: true },
   { name: 'images', label: '镜像库', icon: 'dataset', ready: false },
   { name: 'docker-pkgs', label: 'Docker 安装包库', icon: 'archive', ready: false },
-  { name: 'settings', label: '设置', icon: 'settings', ready: false }
+  { name: 'settings', label: '设置', icon: 'settings', ready: true }
 ]
 
 const activeName = computed(() => route.name?.toString() ?? '')
