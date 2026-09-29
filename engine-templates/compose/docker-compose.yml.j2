@@ -18,7 +18,7 @@ services:
 {% endif %}{% endfor %}{% endif %}
 {% if inst.env %}
     environment:
-{% for k, v in inst.env %}      {{ k }}: "{{ v }}"
+{% for e in inst.env %}      {{ e.k }}: "{{ e.v }}"
 {% endfor %}{% endif %}
     volumes:
       - ./data/{{ inst.instance_name }}:{{ inst.data_volume }}

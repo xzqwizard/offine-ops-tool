@@ -8,7 +8,6 @@ use minijinja::Environment;
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -348,10 +347,10 @@ fn build_server(
         .iter()
         .map(|inst| {
             let tpl = tpl_of(&inst.template_id);
-            let env_map: BTreeMap<String, String> = inst
+            let env_pairs: Vec<serde_json::Value> = inst
                 .params
                 .iter()
-                .map(|(k, v)| (k.clone(), value_to_plain_string(v)))
+                .map(|(k, v)| json!({ "k": k, "v": value_to_plain_string(v) }))
                 .collect();
             let ports_csv = inst
                 .ports
@@ -380,7 +379,7 @@ fn build_server(
             json!({
                 "instance_name": inst.instance_name,
                 "image": inst.image,
-                "env": env_map,
+                "env": env_pairs,
                 "ports": inst.ports.iter().map(|p| json!({
                     "host": p.host, "container": p.container,
                     "protocol": p.protocol, "expose": p.expose
@@ -656,5 +655,80 @@ fn image_tag_of(image: &str) -> String {
             tag.to_string()
         }
         _ => "latest".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 样例上下文：覆盖模板引用的全部变量，防止模板变量缺失/语法错误逃逸
+    fn sample_ctx() -> serde_json::Value {
+        json!({
+            "project_name": "测试方案",
+            "build_id": "b-test-0001",
+            "generated_at": "2026-09-29T12:00:00+08:00",
+            "server": {
+                "name": "应用服务器01", "arch": "arm64",
+                "os_family": "kylin", "os_version": "V10 SP3",
+                "ip": "10.10.1.11", "docker_version": "27.5.1",
+                "docker_data_root": "/data/docker", "deploy_base_dir": "/opt/stack"
+            },
+            "instances": [{
+                "instance_name": "mysql", "image": "docker.io/library/mysql:8.0.42",
+                "env": [ { "k": "MYSQL_ROOT_PASSWORD", "v": "p@ss" } ],
+                "ports": [{ "host": 3306, "container": 3306, "protocol": "tcp", "expose": true }],
+                "data_volume": "/var/lib/mysql",
+                "health_cmd": ["mysqladmin", "ping"],
+                "ports_csv": "3306→3306",
+                "backup_hint": "mysqldump ...",
+                "min_memory_gb": 1.0
+            }],
+            "images": [{ "file": "images/mysql_8.0.42.tar", "reference": "docker.io/library/mysql:8.0.42" }],
+            "services_csv": "mysql",
+            "exposed_ports_csv": "3306",
+            "allowed_rules": [{ "from_name": "应用服务器01", "from_ip": "10.10.1.11", "to_port": 3306, "protocol": "tcp", "description": "测试" }],
+            "local_ports": [{ "host": 3306, "container": 3306, "protocol": "tcp", "instance_name": "mysql", "sources": "10.10.1.21" }],
+            "uname_arch": "aarch64",
+            "dir_name": "app-01_arm64",
+            "stack_name": "test-project",
+            "mem_need_gb": 2,
+            "disk_need_mb": 15360,
+            "kernel_reqs": ["vm.max_map_count>=262144"],
+            "kernel_reqs_raw": "vm.max_map_count>=262144",
+        })
+    }
+
+    #[test]
+    fn all_templates_parse_and_render() {
+        let env = template_env().expect("模板解析失败");
+        let ctx = sample_ctx();
+        for (name, _) in TEMPLATES {
+            let out = render(&env, name, &ctx).unwrap_or_else(|e| panic!("模板 {name} 渲染失败: {e}"));
+            assert!(!out.trim().is_empty(), "模板 {name} 渲染结果为空");
+        }
+    }
+
+    #[test]
+    fn compose_contains_service_and_env() {
+        let env = template_env().unwrap();
+        let out = render(&env, "compose/docker-compose.yml.j2", &sample_ctx()).unwrap();
+        assert!(out.contains("mysql:"));
+        assert!(out.contains("image: docker.io/library/mysql:8.0.42"));
+        assert!(out.contains("MYSQL_ROOT_PASSWORD"));
+        assert!(out.contains("\"3306:3306\""));
+    }
+
+    #[test]
+    fn sanitize_keeps_safe_chars_only() {
+        assert_eq!(sanitize("应用 服务器/01"), "01");
+        assert_eq!(sanitize("app-01_生产"), "app-01_");
+    }
+
+    #[test]
+    fn image_tag_extraction() {
+        assert_eq!(image_tag_of("docker.io/library/mysql:8.0.42"), "8.0.42");
+        assert_eq!(image_tag_of("registry.cn:5000/app/img"), "latest");
+        assert_eq!(image_tag_of("nginx"), "latest");
     }
 }

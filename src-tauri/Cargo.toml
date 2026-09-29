@@ -7,7 +7,9 @@ edition = "2021"
 
 [lib]
 name = "offline_preops_tool_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# 桌面应用仅需 rlib；去掉 cdylib/staticlib 以兼容 windows-gnu(MinGW) 工具链
+# （cdylib 在 MinGW 下触发 "export ordinal too large" 链接错误）
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
