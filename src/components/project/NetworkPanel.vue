@@ -1,16 +1,20 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { save as saveFileDialog } from '@tauri-apps/plugin-dialog'
 import { useProjectStore } from '@/stores/project'
-import { toAppError } from '@/api/backend'
+import { toAppError, backend } from '@/api/backend'
 import { genId } from '@/utils/id'
 import { exposedPortsOf } from '@/utils/validate'
 import type { NetworkRule } from '@/types/project'
+import TopologyGraph from './TopologyGraph.vue'
 
 const store = useProjectStore()
 const dialogOpen = ref(false)
 const editingRuleId = ref<string | null>(null)
 const form = ref<NetworkRule>(emptyRule())
+const viewMode = ref<'matrix' | 'topology'>('matrix')
+const exporting = ref(false)
 
 function emptyRule(): NetworkRule {
   return {
@@ -159,19 +163,68 @@ async function handleDelete(rule: NetworkRule) {
 function serverName(id: string): string {
   return servers.value.find((s) => s.id === id)?.name ?? id
 }
+
+/** 导出端口矩阵 xlsx（含防火墙开通申请表） */
+async function handleExportXlsx() {
+  if (!store.project) return
+  if (!('__TAURI_INTERNALS__' in window)) {
+    ElMessage.warning('导出仅支持桌面应用环境')
+    return
+  }
+  try {
+    const path = await saveFileDialog({
+      title: '保存端口矩阵',
+      defaultPath: `端口矩阵-${store.project.name || '方案'}.xlsx`,
+      filters: [{ name: 'Excel 工作簿', extensions: ['xlsx'] }]
+    })
+    if (!path) return
+    exporting.value = true
+    try {
+      const saved = await backend.exportPortMatrixXlsx(store.project, path)
+      ElMessage.success(`已导出：${saved}`)
+    } catch (e) {
+      ElMessage.error(`导出失败: ${toAppError(e).message}`)
+    } finally {
+      exporting.value = false
+    }
+  } catch (e) {
+    ElMessage.error(`打开保存对话框失败: ${toAppError(e).message}`)
+  }
+}
 </script>
 
 <template>
   <div class="flex flex-col gap-6">
-    <!-- 端口访问矩阵 -->
+    <!-- 端口访问矩阵 / 拓扑 -->
     <section>
       <div class="flex justify-between items-center mb-3">
-        <h3 class="text-sm font-headline font-bold text-primary uppercase tracking-widest">
-          端口访问矩阵
-        </h3>
-        <span class="text-xs text-on-surface-variant">点击单元格切换放行（列=来源，行=目标端口）</span>
+        <div class="flex items-center gap-4">
+          <h3 class="text-sm font-headline font-bold text-primary uppercase tracking-widest">
+            端口访问矩阵
+          </h3>
+          <el-radio-group v-model="viewMode" size="small">
+            <el-radio-button value="matrix">矩阵</el-radio-button>
+            <el-radio-button value="topology">拓扑</el-radio-button>
+          </el-radio-group>
+        </div>
+        <div class="flex items-center gap-3">
+          <span v-if="viewMode === 'matrix'" class="text-xs text-on-surface-variant"
+            >点击单元格切换放行（列=来源，行=目标端口）</span
+          >
+          <button
+            class="px-4 py-1 rounded-lg text-xs font-bold border border-primary/50 text-primary hover:bg-primary/10 transition-colors"
+            :disabled="exporting"
+            @click="handleExportXlsx"
+          >
+            {{ exporting ? '导出中…' : '导出 xlsx（含防火墙申请表）' }}
+          </button>
+        </div>
       </div>
-      <div class="bg-surface-container-low rounded-xl border border-outline-variant p-4 overflow-x-auto">
+      <TopologyGraph v-if="viewMode === 'topology'" />
+      <div
+        v-if="viewMode === 'matrix'"
+        class="bg-surface-container-low rounded-xl border border-outline-variant p-4 overflow-x-auto"
+      >
         <table v-if="servers.length && matrixRows.length" class="w-full text-sm">
           <thead>
             <tr>

@@ -27,6 +27,7 @@ sha2 = "0.10"
 hex = "0.4"
 tar = "0.4"
 flate2 = "1"
+rust_xlsxwriter = "0.99.1"
 
 [profile.release]
 panic = "abort"

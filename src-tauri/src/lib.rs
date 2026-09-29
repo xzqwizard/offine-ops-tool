@@ -6,9 +6,10 @@ pub mod docker_versions;
 mod engine;
 mod error;
 pub mod images;
-mod models;
+pub mod models;
 mod net;
 pub mod store;
+pub mod xlsx_export;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -40,6 +41,7 @@ pub fn run() {
             docker_pkgs::import_docker_pkgs,
             docker_pkgs::download_docker_static,
             docker_pkgs::download_compose_plugin,
+            xlsx_export::export_port_matrix_xlsx,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
