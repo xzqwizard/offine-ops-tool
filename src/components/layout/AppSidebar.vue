@@ -15,7 +15,7 @@ const navItems: NavItem[] = [
   { name: 'workbench', label: '工作台', icon: 'space_dashboard', ready: true },
   { name: 'projects', label: '方案管理', icon: 'folder_open', ready: true },
   { name: 'images', label: '镜像库', icon: 'dataset', ready: true },
-  { name: 'docker-pkgs', label: 'Docker 安装包库', icon: 'archive', ready: false },
+  { name: 'docker-pkgs', label: 'Docker 安装包库', icon: 'archive', ready: true },
   { name: 'settings', label: '设置', icon: 'settings', ready: true }
 ]
 

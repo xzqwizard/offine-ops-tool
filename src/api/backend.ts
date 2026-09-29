@@ -16,6 +16,11 @@ import type {
   ImageInspect,
   PullResult
 } from '@/types/images'
+import type {
+  ComposePluginStatus,
+  DockerPkgEntry,
+  ImportResult
+} from '@/types/dockerPkgs'
 
 /**
  * 后端适配层：前端唯一的后端调用入口。
@@ -97,6 +102,34 @@ export const backend = {
 
   async pullImage(image: string, arch: string): Promise<PullResult> {
     return invoke<PullResult>('pull_image', { image, arch })
+  },
+
+  async listDockerPkgs(): Promise<DockerPkgEntry[]> {
+    return invoke<DockerPkgEntry[]>('list_docker_pkgs')
+  },
+
+  async listComposePlugins(): Promise<ComposePluginStatus[]> {
+    return invoke<ComposePluginStatus[]>('list_compose_plugins')
+  },
+
+  async deleteDockerPkg(dir: string): Promise<void> {
+    return invoke<void>('delete_docker_pkg', { dir })
+  },
+
+  async importDockerPkgs(paths: string[], defaultArch: string): Promise<ImportResult> {
+    return invoke<ImportResult>('import_docker_pkgs', { paths, defaultArch })
+  },
+
+  async downloadDockerStatic(arch: string, version: string): Promise<DockerPkgEntry> {
+    return invoke<DockerPkgEntry>('download_docker_static', { arch, version })
+  },
+
+  async downloadComposePlugin(arch: string): Promise<ComposePluginStatus> {
+    return invoke<ComposePluginStatus>('download_compose_plugin', { arch })
+  },
+
+  async exportPortMatrixXlsx(project: Project, outputPath: string): Promise<string> {
+    return invoke<string>('export_port_matrix_xlsx', { project, outputPath })
   }
 }
 
