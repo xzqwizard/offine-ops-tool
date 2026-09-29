@@ -1,9 +1,16 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as openDirectory } from '@tauri-apps/plugin-dialog'
 import { backend, toAppError } from '@/api/backend'
-import type { AppSettings, StorageInfo, ConnectivityResult, ProxyConfig } from '@/types/project'
+import type {
+  AppSettings,
+  StorageInfo,
+  ProxyConfig,
+  ConnectivityResult,
+  NetTestEvent
+} from '@/types/project'
 
 const loading = ref(true)
 const loadError = ref('')
@@ -11,8 +18,27 @@ const saving = ref(false)
 const settings = ref<AppSettings | null>(null)
 const storage = ref<StorageInfo | null>(null)
 const newMirror = ref('')
+
+// ---- 连通性测试（弹窗 + 实时进度） ----
+interface TestItem {
+  label: string
+  state: 'pending' | 'running' | 'ok' | 'fail'
+  latencyMs: number
+  error: string
+}
+const testOpen = ref(false)
 const testing = ref(false)
-const connectivity = ref<ConnectivityResult[]>([])
+const testItems = reactive<TestItem[]>([])
+const testProxyUsed = ref<string | null>(null)
+let unlistenNetTest: UnlistenFn | null = null
+
+function labelOf(target: string): string {
+  if (target.includes('www.google.com')) return '代理通道（google.com）'
+  if (target.includes('auth.docker.io')) return 'Docker Hub 认证端点'
+  if (target.includes('registry-1.docker.io')) return 'Docker Hub Registry'
+  if (target.includes('daocloud')) return '国内镜像源（daocloud）'
+  return target
+}
 
 function emptyProxy(): ProxyConfig {
   return { enabled: false, scheme: 'http', host: '127.0.0.1', port: 7890, username: null, password: null, noProxy: null }
@@ -62,16 +88,34 @@ async function loadAll() {
   }
 }
 
-onMounted(loadAll)
+onMounted(async () => {
+  await loadAll()
+  try {
+    unlistenNetTest = await listen<NetTestEvent>('net-test', (e) => {
+      const { target, state, result } = e.payload
+      const item = testItems.find((t) => t.label === labelOf(target))
+      if (!item) return
+      if (state === 'running') {
+        item.state = 'running'
+      } else if (result) {
+        item.state = result.ok ? 'ok' : 'fail'
+        item.latencyMs = result.latencyMs
+        item.error = result.ok ? '' : result.error || '不可达'
+      }
+    })
+  } catch {
+    /* 非 Tauri 环境忽略 */
+  }
+})
 
-/** 保存后立即测一次连通性（读数展示在代理卡片里） */
+onUnmounted(() => unlistenNetTest?.())
+
 async function handleSave() {
   if (!settings.value) return
   saving.value = true
   try {
     storage.value = await backend.saveSettings(settings.value)
     ElMessage.success('设置已保存（目录已就绪）')
-    runTest()
   } catch (e) {
     ElMessage.error(`保存失败: ${toAppError(e).message}`)
   } finally {
@@ -79,21 +123,49 @@ async function handleSave() {
   }
 }
 
+/** 弹窗内逐目标实时测试；直接使用界面当前配置（未保存也生效） */
 async function runTest() {
+  if (!settings.value || testing.value) return
+  const snapshot: AppSettings = JSON.parse(JSON.stringify(settings.value))
+
+  // 预置目标（启用代理时先测代理通道；auth/registry 是拉镜像的实际依赖）
+  const targets: string[] = []
+  const proxyOn = snapshot.proxy?.enabled && !!snapshot.proxy.host.trim() && !!snapshot.proxy.port
+  if (proxyOn) targets.push('https://www.google.com/')
+  targets.push('https://auth.docker.io/token', 'https://registry-1.docker.io/v2/', 'https://docker.m.daocloud.io/v2/')
+
+  testItems.length = 0
+  for (const t of targets) {
+    testItems.push({ label: labelOf(t), state: 'pending', latencyMs: 0, error: '' })
+  }
+  testProxyUsed.value = null
+  testOpen.value = true
   testing.value = true
+
   try {
-    connectivity.value = await backend.testNetwork()
+    const report = await backend.testNetwork(snapshot)
+    testProxyUsed.value = report.proxyUsed
+    // 事件丢失时以最终报告兜底刷新
+    for (const r of report.results) {
+      const item = testItems.find((t) => t.label === labelOf(r.target))
+      if (item && item.state !== 'running') continue
+      if (item) {
+        item.state = r.ok ? 'ok' : 'fail'
+        item.latencyMs = r.latencyMs
+        item.error = r.ok ? '' : r.error || '不可达'
+      }
+    }
   } catch (e) {
     ElMessage.error(`测试失败: ${toAppError(e).message}`)
+    for (const item of testItems) {
+      if (item.state === 'pending' || item.state === 'running') {
+        item.state = 'fail'
+        item.error = '未执行'
+      }
+    }
   } finally {
     testing.value = false
   }
-}
-
-function targetLabel(url: string): string {
-  if (url.includes('registry-1.docker.io')) return 'Docker Hub（官方源）'
-  if (url.includes('daocloud')) return '国内镜像源（daocloud）'
-  return url
 }
 
 /** 目录选择器（Tauri 环境下弹出系统对话框；浏览器开发模式提示不可用） */
@@ -301,24 +373,8 @@ function removeMirror(index: number) {
             {{ testing ? '测试中…' : '测试连通性' }}
           </button>
           <span class="text-[10px] text-on-surface-variant/50">
-            保存设置后测试生效；401 状态即代表源可达（正常认证质询）
+            使用界面当前配置测试（无需先保存）；401 状态即代表源可达
           </span>
-        </div>
-        <div v-if="connectivity.length" class="flex flex-col gap-1.5">
-          <div
-            v-for="c in connectivity"
-            :key="c.target"
-            class="flex items-center gap-3 text-xs font-mono bg-surface-container rounded-lg px-3 py-1.5 border border-outline-variant"
-          >
-            <span
-              class="w-2 h-2 rounded-full shrink-0"
-              :class="c.ok ? 'bg-success' : 'bg-error'"
-            ></span>
-            <span class="w-48 shrink-0">{{ targetLabel(c.target) }}</span>
-            <span class="flex-1 truncate" :class="c.ok ? 'text-success' : 'text-error'">
-              {{ c.ok ? `可达 · ${c.latencyMs}ms` : c.error || '不可达' }}
-            </span>
-          </div>
         </div>
       </div>
     </section>
@@ -349,4 +405,77 @@ function removeMirror(index: number) {
     </div>
     </template>
   </div>
+
+  <!-- 连通性测试弹窗（逐目标实时进度） -->
+  <el-dialog
+    v-model="testOpen"
+    title="网络连通性测试"
+    width="560"
+    :close-on-click-modal="!testing"
+    :close-on-press-escape="!testing"
+    :show-close="!testing"
+  >
+    <div class="mb-3 font-mono text-xs text-on-surface-variant">
+      <template v-if="testing">
+        正在逐目标探测（每个最长 15 秒），窗口可正常操作…
+      </template>
+      <template v-else>
+        测试通道：
+        <span :class="testProxyUsed ? 'text-success' : 'text-on-surface-variant'">
+          {{ testProxyUsed ? `经代理 ${testProxyUsed}` : '直连（未启用代理）' }}
+        </span>
+      </template>
+    </div>
+    <div class="flex flex-col gap-2">
+      <div
+        v-for="item in testItems"
+        :key="item.label"
+        class="flex items-center gap-3 text-xs bg-surface-container rounded-lg px-3 py-2.5 border border-outline-variant"
+      >
+        <!-- 状态图标 -->
+        <span
+          v-if="item.state === 'running'"
+          class="material-symbols-outlined text-lg text-primary animate-spin"
+          >progress_activity</span
+        >
+        <span
+          v-else-if="item.state === 'ok'"
+          class="material-symbols-outlined text-lg text-success"
+          >check_circle</span
+        >
+        <span
+          v-else-if="item.state === 'fail'"
+          class="material-symbols-outlined text-lg text-error"
+          >cancel</span
+        >
+        <span v-else class="material-symbols-outlined text-lg text-on-surface-variant/30"
+          >schedule</span
+        >
+        <span class="w-44 shrink-0">{{ item.label }}</span>
+        <span
+          class="flex-1 truncate"
+          :class="item.state === 'ok' ? 'text-success' : item.state === 'fail' ? 'text-error' : 'text-on-surface-variant/50'"
+        >
+          {{
+            item.state === 'pending'
+              ? '等待中'
+              : item.state === 'running'
+                ? '探测中…'
+                : item.state === 'ok'
+                  ? `可达 · ${item.latencyMs}ms`
+                  : item.error || '不可达'
+          }}
+        </span>
+      </div>
+    </div>
+    <div class="text-[10px] text-on-surface-variant/50 mt-3">
+      诊断参考：代理通道✗ → 检查代理软件/端口/类型（HTTP 端口选 HTTP，勿选 SOCKS5）；
+      代理通道✓ 但 Docker 端点✗ → 代理节点访问不了 Docker，请切换节点（镜像拉取会自动回退国内源兜底）；
+      daocloud✗ → 内网限制了国内镜像源，需联系网络组
+    </div>
+    <template #footer>
+      <el-button :disabled="testing" @click="testOpen = false">关闭</el-button>
+      <el-button type="primary" :disabled="testing" @click="runTest">重新测试</el-button>
+    </template>
+  </el-dialog>
 </template>

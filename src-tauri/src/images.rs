@@ -155,16 +155,22 @@ struct RawConfig {
     os: String,
 }
 
-/// 查询镜像的架构支持矩阵与 digest（按镜像源顺序尝试）
+/// 查询镜像的架构支持矩阵与 digest（按镜像源顺序尝试，后台线程执行）
 #[tauri::command]
-pub fn inspect_image(app: AppHandle, image: String) -> AppResult<ImageInspect> {
-    let settings = store::load_settings(&app)?;
-    let r = parse_reference(&image)?;
+pub async fn inspect_image(app: AppHandle, image: String) -> AppResult<ImageInspect> {
+    tauri::async_runtime::spawn_blocking(move || inspect_image_sync(&app, &image))
+        .await
+        .map_err(|e| AppError::Io(format!("查询任务异常: {e}")))?
+}
+
+fn inspect_image_sync(app: &AppHandle, image: &str) -> AppResult<ImageInspect> {
+    let settings = store::load_settings(app)?;
+    let r = parse_reference(image)?;
     let mut errors: Vec<String> = Vec::new();
 
     for cand in candidates(&settings, &r) {
         // 1) manifest：判断是否 index 并收集 platform
-        match run_crane(&app, &["manifest", "--platform", "all", &cand]) {
+        match run_crane(app, &["manifest", "--platform", "all", &cand]) {
             Ok(o) if o.status.success() => {
                 let body = String::from_utf8_lossy(&o.stdout).into_owned();
                 if let Ok(idx) = serde_json::from_str::<RawIndex>(&body) {
@@ -183,7 +189,7 @@ pub fn inspect_image(app: AppHandle, image: String) -> AppResult<ImageInspect> {
                                 }
                             })
                             .collect();
-                        let digest = query_digest(&app, &cand)?;
+                        let digest = query_digest(app, &cand)?;
                         return Ok(ImageInspect {
                             is_list: true,
                             arches,
@@ -193,12 +199,12 @@ pub fn inspect_image(app: AppHandle, image: String) -> AppResult<ImageInspect> {
                     }
                 }
                 // 2) 单架构：从 config 读 os/arch
-                if let Ok(cfg_out) = run_crane(&app, &["config", &cand]) {
+                if let Ok(cfg_out) = run_crane(app, &["config", &cand]) {
                     if cfg_out.status.success() {
                         if let Ok(cfg) =
                             serde_json::from_str::<RawConfig>(&String::from_utf8_lossy(&cfg_out.stdout))
                         {
-                            let digest = query_digest(&app, &cand)?;
+                            let digest = query_digest(app, &cand)?;
                             return Ok(ImageInspect {
                                 is_list: false,
                                 arches: vec![format!("{}/{}", cfg.os, cfg.architecture)],
@@ -231,11 +237,17 @@ fn query_digest(app: &AppHandle, reference: &str) -> AppResult<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// 查询仓库 tag 列表（部分镜像源不代理 tags 接口，自动回退）
+/// 查询仓库 tag 列表（部分镜像源不代理 tags 接口，自动回退，后台线程执行）
 #[tauri::command]
-pub fn list_image_tags(app: AppHandle, image: String) -> AppResult<Vec<String>> {
-    let settings = store::load_settings(&app)?;
-    let r = parse_reference(&image)?;
+pub async fn list_image_tags(app: AppHandle, image: String) -> AppResult<Vec<String>> {
+    tauri::async_runtime::spawn_blocking(move || list_image_tags_sync(&app, &image))
+        .await
+        .map_err(|e| AppError::Io(format!("tag 查询任务异常: {e}")))?
+}
+
+fn list_image_tags_sync(app: &AppHandle, image: &str) -> AppResult<Vec<String>> {
+    let settings = store::load_settings(app)?;
+    let r = parse_reference(image)?;
     let mut errors: Vec<String> = Vec::new();
     for cand in candidates(&settings, &r) {
         let repo_only = cand.split('@').next().unwrap_or(&cand);
@@ -243,7 +255,7 @@ pub fn list_image_tags(app: AppHandle, image: String) -> AppResult<Vec<String>> 
             Some(i) if i > repo_only.rfind('/').unwrap_or(0) => &repo_only[..i],
             _ => repo_only,
         };
-        match run_crane(&app, &["ls", repo_only]) {
+        match run_crane(app, &["ls", repo_only]) {
             Ok(o) if o.status.success() => {
                 let tags: Vec<String> = String::from_utf8_lossy(&o.stdout)
                     .lines()
@@ -370,14 +382,20 @@ fn emit(app: &AppHandle, status: &str, detail: &str) {
     let _ = app.emit("image-pull", serde_json::json!({ "status": status, "detail": detail }));
 }
 
-/// 拉取镜像到缓存（跨架构 docker-archive）。命中缓存直接返回。
+/// 拉取镜像到缓存（跨架构 docker-archive，后台线程执行）。命中缓存直接返回。
 #[tauri::command]
-pub fn pull_image(app: AppHandle, image: String, arch: String) -> AppResult<PullResult> {
+pub async fn pull_image(app: AppHandle, image: String, arch: String) -> AppResult<PullResult> {
+    tauri::async_runtime::spawn_blocking(move || pull_image_sync(&app, &image, &arch))
+        .await
+        .map_err(|e| AppError::Io(format!("拉取任务异常: {e}")))?
+}
+
+fn pull_image_sync(app: &AppHandle, image: &str, arch: &str) -> AppResult<PullResult> {
     let os = "linux";
-    let final_path = cache_file_for(&app, &image, os, &arch)?;
+    let final_path = cache_file_for(app, image, os, arch)?;
     if final_path.is_file() {
         return Ok(PullResult {
-            reference: image,
+            reference: image.to_string(),
             platform: format!("{os}/{arch}"),
             cache_file: final_path.to_string_lossy().into_owned(),
             size_bytes: final_path.metadata().map(|m| m.len()).unwrap_or(0),
@@ -387,7 +405,7 @@ pub fn pull_image(app: AppHandle, image: String, arch: String) -> AppResult<Pull
             elapsed_ms: 0,
         });
     }
-    let result = pull_image_inner(&app, &image, os, &arch, &final_path)?;
+    let result = pull_image_inner(app, image, os, arch, &final_path)?;
     Ok(result)
 }
 

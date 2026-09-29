@@ -1,8 +1,17 @@
 fn main() {
-    tauri_build::build();
+    // 主程序不使用 Tauri 内嵌 manifest（new_without_app_manifest），
+    // 改为下方全局注入统一清单：否则仅 bin 有 manifest，而 lib 单元测试/
+    // 集成测试/示例产物缺失清单时，加载器绑定 comctl32 5.82，缺少
+    // TaskDialogIndirect 等入口 → 进程以 STATUS_ENTRYPOINT_NOT_FOUND 静默失败。
+    let attrs = tauri_build::Attributes::default()
+        .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
+    if let Err(e) = tauri_build::try_build(attrs) {
+        // 与 tauri_build::build() 行为一致：构建失败直接 panic
+        panic!("tauri_build failed: {e}");
+    }
 
     // windows-gnu + rust-lld 链接方案：lld 不允许重复资源，而 gcc specs 默认
-    // 注入 default-manifest.o 与 Tauri 内嵌清单冲突 → 通过自定义 specs 去除。
+    // 注入 default-manifest.o 与下方的统一清单冲突 → 通过自定义 specs 去除。
     // 路径由 build script 按当前包位置动态生成（可移植，勿硬编码）。
     // 详见 .cargo/config.toml 说明与本目录 mingw-specs-nodm.txt。
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
@@ -12,17 +21,13 @@ fn main() {
         .replace('\\', "/");
     println!("cargo:rustc-link-arg=-specs={specs}");
 
-    // 测试/示例二进制补嵌 common-controls v6 清单：
-    // 主 bin 由 tauri_build 嵌入完整资源；tests/examples 产物缺清单时加载器
-    // 绑定 comctl32 5.82，TaskDialogIndirect 等导入缺失 → 进程以
-    // STATUS_ENTRYPOINT_NOT_FOUND 静默失败。
-    // 实现：windres 将最小清单编译为 COFF 目标文件，仅注入 test/example 目标
-    // （cargo:rustc-link-arg-tests 仅在存在显式/自动发现的 test 目标时合法）。
+    // 统一清单（common-controls v6 + DPI 感知 + UTF-8 代码页），windres 编译
+    // 为 COFF 后全局注入（bin/lib-test/test/example 全部生效，各一份无重复）。
     if let Ok(out_dir) = std::env::var("OUT_DIR") {
         let out = std::path::Path::new(&out_dir);
-        let manifest = out.join("test-manifest.xml");
-        let rc = out.join("test-manifest.rc");
-        let obj = out.join("test-manifest.o");
+        let manifest = out.join("app-manifest.xml");
+        let rc = out.join("app-manifest.rc");
+        let obj = out.join("app-manifest.o");
         let xml = concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n",
             "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n",
@@ -35,7 +40,7 @@ fn main() {
             "</assembly>\n"
         );
         if std::fs::write(&manifest, xml).is_ok() {
-            let _ = std::fs::write(&rc, "1 24 \"test-manifest.xml\"\n");
+            let _ = std::fs::write(&rc, "1 24 \"app-manifest.xml\"\n");
             let wr = std::process::Command::new("x86_64-w64-mingw32-windres")
                 .arg("-i").arg(&rc)
                 .arg("-O").arg("coff")
@@ -44,8 +49,9 @@ fn main() {
                 .status();
             if matches!(wr, Ok(s) if s.success()) {
                 let p = obj.to_string_lossy().replace('\\', "/");
-                println!("cargo:rustc-link-arg-tests={p}");
-                println!("cargo:rustc-link-arg-examples={p}");
+                println!("cargo:rustc-link-arg={p}");
+            } else {
+                panic!("windres 编译统一清单失败（本方案依赖该清单，请确认 MinGW windres 可用）");
             }
         }
     }

@@ -5,7 +5,8 @@ import type {
   ConnectivityResult,
   Project,
   ProjectSummary,
-  StorageInfo
+  StorageInfo,
+  TestNetworkReport
 } from '@/types/project'
 import type { CatalogFile } from '@/types/catalog'
 import type { BuildResult } from '@/types/build'
@@ -65,8 +66,9 @@ export const backend = {
     return invoke<string[]>('list_docker_versions', { arch })
   },
 
-  async testNetwork(): Promise<ConnectivityResult[]> {
-    return invoke<ConnectivityResult[]>('test_network')
+  /** settings 传界面当前配置（未保存也可测）；缺省用已保存设置 */
+  async testNetwork(settings?: AppSettings): Promise<TestNetworkReport> {
+    return invoke<TestNetworkReport>('test_network', { settings: settings ?? null })
   },
 
   async engineStatus(): Promise<EngineStatus> {

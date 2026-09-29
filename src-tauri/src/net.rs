@@ -3,7 +3,7 @@ use crate::models::AppSettings;
 use crate::store;
 use serde::Serialize;
 use std::time::Instant;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 /// 统一的外网访问入口：所有 HTTP 请求走系统 curl（自动应用代理设置），
 /// 所有外部子进程（crane 等）注入标准代理环境变量。
@@ -54,9 +54,6 @@ pub fn proxy_envs(settings: &AppSettings) -> Vec<(String, String)> {
 }
 
 /// HTTP GET（curl），自动应用代理与超时。返回响应体。
-pub fn http_get(app: &AppHandle, url: &str) -> AppResult<String> {
-    http_get_with_settings(&store::load_settings(app)?, url, 20)
-}
 
 pub fn http_get_with_settings(settings: &AppSettings, url: &str, timeout_secs: u64) -> AppResult<String> {
     let mut args: Vec<String> = vec![
@@ -152,15 +149,55 @@ fn probe(settings: &AppSettings, url: &str) -> ConnectivityResult {
     }
 }
 
-/// 网络连通性测试：
-/// - direct_hub：直连 Docker Hub（多数政务外网环境不通，预期现象）
-/// - proxy_hub：按当前代理设置访问 Docker Hub（配置正确时应通）
-/// - direct_mirror：直连国内镜像源（无代理时的兜底通道）
+/// 网络连通性测试报告
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestNetworkReport {
+    /// 本次测试实际使用的代理（None=直连）
+    pub proxy_used: Option<String>,
+    pub results: Vec<ConnectivityResult>,
+}
+
+fn emit_test(app: &AppHandle, target: &str, state: &str, result: Option<&ConnectivityResult>) {
+    let _ = app.emit(
+        "net-test",
+        serde_json::json!({ "target": target, "state": state, "result": result }),
+    );
+}
+
+/// 网络连通性测试（后台线程执行，逐目标推送 net-test 事件）：
+/// - 代理通道探针（启用代理时，验证代理本身可用；google.com 对节点分流最敏感）
+/// - auth.docker.io（拉取 Docker Hub 镜像的 token 端点，最贴近实际拉取链路）
+/// - registry-1.docker.io（Docker Hub Registry API）
+/// - 国内镜像源 daocloud（直连兜底通道）
+/// settings 参数：前端传入界面当前配置（未保存也可测）；缺省读已保存设置。
 #[tauri::command]
-pub fn test_network(app: AppHandle) -> AppResult<Vec<ConnectivityResult>> {
-    let settings = store::load_settings(&app)?;
-    Ok(vec![
-        probe(&settings, "https://registry-1.docker.io/v2/"),
-        probe(&settings, "https://docker.m.daocloud.io/v2/"),
-    ])
+pub async fn test_network(
+    app: AppHandle,
+    settings: Option<AppSettings>,
+) -> AppResult<TestNetworkReport> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = match settings {
+            Some(s) => s,
+            None => store::load_settings(&app)?,
+        };
+        let proxy_used = proxy_url(&settings);
+        let mut targets: Vec<&str> = Vec::new();
+        if proxy_used.is_some() {
+            targets.push("https://www.google.com/");
+        }
+        targets.push("https://auth.docker.io/token");
+        targets.push("https://registry-1.docker.io/v2/");
+        targets.push("https://docker.m.daocloud.io/v2/");
+        let mut results = Vec::new();
+        for url in targets {
+            emit_test(&app, url, "running", None);
+            let r = probe(&settings, url);
+            emit_test(&app, url, "done", Some(&r));
+            results.push(r);
+        }
+        Ok(TestNetworkReport { proxy_used, results })
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("测试任务异常: {e}")))?
 }

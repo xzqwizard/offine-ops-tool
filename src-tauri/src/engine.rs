@@ -70,23 +70,29 @@ fn emit(app: &AppHandle, step: &str, detail: &str) {
     let _ = app.emit("engine-install", serde_json::json!({ "step": step, "detail": detail }));
 }
 
-/// 下载并安装 crane 引擎（幂等：已安装同版本则跳过）
+/// 下载并安装 crane 引擎（后台线程执行，幂等：已安装同版本则跳过）
 #[tauri::command]
-pub fn engine_install(app: AppHandle, force: bool) -> AppResult<EngineStatus> {
-    let settings = store::load_settings(&app)?;
-    let dir = bin_dir(&app)?;
+pub async fn engine_install(app: AppHandle, force: bool) -> AppResult<EngineStatus> {
+    tauri::async_runtime::spawn_blocking(move || engine_install_sync(&app, force))
+        .await
+        .map_err(|e| AppError::Io(format!("安装任务异常: {e}")))?
+}
+
+fn engine_install_sync(app: &AppHandle, force: bool) -> AppResult<EngineStatus> {
+    let settings = store::load_settings(app)?;
+    let dir = bin_dir(app)?;
     fs::create_dir_all(&dir)?;
     let exe = dir.join("crane.exe");
     let marker = dir.join("crane-version.txt");
 
-    emit(&app, "start", "获取 go-containerregistry 最新版本号…");
+    emit(app, "start", "获取 go-containerregistry 最新版本号…");
     let rel_raw = http_get_with_settings(&settings, RELEASES_API, 20)?;
     let rel: GithubRelease = serde_json::from_str(&rel_raw)
         .map_err(|e| AppError::Serialize(format!("解析 GitHub Release 失败: {e}")))?;
     let tag = rel.tag_name;
     let current = fs::read_to_string(&marker).ok().map(|v| v.trim().to_string());
     if !force && current.as_deref() == Some(tag.as_str()) && exe.is_file() {
-        emit(&app, "done", &format!("已安装最新版 {tag}，跳过"));
+        emit(app, "done", &format!("已安装最新版 {tag}，跳过"));
         return engine_status_inner(&exe, &marker);
     }
 
@@ -94,7 +100,7 @@ pub fn engine_install(app: AppHandle, force: bool) -> AppResult<EngineStatus> {
     let arch = host_asset_arch();
     let base = format!("https://github.com/google/go-containerregistry/releases/download/{tag}");
     let asset_name = format!("go-containerregistry_Windows_{arch}.tar.gz");
-    emit(&app, "checksum", "下载官方校验清单…");
+    emit(app, "checksum", "下载官方校验清单…");
     let checksums = http_get_with_settings(&settings, &format!("{base}/checksums.txt"), 20)?;
     let expect = checksums
         .lines()
@@ -104,7 +110,7 @@ pub fn engine_install(app: AppHandle, force: bool) -> AppResult<EngineStatus> {
         })
         .ok_or_else(|| AppError::Io("checksums.txt 中未找到 Windows 资产条目".into()))?;
 
-    emit(&app, "download", &format!("下载 {asset_name}（约 15MB）…"));
+    emit(app, "download", &format!("下载 {asset_name}（约 15MB）…"));
     let tmp = dir.join(format!(".{asset_name}.downloading"));
     let mut curl_args: Vec<String> = vec!["-sSL".into(), "--max-time".into(), "300".into()];
     if let Some(p) = proxy_url(&settings) {
@@ -125,7 +131,7 @@ pub fn engine_install(app: AppHandle, force: bool) -> AppResult<EngineStatus> {
         )));
     }
 
-    emit(&app, "verify", "校验 SHA256…");
+    emit(app, "verify", "校验 SHA256…");
     let actual = sha256_file(&tmp)?;
     if !actual.eq_ignore_ascii_case(&expect) {
         let _ = fs::remove_file(&tmp);
@@ -134,7 +140,7 @@ pub fn engine_install(app: AppHandle, force: bool) -> AppResult<EngineStatus> {
         )));
     }
 
-    emit(&app, "extract", "解压 crane.exe…");
+    emit(app, "extract", "解压 crane.exe…");
     let exe_tmp = dir.join(".crane.exe.extracting");
     extract_crane(&tmp, &exe_tmp)?;
 
@@ -145,7 +151,7 @@ pub fn engine_install(app: AppHandle, force: bool) -> AppResult<EngineStatus> {
     let mut m = File::create(&marker)?;
     m.write_all(tag.as_bytes())?;
 
-    emit(&app, "done", &format!("crane {tag} 安装完成"));
+    emit(app, "done", &format!("crane {tag} 安装完成"));
     engine_status_inner(&exe, &marker)
 }
 

@@ -10,10 +10,17 @@ static CACHE: Mutex<Option<(String, Instant, Vec<String>)>> = Mutex::new(None);
 
 const CACHE_TTL: Duration = Duration::from_secs(600);
 
-/// 从 Docker 官方静态包目录抓取可用版本列表（倒序，自动应用代理）
+/// 从 Docker 官方静态包目录抓取可用版本列表（倒序，自动应用代理，后台线程执行）
 /// https://download.docker.com/linux/static/stable/{x86_64|aarch64}/
 #[tauri::command]
-pub fn list_docker_versions(app: AppHandle, arch: String) -> AppResult<Vec<String>> {
+pub async fn list_docker_versions(app: AppHandle, arch: String) -> AppResult<Vec<String>> {
+    tauri::async_runtime::spawn_blocking(move || list_docker_versions_sync(&app, &arch))
+        .await
+        .map_err(|e| AppError::Io(format!("版本列表任务异常: {e}")))?
+}
+
+fn list_docker_versions_sync(app: &AppHandle, arch: &str) -> AppResult<Vec<String>> {
+    let arch = arch.to_string();
     let dir = match arch.as_str() {
         "amd64" => "x86_64",
         "arm64" => "aarch64",
@@ -33,7 +40,7 @@ pub fn list_docker_versions(app: AppHandle, arch: String) -> AppResult<Vec<Strin
         }
     }
 
-    let settings = store::load_settings(&app)?;
+    let settings = store::load_settings(app)?;
     let url = format!("https://download.docker.com/linux/static/stable/{dir}/");
     let body = http_get_with_settings(&settings, &url, 20)?;
     let versions = parse_docker_versions(&body);
@@ -48,7 +55,7 @@ pub fn list_docker_versions(app: AppHandle, arch: String) -> AppResult<Vec<Strin
 }
 
 /// 从目录索引 HTML 中解析 docker-<版本>.tgz 文件名，版本倒序去重
-fn parse_docker_versions(html: &str) -> Vec<String> {
+pub fn parse_docker_versions(html: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut rest = html;
     while let Some(pos) = rest.find("docker-") {
@@ -68,7 +75,7 @@ fn parse_docker_versions(html: &str) -> Vec<String> {
     out
 }
 
-fn version_key(v: &str) -> (u64, u64, u64) {
+pub fn version_key(v: &str) -> (u64, u64, u64) {
     let mut parts = [0u64; 3];
     for (i, p) in v.split('.').take(3).enumerate() {
         parts[i] = p.parse().unwrap_or(0);
@@ -76,19 +83,3 @@ fn version_key(v: &str) -> (u64, u64, u64) {
     (parts[0], parts[1], parts[2])
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // 历史"布局敏感崩溃"已定案：并非工具链 bug，而是 WebView2Loader.dll 未随
-    // deps/examples 子目录的测试二进制落位导致进程启动失败（build.rs 已自动
-    // 复制修复，详见 build.rs 注释）。parse 测试曾因排障被移除，M2 可补回。
-    // 单元测试布局受限于本机工具链的历史问题（test 目标缺 common-controls v6
-    // 清单），保持最小集；parse 测试位于 tests/images_tests.rs（build.rs 注入
-    // 清单的显式 test 目标，可任意扩展）。
-    #[test]
-    fn version_key_numeric_compare() {
-        assert!(version_key("27.5.1") > version_key("9.03.0"));
-        assert_eq!(version_key("24.0"), (24, 0, 0));
-    }
-}

@@ -1,7 +1,7 @@
 pub mod builder;
 pub mod catalog;
 mod commands;
-mod docker_versions;
+pub mod docker_versions;
 mod engine;
 mod error;
 pub mod images;

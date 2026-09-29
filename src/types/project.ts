@@ -106,6 +106,17 @@ export interface ConnectivityResult {
   error: string
 }
 
+export interface TestNetworkReport {
+  proxyUsed: string | null
+  results: ConnectivityResult[]
+}
+
+export interface NetTestEvent {
+  target: string
+  state: 'running' | 'done' | string
+  result: ConnectivityResult | null
+}
+
 export interface StorageInfo {
   projectsRoot: string
   imageCacheRoot: string

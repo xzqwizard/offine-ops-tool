@@ -48,7 +48,7 @@ pub struct BuildResult {
 
 // ==================== 模板注册 ====================
 
-const TEMPLATES: &[(&str, &str)] = &[
+pub const TEMPLATES: &[(&str, &str)] = &[
     (
         "scripts/precheck.sh.j2",
         include_str!("../../engine-templates/scripts/precheck.sh.j2"),
@@ -87,7 +87,7 @@ const TEMPLATES: &[(&str, &str)] = &[
     ),
 ];
 
-fn template_env() -> AppResult<Environment<'static>> {
+pub fn template_env() -> AppResult<Environment<'static>> {
     let mut env = Environment::new();
     for (name, src) in TEMPLATES {
         env.add_template(name, src)
@@ -96,7 +96,7 @@ fn template_env() -> AppResult<Environment<'static>> {
     Ok(env)
 }
 
-fn render(env: &Environment<'_>, name: &str, ctx: &serde_json::Value) -> AppResult<String> {
+pub fn render(env: &Environment<'_>, name: &str, ctx: &serde_json::Value) -> AppResult<String> {
     let tpl = env
         .get_template(name)
         .map_err(|e| AppError::Serialize(format!("模板 {name} 缺失: {e}")))?;
@@ -107,7 +107,7 @@ fn render(env: &Environment<'_>, name: &str, ctx: &serde_json::Value) -> AppResu
 // ==================== 工具函数 ====================
 
 /// 名称转文件/目录安全的片段
-fn sanitize(s: &str) -> String {
+pub fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.trim().chars() {
         if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -221,18 +221,22 @@ fn backup_hint(template_id: &str) -> &'static str {
 // ==================== 主流程 ====================
 
 #[tauri::command]
-pub fn build_offline_package(
+pub async fn build_offline_package(
     app: AppHandle,
     project: Project,
     auto_pull: Option<bool>,
 ) -> AppResult<BuildResult> {
-    let auto_pull = auto_pull.unwrap_or(true);
-    let r = build(&app, &project, auto_pull);
-    match &r {
-        Ok(res) => emit(&app, "done", &format!("构建完成: {}", res.build_id)),
-        Err(e) => emit(&app, "error", &e.to_string()),
-    }
-    r
+    tauri::async_runtime::spawn_blocking(move || {
+        let auto_pull = auto_pull.unwrap_or(true);
+        let r = build(&app, &project, auto_pull);
+        match &r {
+            Ok(res) => emit(&app, "done", &format!("构建完成: {}", res.build_id)),
+            Err(e) => emit(&app, "error", &e.to_string()),
+        }
+        r
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("构建任务异常: {e}")))?
 }
 
 fn emit(app: &AppHandle, step: &str, detail: &str) {
@@ -684,7 +688,7 @@ fn value_to_plain_string(v: &serde_json::Value) -> String {
     }
 }
 
-fn image_tag_of(image: &str) -> String {
+pub fn image_tag_of(image: &str) -> String {
     let base = image.split('@').next().unwrap_or(image);
     match base.rsplit_once(':') {
         Some((before, tag)) if tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') && before.contains('/') => {
@@ -694,77 +698,3 @@ fn image_tag_of(image: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 样例上下文：覆盖模板引用的全部变量，防止模板变量缺失/语法错误逃逸
-    fn sample_ctx() -> serde_json::Value {
-        json!({
-            "project_name": "测试方案",
-            "build_id": "b-test-0001",
-            "generated_at": "2026-09-29T12:00:00+08:00",
-            "server": {
-                "name": "应用服务器01", "arch": "arm64",
-                "os_family": "kylin", "os_version": "V10 SP3",
-                "ip": "10.10.1.11", "docker_version": "27.5.1",
-                "docker_data_root": "/data/docker", "deploy_base_dir": "/opt/stack"
-            },
-            "instances": [{
-                "instance_name": "mysql", "image": "docker.io/library/mysql:8.0.42",
-                "env": [ { "k": "MYSQL_ROOT_PASSWORD", "v": "p@ss" } ],
-                "ports": [{ "host": 3306, "container": 3306, "protocol": "tcp", "expose": true }],
-                "data_volume": "/var/lib/mysql",
-                "health_cmd": ["mysqladmin", "ping"],
-                "ports_csv": "3306→3306",
-                "backup_hint": "mysqldump ...",
-                "min_memory_gb": 1.0
-            }],
-            "images": [{ "file": "images/mysql_8.0.42.tar", "reference": "docker.io/library/mysql:8.0.42" }],
-            "services_csv": "mysql",
-            "exposed_ports_csv": "3306",
-            "allowed_rules": [{ "from_name": "应用服务器01", "from_ip": "10.10.1.11", "to_port": 3306, "protocol": "tcp", "description": "测试" }],
-            "local_ports": [{ "host": 3306, "container": 3306, "protocol": "tcp", "instance_name": "mysql", "sources": "10.10.1.21" }],
-            "uname_arch": "aarch64",
-            "dir_name": "app-01_arm64",
-            "stack_name": "test-project",
-            "mem_need_gb": 2,
-            "disk_need_mb": 15360,
-            "kernel_reqs": ["vm.max_map_count>=262144"],
-            "kernel_reqs_raw": "vm.max_map_count>=262144",
-        })
-    }
-
-    #[test]
-    fn all_templates_parse_and_render() {
-        let env = template_env().expect("模板解析失败");
-        let ctx = sample_ctx();
-        for (name, _) in TEMPLATES {
-            let out = render(&env, name, &ctx).unwrap_or_else(|e| panic!("模板 {name} 渲染失败: {e}"));
-            assert!(!out.trim().is_empty(), "模板 {name} 渲染结果为空");
-        }
-    }
-
-    #[test]
-    fn compose_contains_service_and_env() {
-        let env = template_env().unwrap();
-        let out = render(&env, "compose/docker-compose.yml.j2", &sample_ctx()).unwrap();
-        assert!(out.contains("mysql:"));
-        assert!(out.contains("image: docker.io/library/mysql:8.0.42"));
-        assert!(out.contains("MYSQL_ROOT_PASSWORD"));
-        assert!(out.contains("\"3306:3306\""));
-    }
-
-    #[test]
-    fn sanitize_keeps_safe_chars_only() {
-        assert_eq!(sanitize("应用 服务器/01"), "01");
-        assert_eq!(sanitize("app-01_生产"), "app-01_");
-    }
-
-    #[test]
-    fn image_tag_extraction() {
-        assert_eq!(image_tag_of("docker.io/library/mysql:8.0.42"), "8.0.42");
-        assert_eq!(image_tag_of("registry.cn:5000/app/img"), "latest");
-        assert_eq!(image_tag_of("nginx"), "latest");
-    }
-}
