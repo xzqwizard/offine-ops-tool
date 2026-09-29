@@ -77,6 +77,16 @@ export interface ProjectSummary {
   instanceCount: number
 }
 
+export interface ProxyConfig {
+  enabled: boolean
+  scheme: 'http' | 'socks5' | string
+  host: string
+  port: number
+  username: string | null
+  password: string | null
+  noProxy: string | null
+}
+
 export interface AppSettings {
   schemaVersion: number
   projectsRoot: string | null
@@ -85,6 +95,15 @@ export interface AppSettings {
   artifactRoot: string | null
   logRoot: string | null
   registryMirrors: string[]
+  proxy: ProxyConfig | null
+}
+
+export interface ConnectivityResult {
+  target: string
+  ok: boolean
+  status: number | null
+  latencyMs: number
+  error: string
 }
 
 export interface StorageInfo {

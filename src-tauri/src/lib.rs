@@ -4,6 +4,7 @@ mod commands;
 mod docker_versions;
 mod error;
 mod models;
+mod net;
 mod store;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -21,6 +22,7 @@ pub fn run() {
             catalog::list_catalog,
             builder::build_offline_package,
             docker_versions::list_docker_versions,
+            net::test_network,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

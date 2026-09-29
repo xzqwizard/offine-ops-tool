@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import type {
   AppSettings,
   BackendError,
+  ConnectivityResult,
   Project,
   ProjectSummary,
   StorageInfo
@@ -56,6 +57,10 @@ export const backend = {
 
   async listDockerVersions(arch: string): Promise<string[]> {
     return invoke<string[]>('list_docker_versions', { arch })
+  },
+
+  async testNetwork(): Promise<ConnectivityResult[]> {
+    return invoke<ConnectivityResult[]>('test_network')
   }
 }
 

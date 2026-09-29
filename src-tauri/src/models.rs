@@ -168,6 +168,29 @@ pub struct NetworkRule {
 // ==================== 应用设置（存储根可自定义） ====================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyConfig {
+    pub enabled: bool,
+    /// http | socks5
+    #[serde(default = "default_proxy_scheme")]
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    /// TODO(M2)：迁移到 OS 凭据库；当前随设置文件存储于本机
+    #[serde(default)]
+    pub password: Option<String>,
+    /// 不走代理的地址（逗号分隔），如 localhost,127.0.0.1,10.*,192.168.*
+    #[serde(default)]
+    pub no_proxy: Option<String>,
+}
+
+fn default_proxy_scheme() -> String {
+    "http".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppSettings {
     pub schema_version: u32,
@@ -179,6 +202,8 @@ pub struct AppSettings {
     pub log_root: Option<String>,
     /// 镜像源列表（有序，失败自动切换）
     pub registry_mirrors: Vec<String>,
+    /// 外网访问代理（Docker Hub / Google 等；私有内网源可走 no_proxy 直连）
+    pub proxy: Option<ProxyConfig>,
 }
 
 impl Default for AppSettings {
@@ -195,6 +220,7 @@ impl Default for AppSettings {
                 "docker.m.daocloud.io".into(),
                 "docker.1ms.run".into(),
             ],
+            proxy: None,
         }
     }
 }

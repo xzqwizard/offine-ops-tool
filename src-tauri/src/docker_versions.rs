@@ -1,32 +1,19 @@
 use crate::error::{AppError, AppResult};
+use crate::net::http_get_with_settings;
+use crate::store;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tauri::AppHandle;
 
 /// Docker 版本列表缓存：(arch, 抓取时间, 版本列表)
 static CACHE: Mutex<Option<(String, Instant, Vec<String>)>> = Mutex::new(None);
 
 const CACHE_TTL: Duration = Duration::from_secs(600);
 
-/// HTTP GET：使用系统自带 curl（Windows 10 1803+ 原生集成，免 TLS 依赖）
-fn http_get(url: &str) -> AppResult<String> {
-    let output = std::process::Command::new("curl")
-        .args(["-sSL", "--max-time", "20", url])
-        .output()
-        .map_err(|e| AppError::Io(format!("调用系统 curl 失败: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::Io(format!(
-            "访问 Docker 官方源失败: {}（请检查办公机网络/代理）",
-            stderr.trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// 从 Docker 官方静态包目录抓取可用版本列表（倒序）
+/// 从 Docker 官方静态包目录抓取可用版本列表（倒序，自动应用代理）
 /// https://download.docker.com/linux/static/stable/{x86_64|aarch64}/
 #[tauri::command]
-pub fn list_docker_versions(arch: String) -> AppResult<Vec<String>> {
+pub fn list_docker_versions(app: AppHandle, arch: String) -> AppResult<Vec<String>> {
     let dir = match arch.as_str() {
         "amd64" => "x86_64",
         "arm64" => "aarch64",
@@ -46,8 +33,9 @@ pub fn list_docker_versions(arch: String) -> AppResult<Vec<String>> {
         }
     }
 
+    let settings = store::load_settings(&app)?;
     let url = format!("https://download.docker.com/linux/static/stable/{dir}/");
-    let body = http_get(&url)?;
+    let body = http_get_with_settings(&settings, &url, 20)?;
     let versions = parse_docker_versions(&body);
     if versions.is_empty() {
         return Err(AppError::Io(
