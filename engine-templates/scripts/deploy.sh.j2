@@ -44,7 +44,7 @@ echo " 构建: {{ build_id }}"
 echo " 日志: $LOG_FILE"
 echo "============================================================"
 
-if [ "$DRY_RUN" -eq 1 ]; then warn "dry-run 演练模式：不实际执行变更操作"; fi
+if [ "$DRY_RUN" -eq 1 ]; then warn "dry-run 演练模式：不实际执行任何变更操作"; fi
 
 # ---------- 1. 环境预检 ----------
 step "1/6 环境预检"
@@ -66,7 +66,7 @@ if command -v docker >/dev/null 2>&1; then
 else
   if [ -d "$DOCKER_OFFLINE_DIR/packages" ] && [ -n "$(ls -A "$DOCKER_OFFLINE_DIR/packages" 2>/dev/null)" ]; then
     info "从离线材料安装 Docker..."
-    bash "$DOCKER_OFFLINE_DIR/install-docker.sh"
+    run bash "$DOCKER_OFFLINE_DIR/install-docker.sh"
   else
     fail "未安装 Docker，且包内无离线安装材料（docker-offline/packages 为空）"
     fail "请先在工具端配置 Docker 离线安装包后重新构建，或人工安装 Docker {{ server.docker_version }} 后重试"
@@ -84,11 +84,11 @@ step "3/6 装载离线镜像"
 warn "本包未内嵌镜像 tar（M0 构建可不含镜像）：请确保目标镜像已存在于本机 docker images"
 {% endif %}
 {% for img in images %}
-if [ -f "$IMAGES_DIR/{{ img.file }}" ]; then
+if [ -f "$BASE_DIR/{{ img.file }}" ]; then
   info "docker load: {{ img.file }}"
-  run docker load -i "$IMAGES_DIR/{{ img.file }}"
+  run docker load -i "$BASE_DIR/{{ img.file }}"
 else
-  warn "缺少镜像文件 images/{{ img.file }}（{{ img.reference }}），该服务可能无法启动"
+  warn "缺少镜像文件 {{ img.file }}（{{ img.reference }}），该服务可能无法启动"
 fi
 {% endfor %}
 
@@ -102,28 +102,33 @@ run docker compose -f "$COMPOSE_FILE" up -d
 # ---------- 5. 健康检查 ----------
 step "5/6 健康检查"
 HEALTH_FAIL=0
+if [ "$DRY_RUN" -eq 1 ]; then
+  info "[dry-run] 跳过健康检查"
+else
 {% for inst in instances %}
 printf "    %-20s " "{{ inst.instance_name }}"
-TRY=0; MAX={{ inst.health_timeout | default(60) }}
+TRY=0; MAX={{ inst.health_timeout | default(60) }}; READY=0
 while [ $TRY -lt $MAX ]; do
-  STATE=$(docker inspect -f '{{'{{'}}.State.Running{{'}}'}}' {{ inst.instance_name }} 2>/dev/null || echo false)
-  if [ "$STATE" != "true" ]; then
-    printf "."; TRY=$((TRY+3)); sleep 3; continue
-  fi
+  STATE=$(docker inspect -f '{{'{{'}}.State.Running{{'}}'}}' "{{ inst.instance_name }}" 2>/dev/null || echo false)
+  if [ "$STATE" = "true" ]; then
 {% if inst.health_cmd %}
-  if docker exec {{ inst.instance_name }} {{ inst.health_cmd | join(' ') }} >/dev/null 2>&1; then
-    echo -e " \033[32m✓ 运行中/健康\033[0m"; break
-  fi
+    if docker exec "{{ inst.instance_name }}" {{ inst.health_cmd | join(' ') }} >/dev/null 2>&1; then
+      READY=1; break
+    fi
 {% else %}
-  echo -e " \033[32m✓ 运行中\033[0m"; break
+    READY=1; break
 {% endif %}
-  printf "."; TRY=$((TRY+3)); sleep 3
-  if [ $TRY -ge $MAX ]; then
-    echo -e " \033[31m✗ 超时未就绪\033[0m"; HEALTH_FAIL=$((HEALTH_FAIL+1))
-    docker logs --tail 50 {{ inst.instance_name }} 2>/dev/null | sed 's/^/        /' || true
   fi
+  printf "."; TRY=$((TRY+3)); sleep 3
 done
+if [ $READY -eq 1 ]; then
+  echo -e " \033[32m✓ 运行中/健康\033[0m"
+else
+  echo -e " \033[31m✗ 超时未就绪\033[0m"; HEALTH_FAIL=$((HEALTH_FAIL+1))
+  docker logs --tail 50 "{{ inst.instance_name }}" 2>/dev/null | sed 's/^/        /' || true
+fi
 {% endfor %}
+fi
 
 # ---------- 6. 报告 ----------
 step "6/6 部署报告"

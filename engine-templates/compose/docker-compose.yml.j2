@@ -8,22 +8,25 @@ name: {{ stack_name }}
 
 services:
 {% for inst in instances %}
+{% set exposed = inst.ports | selectattr("expose") | list %}
   {{ inst.instance_name }}:
-    image: {{ inst.image }}
-    container_name: {{ inst.instance_name }}
+    image: "{{ inst.image }}"
+    container_name: "{{ inst.instance_name }}"
     restart: unless-stopped
-{% if inst.ports %}
+{% if exposed %}
     ports:
-{% for p in inst.ports %}{% if p.expose %}      - "{{ p.host }}:{{ p.container }}"
-{% endif %}{% endfor %}{% endif %}
+{% for p in exposed %}      - "{{ p.host }}:{{ p.container }}"
+{% endfor %}{% endif %}
+{% if inst.command %}
+    command: [{% for c in inst.command %}"{{ c }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif %}
+{% if inst.data_user %}
+    user: "{{ inst.data_user }}"
+{% endif %}
 {% if inst.env %}
     environment:
-{% for e in inst.env %}      {{ e.k }}: "{{ e.v }}"
+{% for e in inst.env %}      {{ e.k }}: '{{ e.v }}'
 {% endfor %}{% endif %}
     volumes:
       - ./data/{{ inst.instance_name }}:{{ inst.data_volume }}
-{% if inst.mem_limit_mb %}
-    mem_limit: {{ inst.mem_limit_mb }}m
-{% endif %}
-
 {% endfor %}

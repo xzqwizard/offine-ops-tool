@@ -23,7 +23,7 @@ if systemctl is-active firewalld >/dev/null 2>&1; then
 elif command -v iptables >/dev/null 2>&1; then
   echo "firewalld 未运行，使用 iptables 应用规则（注意持久化）..."
   {% for r in allowed_rules %}
-  iptables -I INPUT -p {{ r.protocol }} -s {{ r.from_ip }} --dport {{ r.to_port }} -j ACCEPT && echo "  [+] {{ r.from_name }}({{ r.from_ip }}) -> :{{ r.to_port }}/{{ r.protocol }}"
+  iptables -I INPUT -p {{ r.protocol }} -s "{{ r.from_ip }}" --dport {{ r.to_port }} -j ACCEPT && echo "  [+] {{ r.from_name }}({{ r.from_ip }}) -> :{{ r.to_port }}/{{ r.protocol }}"
   {% endfor %}
   echo "提示: iptables 规则重启后失效，请按 OS 执行持久化（如 iptables-save > /etc/sysconfig/iptables）"
 else

@@ -16,7 +16,7 @@ SERVICES="{{ services_csv }}"
 c() { docker compose -f "$COMPOSE_FILE" "$@"; }
 
 usage() {
-  cat <<'EOF'
+  cat <<EOF
 用法: ops.sh <子命令> [参数]
 
   status            服务状态总览
@@ -49,7 +49,8 @@ cmd_status() {
   for S in $(svc_all); do
     STATE=$(docker inspect -f "{{'{{'}}.State.Status{{'}}'}}" "$S" 2>/dev/null || echo "absent")
     HC=$(docker inspect -f "{{'{{'}}if .State.Health{{'}}'}}{{'{{'}}.State.Health.Status{{'}}'}}{{'{{'}}else{{'}}'}}-{{'{{'}}end{{'}}'}}" "$S" 2>/dev/null || echo "-")
-    PORTS=$(docker port "$S" 2>/dev/null | awk -F' -> ' '{printf "%s,", $2}' | sed 's/,$//')
+    # docker port 在容器不存在时退出非零，必须兜底（set -e 会中止脚本）
+    PORTS=$( { docker port "$S" 2>/dev/null || true; } | awk -F' -> ' '{printf "%s,", $2}' | sed 's/,$//')
     printf "%-22s %-12s %-10s %s\n" "$S" "$STATE" "$HC" "${PORTS:-}"
   done
 }
