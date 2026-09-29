@@ -5,6 +5,7 @@ import { backend, toAppError } from '@/api/backend'
 import type { AppSettings, StorageInfo, ConnectivityResult, ProxyConfig } from '@/types/project'
 
 const loading = ref(true)
+const loadError = ref('')
 const saving = ref(false)
 const settings = ref<AppSettings | null>(null)
 const storage = ref<StorageInfo | null>(null)
@@ -44,19 +45,23 @@ const ROOT_FIELDS: { key: keyof AppSettings; label: string; effKey: keyof Storag
   { key: 'logRoot', label: '日志', effKey: 'logRoot', desc: '应用与构建日志' }
 ]
 
-onMounted(async () => {
+async function loadAll() {
+  loading.value = true
+  loadError.value = ''
   try {
     ;[settings.value, storage.value] = await Promise.all([
       backend.getSettings(),
       backend.getStorageInfo()
     ])
-    if (!settings.value.proxy) settings.value.proxy = emptyProxy()
+    if (!settings.value!.proxy) settings.value!.proxy = emptyProxy()
   } catch (e) {
-    ElMessage.error(`读取设置失败: ${toAppError(e).message}`)
+    loadError.value = toAppError(e).message
   } finally {
     loading.value = false
   }
-})
+}
+
+onMounted(loadAll)
 
 /** 保存后立即测一次连通性（读数展示在代理卡片里） */
 async function handleSave() {
@@ -109,7 +114,23 @@ function removeMirror(index: number) {
 </script>
 
 <template>
-  <div class="max-w-3xl mx-auto" v-loading="loading">
+  <div class="max-w-3xl mx-auto">
+    <!-- 加载失败 -->
+    <div v-if="loadError" class="bg-surface-container-low rounded-xl border border-outline-variant p-8 text-center">
+      <span class="material-symbols-outlined text-4xl text-error mb-3 block">cloud_off</span>
+      <p class="text-sm text-on-surface-variant mb-4">读取设置失败：{{ loadError }}</p>
+      <button
+        class="px-5 py-1.5 rounded-lg text-xs font-bold border border-primary/50 text-primary hover:bg-primary/10 transition-colors"
+        @click="loadAll"
+      >
+        重试
+      </button>
+    </div>
+
+    <!-- 加载中 -->
+    <div v-else-if="loading" class="py-20 text-center text-on-surface-variant text-sm">设置加载中…</div>
+
+    <template v-else-if="settings && storage">
     <h1 class="font-headline text-2xl font-bold tracking-tight mb-2">设置</h1>
     <p class="text-on-surface-variant text-sm mb-6">
       大文件路径均可自定义，避免写满系统盘；留空表示使用默认值
@@ -292,5 +313,6 @@ function removeMirror(index: number) {
         {{ saving ? '保存中…' : '保存设置' }}
       </button>
     </div>
+    </template>
   </div>
 </template>
