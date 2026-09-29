@@ -23,9 +23,15 @@ fn sample_ctx() -> serde_json::Value {
         "instances": [{
             "instance_name": "mysql", "image": "docker.io/library/mysql:8.0.42",
             "env": [ { "k": "MYSQL_ROOT_PASSWORD", "v": "p@ss" } ],
-            "ports": [{ "host": 3306, "container": 3306, "protocol": "tcp", "expose": true }],
+            "ports": [
+                { "host": 3306, "container": 3306, "protocol": "tcp", "expose": true },
+                { "host": 33060, "container": 33060, "protocol": "tcp", "expose": false }
+            ],
             "data_volume": "/var/lib/mysql",
+            "data_user": null,
+            "command": [],
             "health_cmd": ["mysqladmin", "ping"],
+            "health_timeout": 90,
             "ports_csv": "3306→3306",
             "backup_hint": "mysqldump ...",
             "min_memory_gb": 1.0
@@ -60,20 +66,34 @@ fn compose_contains_service_and_env() {
     let env = template_env().unwrap();
     let out = render(&env, "compose/docker-compose.yml.j2", &sample_ctx()).unwrap();
     assert!(out.contains("mysql:"));
-    assert!(out.contains("image: docker.io/library/mysql:8.0.42"));
-    assert!(out.contains("MYSQL_ROOT_PASSWORD"));
+    // 镜像引用带引号（防 YAML 特殊字符）
+    assert!(out.contains("image: \"docker.io/library/mysql:8.0.42\""));
+    // env 值用单引号包裹（$ 与 " 不会破坏 compose）
+    assert!(out.contains("MYSQL_ROOT_PASSWORD: 'p@ss'"));
+    // 仅 expose=true 的端口进入 ports；33060 不应出现
     assert!(out.contains("\"3306:3306\""));
+    assert!(!out.contains("33060"));
+    // 健康超时透传
+    let deploy = render(&env, "scripts/deploy.sh.j2", &sample_ctx()).unwrap();
+    assert!(deploy.contains("MAX=90"));
+    // 镜像路径不得双重拼接（img.file 已含 images/ 前缀）
+    assert!(deploy.contains("$BASE_DIR/images/mysql_8.0.42.tar"));
+    assert!(!deploy.contains("images/images/"));
 }
 
 #[test]
-fn sanitize_keeps_safe_chars_only() {
-    assert_eq!(sanitize("应用 服务器/01"), "01");
-    assert_eq!(sanitize("app-01_生产"), "app-01_");
+fn sanitize_keeps_unicode_names() {
+    // 中文保留（政务命名常态），分隔符替换为 -
+    assert_eq!(sanitize("应用 服务器/01"), "应用-服务器-01");
+    assert_eq!(sanitize("app-01_生产"), "app-01_生产");
+    assert_eq!(sanitize("---"), "unnamed");
 }
 
 #[test]
 fn image_tag_extraction() {
     assert_eq!(image_tag_of("docker.io/library/mysql:8.0.42"), "8.0.42");
+    // 官方镜像短引用（无 registry 前缀）——旧实现曾误判为 latest
+    assert_eq!(image_tag_of("mysql:8.0"), "8.0");
     assert_eq!(image_tag_of("registry.cn:5000/app/img"), "latest");
     assert_eq!(image_tag_of("nginx"), "latest");
 }

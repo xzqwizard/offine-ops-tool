@@ -106,16 +106,21 @@ pub fn render(env: &Environment<'_>, name: &str, ctx: &serde_json::Value) -> App
 
 // ==================== 工具函数 ====================
 
-/// 名称转文件/目录安全的片段
+/// 名称转文件/目录安全的片段：保留 Unicode 字母数字（含中文）与 - _ .，
+/// 其余替换为 '-'；控制为可控长度。中文服务器/实例名是常态，不能折叠为空。
 pub fn sanitize(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.trim().chars() {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-            out.push(c)
-        } else {
-            out.push('-')
-        }
-    }
+    let mut out: String = s
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    out.truncate(64);
     let t = out.trim_matches('-').to_string();
     if t.is_empty() {
         "unnamed".into()
@@ -199,22 +204,77 @@ fn uname_of(arch: &str) -> &'static str {
     }
 }
 
-/// 各中间件的逻辑备份提示（写入手册第 4 章）
-fn backup_hint(template_id: &str) -> &'static str {
+/// 各中间件的逻辑备份提示（写入手册第 4 章）。
+/// 输出路径统一用绝对备份目录 <deploy_base_dir>/backup（ops.sh backup 的同一路径）；
+/// 密码类一律在容器内引用环境变量（宿主 shell 无这些变量）。
+fn backup_hint(template_id: &str, deploy_base_dir: &str) -> String {
+    let b = format!("{deploy_base_dir}/backup");
     match template_id {
-        "mysql-8.0" => {
-            "```bash\ndocker exec mysql sh -c 'mysqldump -uroot -p\"$MYSQL_ROOT_PASSWORD\" --single-transaction --all-databases' | gzip > backup/mysql-$(date +%F).sql.gz\n```"
+        "mysql-8.0" => format!(
+            "```bash\nmkdir -p {b}\ndocker exec mysql sh -c 'mysqldump -uroot -p\"$MYSQL_ROOT_PASSWORD\" --single-transaction --all-databases' | gzip > {b}/mysql-$(date +%F).sql.gz\n```"
+        ),
+        "postgresql-16" => format!(
+            "```bash\nmkdir -p {b}\ndocker exec pgsql sh -c 'pg_dumpall -U postgres' | gzip > {b}/pgsql-$(date +%F).sql.gz\n```"
+        ),
+        "redis-7" => format!(
+            "```bash\nmkdir -p {b}\ndocker exec redis sh -c 'redis-cli -a \"$REDIS_PASSWORD\" BGSAVE'\ncp stack/data/redis/dump.rdb {b}/redis-$(date +%F).rdb\n```"
+        ),
+        "mongodb-7" => format!(
+            "```bash\nmkdir -p {b}\ndocker exec mongo sh -c 'mongodump --archive --gzip' > {b}/mongo-$(date +%F).archive.gz\n```"
+        ),
+        _ => String::new(),
+    }
+}
+
+/// 渲染前字段白名单校验（阻止脚本/compose 注入与损坏）：
+/// - 实例名：字母数字开头 + [A-Za-z0-9_-]（进入 bash 与 compose 服务名，严格）
+/// - 镜像引用：[A-Za-z0-9._:/@-]
+/// - 服务器名/IP/主机名/目录/参数值：禁止控制字符（换行/回车）与反引号
+fn validate_render_fields(project: &Project) -> AppResult<()> {
+    let mut errors: Vec<String> = Vec::new();
+    for inst in &project.instances {
+        let name_ok = !inst.instance_name.is_empty()
+            && inst.instance_name.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false)
+            && inst.instance_name[1..].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !name_ok {
+            errors.push(format!("实例名「{}」不合法（仅允许字母数字开头，含 _ -）", inst.instance_name));
         }
-        "postgresql-16" => {
-            "```bash\ndocker exec pgsql sh -c 'pg_dumpall -U postgres' | gzip > backup/pgsql-$(date +%F).sql.gz\n```"
+        if !inst.image.chars().all(|c| c.is_ascii_alphanumeric() || "._:/@-".contains(c)) {
+            errors.push(format!("实例「{}」的镜像引用含非法字符: {}", inst.instance_name, inst.image));
         }
-        "redis-7" => {
-            "```bash\ndocker exec redis redis-cli -a \"$REDIS_PASSWORD\" BGSAVE\ncp stack/data/redis/dump.rdb backup/redis-$(date +%F).rdb\n```"
+        for (k, v) in &inst.params {
+            let s = match v {
+                serde_json::Value::String(s) => s.as_str(),
+                _ => continue, // 非字符串值序列化无换行风险
+            };
+            if s.contains('\n') || s.contains('\r') || s.contains('`') {
+                errors.push(format!(
+                    "实例「{}」参数 {k} 含换行/反引号（会破坏生成的编排文件）",
+                    inst.instance_name
+                ));
+            }
         }
-        "mongodb-7" => {
-            "```bash\ndocker exec mongo sh -c 'mongodump --archive --gzip' > backup/mongo-$(date +%F).archive.gz\n```"
+    }
+    for s in &project.servers {
+        for (label, v) in [
+            ("服务器名", s.name.as_str()),
+            ("主机名", s.hostname.as_str()),
+            ("IP", s.ip.as_str()),
+            ("部署目录", s.deploy_base_dir.as_str()),
+            ("Docker 数据目录", s.docker_data_root.as_str()),
+        ] {
+            if v.contains('\n') || v.contains('\r') || v.contains('`') || v.contains('"') {
+                errors.push(format!("服务器「{}」的{label}含换行/引号/反引号: {v}", s.name));
+            }
         }
-        _ => "",
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Invalid(format!(
+            "方案内容含不安全字符，已阻止构建：\n- {}",
+            errors.join("\n- ")
+        )))
     }
 }
 
@@ -268,6 +328,9 @@ fn build(app: &AppHandle, project: &Project, auto_pull: bool) -> AppResult<Build
     if project.servers.is_empty() {
         return Err(AppError::Invalid("方案中没有服务器，无法构建".into()));
     }
+    // 渲染前字段白名单校验：这些字段会进入 bash 脚本 / compose YAML，
+    // 拒绝引号/换行/$()/反引号等可破坏或注入生成物的字符。
+    validate_render_fields(project)?;
 
     for server in &project.servers {
         emit(app, "server", &format!("处理服务器: {} ({})", server.name, server.arch));
@@ -357,10 +420,14 @@ fn build_server(
         .iter()
         .map(|inst| {
             let tpl = tpl_of(&inst.template_id);
+            // env 值做 compose 安全转义：' → ''（YAML 单引号），$ → $$（禁止 compose 插值）
             let env_pairs: Vec<serde_json::Value> = inst
                 .params
                 .iter()
-                .map(|(k, v)| json!({ "k": k, "v": value_to_plain_string(v) }))
+                .map(|(k, v)| {
+                    let val = value_to_plain_string(v).replace('\'', "''").replace('$', "$$");
+                    json!({ "k": k, "v": val })
+                })
                 .collect();
             let ports_csv = inst
                 .ports
@@ -377,6 +444,8 @@ fn build_server(
                     }
                 })
                 .unwrap_or_else(|| "/data".into());
+            let data_user = tpl.and_then(|t| t.data_user.clone());
+            let command = tpl.map(|t| t.command.clone()).unwrap_or_default();
             let health_cmd: Option<Vec<String>> = tpl
                 .and_then(|t| t.health_check.as_ref())
                 .and_then(|h| {
@@ -386,6 +455,7 @@ fn build_server(
                         None
                     }
                 });
+            let health_timeout = tpl.and_then(|t| t.health_timeout_sec).unwrap_or(60);
             json!({
                 "instance_name": inst.instance_name,
                 "image": inst.image,
@@ -395,9 +465,12 @@ fn build_server(
                     "protocol": p.protocol, "expose": p.expose
                 })).collect::<Vec<_>>(),
                 "data_volume": data_volume,
+                "data_user": data_user,
+                "command": command,
                 "health_cmd": health_cmd,
+                "health_timeout": health_timeout,
                 "ports_csv": ports_csv,
-                "backup_hint": backup_hint(&inst.template_id),
+                "backup_hint": backup_hint(&inst.template_id, &server.deploy_base_dir),
                 "min_memory_gb": tpl.map(|t| t.min_memory_gb).unwrap_or(0.5),
             })
         })
@@ -423,6 +496,15 @@ fn build_server(
         .network_rules
         .iter()
         .filter(|r| r.to_server_id == server.id)
+        // 过滤来源 IP 为空的规则：空 address= 会生成非法防火墙命令
+        .filter(|r| {
+            project
+                .servers
+                .iter()
+                .find(|s| s.id == r.from_server_id)
+                .map(|s| !s.ip.trim().is_empty())
+                .unwrap_or(false)
+        })
         .map(|r| {
             let from = project.servers.iter().find(|s| s.id == r.from_server_id);
             json!({
@@ -594,11 +676,17 @@ fn build_server(
         f.write_all(content.as_bytes())?;
     }
 
-    // ---- Docker 离线安装材料（按 arch/版本/包系匹配安装包库） ----
-    match crate::docker_pkgs::pick_pkg_dir(app, &server.arch, &server.docker_version, &server.os_family) {
-        Some(pkg_dir) => {
+    // ---- Docker 离线安装材料（主包组 + 依赖组：arch/版本/包系匹配） ----
+    let pkg_dirs = crate::docker_pkgs::pick_pkg_dirs(app, &server.arch, &server.docker_version, &server.os_family);
+    if pkg_dirs.is_empty() {
+        warnings.push(format!(
+            "「{}」(Docker {} {} 系) 无匹配离线安装包：构建产物不含 Docker 安装材料，deploy.sh 将要求现场已装 Docker 或人工安装",
+            server.name, server.docker_version, server.os_family
+        ));
+    } else {
+        let mut copied = 0u32;
+        for pkg_dir in &pkg_dirs {
             let pkgs_src = pkg_dir.join("packages");
-            let mut copied = 0u32;
             for entry in fs::read_dir(&pkgs_src)? {
                 let entry = entry?;
                 if !entry.path().is_file() {
@@ -611,18 +699,12 @@ fn build_server(
                 fs::copy(entry.path(), sdir.join("docker-offline/packages").join(&name))?;
                 copied += 1;
             }
-            emit(
-                app,
-                "docker-pkg",
-                &format!("Docker 安装材料：{}（{copied} 个文件）", pkg_dir.display()),
-            );
         }
-        None => {
-            warnings.push(format!(
-                "「{}」(Docker {} {} 系) 无匹配离线安装包：构建产物不含 Docker 安装材料，deploy.sh 将要求现场已装 Docker 或人工安装",
-                server.name, server.docker_version, server.os_family
-            ));
-        }
+        emit(
+            app,
+            "docker-pkg",
+            &format!("Docker 安装材料：{} 个组（{copied} 个文件）", pkg_dirs.len()),
+        );
     }
     // compose 插件（独立按 arch 匹配）
     match crate::docker_pkgs::compose_plugin_path(app, &server.arch) {
@@ -732,12 +814,10 @@ fn value_to_plain_string(v: &serde_json::Value) -> String {
 }
 
 pub fn image_tag_of(image: &str) -> String {
-    let base = image.split('@').next().unwrap_or(image);
-    match base.rsplit_once(':') {
-        Some((before, tag)) if tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') && before.contains('/') => {
-            tag.to_string()
-        }
-        _ => "latest".into(),
-    }
+    // 复用 images 的标准解析（旧实现 before.contains('/') 条件写反，
+    // 官方镜像短引用 mysql:8.0 会被误判为 latest）
+    crate::images::parse_reference(image)
+        .map(|r| r.tag)
+        .unwrap_or_else(|_| "latest".into())
 }
 

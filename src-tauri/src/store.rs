@@ -57,15 +57,14 @@ fn override_or(ov: &Option<String>, default: PathBuf) -> PathBuf {
 static MIGRATED: OnceLock<()> = OnceLock::new();
 
 /// 首次访问数据前执行一次旧版迁移（幂等、非破坏性：只复制不覆盖、不删除旧数据）。
+/// get_or_init 保证并发安全：首个调用者执行迁移，其余等待完成后直接返回。
 /// 旧位置：Windows %APPDATA%/<identifier>/（settings.json、projects/、cache/）
 pub fn ensure_migrated(app: &AppHandle) {
-    if MIGRATED.get().is_some() {
-        return;
-    }
-    let _ = MIGRATED.set(());
-    if let Err(e) = migrate_legacy_data(app) {
-        eprintln!("[迁移] 旧版数据迁移失败（不影响使用，可手动复制）: {e}");
-    }
+    MIGRATED.get_or_init(|| {
+        if let Err(e) = migrate_legacy_data(app) {
+            eprintln!("[迁移] 旧版数据迁移失败（不影响使用，可手动复制）: {e}");
+        }
+    });
 }
 
 fn migrate_legacy_data(app: &AppHandle) -> AppResult<()> {
@@ -187,7 +186,10 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> AppResult<()> {
         }
     }
     let raw = serde_json::to_string_pretty(settings)?;
-    fs::write(&path, raw)?;
+    // 原子写：settings.json 损坏会导致几乎所有命令失效，不能接受写一半
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, &raw)?;
+    fs::rename(&tmp, &path)?;
     Ok(())
 }
 

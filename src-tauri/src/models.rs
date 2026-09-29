@@ -28,7 +28,7 @@ pub struct Project {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct BuildConfig {
-    /// tar.gz | zip | tar | dir
+    /// tar.gz | dir（当前实现仅支持这两种）
     pub package_format: String,
     /// 镜像 tar 是否参与二次压缩（默认否，docker save 层已压缩）
     pub recompress_images: bool,

@@ -58,10 +58,12 @@ fn pkg_root(app: &AppHandle) -> AppResult<PathBuf> {
 
 // ==================== 文件名解析 ====================
 
-/// 从 rpm/deb/tgz/compose 文件名解析 (kind, arch, version)
-/// 例：docker-ce-27.5.1-1.el8.x86_64.rpm / docker-ce_27.5.1-1~debian12_arm64.deb /
+/// 从 rpm/deb/tgz/compose 文件名解析 (kind, arch, version, is_aux)
+/// 例：docker-ce-27.5.1-1.el8.x86_64.rpm / docker-ce-cli-27.5.1-1.el8.x86_64.rpm（附件）/
 ///     docker-27.5.1.tgz / docker-compose-linux-x86_64
-pub fn parse_pkg_filename(name: &str) -> Option<(String, String, String)> {
+/// is_aux=true 表示 docker-ce-cli/buildx/containerd 等依赖包：归入同架构 deps 组
+/// （与主包版本无关），构建时与命中主包合并拷贝
+pub fn parse_pkg_filename(name: &str) -> Option<(String, String, String, bool)> {
     let lower = name.to_lowercase();
     if lower.starts_with("docker-compose") {
         let arch = if lower.contains("x86_64") || lower.contains("amd64") {
@@ -71,38 +73,55 @@ pub fn parse_pkg_filename(name: &str) -> Option<(String, String, String)> {
         } else {
             return None
         };
-        return Some(("compose".into(), arch.into(), String::new()))
+        return Some(("compose".into(), arch.into(), String::new(), false))
     }
-    if lower.starts_with("docker-ce-") && lower.ends_with(".rpm") {
-        // docker-ce-27.5.1-1.el8.x86_64.rpm
-        let arch = if lower.contains(".x86_64.rpm") {
+    // 附件包：docker-ce-cli / docker-buildx-plugin / docker-scan-plugin / containerd.io / fuse-overlayfs 等
+    let aux_prefixes = [
+        "docker-ce-cli-",
+        "docker-buildx-plugin-",
+        "docker-scan-plugin-",
+        "docker-compose-plugin-",
+        "containerd.io-",
+        "containerd.io_",
+        "fuse-overlayfs-",
+    ];
+    if lower.ends_with(".rpm") || lower.ends_with(".deb") {
+        let arch = if lower.contains(".x86_64.rpm") || lower.contains("amd64.deb") {
             "amd64"
-        } else if lower.contains(".aarch64.rpm") {
+        } else if lower.contains(".aarch64.rpm") || lower.contains("arm64.deb") || lower.contains("armhf.deb") {
             "arm64"
         } else {
             return None
         };
-        let version = name
-            .strip_prefix("docker-ce-")?
-            .split('-')
-            .next()?
-            .to_string();
-        return Some(("rpm".into(), arch.into(), version))
-    }
-    if (lower.starts_with("docker-ce_") || lower.starts_with("docker-ce ")) && lower.ends_with(".deb") {
-        let arch = if lower.contains("_amd64.deb") || lower.contains("amd64.deb") {
-            "amd64"
-        } else if lower.contains("_arm64.deb") || lower.contains("_armhf.deb") {
-            "arm64"
-        } else {
+        for pfx in aux_prefixes {
+            if lower.starts_with(pfx) {
+                return Some(("aux".into(), arch.into(), String::new(), true))
+            }
+        }
+        if lower.starts_with("docker-ce-") {
+            let version = name.strip_prefix("docker-ce-")?.split('-').next()?.to_string();
+            if version.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                return Some(("rpm".into(), arch.into(), version, false))
+            }
             return None
-        };
-        let version = name
-            .strip_prefix("docker-ce_")?
-            .split(['-', '_', '~'])
-            .next()?
+        }
+        if lower.starts_with("docker-ce_") {
+            let version = name
+                .strip_prefix("docker-ce_")?
+                .split(['-', '_', '~'])
+                .next()?
+                .to_string();
+            if version.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                return Some(("deb".into(), arch.into(), version, false))
+            }
+            return None
+        }
+        // 其它 rpm/deb（如信创源 docker-engine-x.y.z）尝试提取首位为数字的版本段
+        let stem = name
+            .trim_end_matches(|c: char| c != '.' && !c.is_ascii_digit())
             .to_string();
-        return Some(("deb".into(), arch.into(), version))
+        let _ = stem;
+        return None
     }
     if lower.starts_with("docker-") && lower.ends_with(".tgz") {
         // 官方静态包不带 arch（按下载目录区分），arch 由调用方指定
@@ -111,11 +130,10 @@ pub fn parse_pkg_filename(name: &str) -> Option<(String, String, String)> {
             .strip_suffix(".tgz")?
             .to_string();
         if version.chars().all(|c| c.is_ascii_digit() || c == '.') {
-            return Some(("static".into(), String::new(), version))
+            return Some(("static".into(), String::new(), version, false))
         }
         return None
     }
-    // containerd.io 等依赖包：归入 rpm/deb 但无版本信息（作为附属文件由导入流程归组）
     None
 }
 
@@ -193,11 +211,17 @@ pub fn list_compose_plugins(app: AppHandle) -> AppResult<Vec<ComposePluginStatus
 #[tauri::command]
 pub fn delete_docker_pkg(app: AppHandle, dir: String) -> AppResult<()> {
     let p = PathBuf::from(&dir);
+    // 路径穿越与根目录防护：canonicalize 规范化 .. 后，
+    // 必须是库根的直接子目录（不能删库根本身，也不能越界）
     let root = pkg_root(&app)?;
-    if !p.starts_with(&root) || !p.is_dir() {
-        return Err(AppError::Invalid("非法的安装包目录".into()));
+    let p_canon = p
+        .canonicalize()
+        .map_err(|_| AppError::Invalid(format!("目录不存在: {dir}")))?;
+    let root_canon = root.canonicalize()?;
+    if p_canon.parent() != Some(root_canon.as_path()) {
+        return Err(AppError::Invalid("仅允许删除安装包库内的包组目录".into()));
     }
-    fs::remove_dir_all(&p)?;
+    fs::remove_dir_all(&p_canon)?;
     Ok(())
 }
 
@@ -241,16 +265,26 @@ fn import_docker_pkgs_sync(app: &AppHandle, paths: &[String], default_arch: &str
         }
         let name = src.file_name().unwrap_or_default().to_string_lossy().into_owned();
         match parse_pkg_filename(&name) {
-            Some((kind, arch, _version)) if kind == "compose" => {
+            Some((kind, arch, _v, _aux)) if kind == "compose" => {
                 let dst = root.join("compose").join(&arch);
                 fs::create_dir_all(&dst)?;
                 fs::copy(&src, dst.join("docker-compose"))?;
                 result.compose_installed.push(format!("{name} → {arch}"));
             }
-            Some((kind, arch, version)) => {
+            Some((kind, arch, version, is_aux)) => {
                 let arch = if arch.is_empty() { default_arch.to_string() } else { arch };
-                let version = if version.is_empty() { "unknown".into() } else { version };
-                let id = format!("pkg-{arch}-{kind}-{version}");
+                let kind = if kind == "aux" {
+                    // 附件包归入按架构的依赖组（rpm/deb 由扩展名决定），与主包版本无关
+                    if name.ends_with(".deb") { "deb" } else { "rpm" }
+                } else {
+                    kind.as_str()
+                };
+                let version = if is_aux || version.is_empty() { "deps".into() } else { version };
+                let id = if is_aux {
+                    format!("pkg-{arch}-{kind}-deps")
+                } else {
+                    format!("pkg-{arch}-{kind}-{version}")
+                };
                 let dir = root.join(&id);
                 let pkgs_dir = dir.join("packages");
                 fs::create_dir_all(&pkgs_dir)?;
@@ -261,7 +295,7 @@ fn import_docker_pkgs_sync(app: &AppHandle, paths: &[String], default_arch: &str
                     .and_then(|s| serde_json::from_str::<DockerPkgMeta>(&s).ok())
                     .unwrap_or(DockerPkgMeta {
                         arch: arch.clone(),
-                        kind: kind.clone(),
+                        kind: kind.to_string(),
                         docker_version: version.clone(),
                         files: vec![],
                         imported_at: store::now_rfc3339(),
@@ -275,33 +309,7 @@ fn import_docker_pkgs_sync(app: &AppHandle, paths: &[String], default_arch: &str
                 }
             }
             None => {
-                // containerd.io 等附属包：归入 default_arch 的 rpm/deb 附属组
-                let kind = if name.ends_with(".rpm") { "rpm" } else if name.ends_with(".deb") { "deb" } else {
-                    result.skipped.push(format!("{name}（无法识别）"));
-                    continue;
-                };
-                let id = format!("pkg-{}-{}-deps", default_arch, kind);
-                let dir = root.join(&id);
-                let pkgs_dir = dir.join("packages");
-                fs::create_dir_all(&pkgs_dir)?;
-                fs::copy(&src, pkgs_dir.join(&name))?;
-                let mut meta = fs::read_to_string(dir.join("meta.json"))
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<DockerPkgMeta>(&s).ok())
-                    .unwrap_or(DockerPkgMeta {
-                        arch: default_arch.into(),
-                        kind: kind.into(),
-                        docker_version: "deps".into(),
-                        files: vec![],
-                        imported_at: store::now_rfc3339(),
-                    });
-                if !meta.files.contains(&name) {
-                    meta.files.push(name);
-                }
-                fs::write(dir.join("meta.json"), serde_json::to_string_pretty(&meta)?)?;
-                if !result.created_dirs.contains(&id) {
-                    result.created_dirs.push(id);
-                }
+                result.skipped.push(format!("{name}（无法识别，支持 docker-ce*/docker-ce-cli*/containerd.io*/docker-*.tgz/docker-compose-*）"));
             }
         }
     }
@@ -463,37 +471,64 @@ fn dir_size(path: &Path) -> u64 {
 
 // ==================== 构建期匹配（builder 调用） ====================
 
-/// 按服务器匹配安装包目录：arch 精确 + docker 版本精确 + 包系（rpm/deb 按偏好，static 兜底）
-pub fn pick_pkg_dir(app: &AppHandle, arch: &str, docker_version: &str, os_family: &str) -> Option<PathBuf> {
-    let root = pkg_root(app).ok()?;
+/// 按服务器匹配安装包目录（主组 + 同架构依赖组）：
+/// arch 精确 + docker 版本精确 + 包系（rpm/deb 按偏好，static 兜底）；
+/// 返回的所有组的 packages/ 内容会被合并拷贝（主包 + cli/containerd 等依赖）。
+pub fn pick_pkg_dirs(app: &AppHandle, arch: &str, docker_version: &str, os_family: &str) -> Vec<PathBuf> {
+    let Ok(root) = pkg_root(app) else { return vec![] };
     let preferred = os_pkg_class(os_family);
-    let mut fallback: Option<PathBuf> = None;
-    for entry in fs::read_dir(&root).ok()?.flatten() {
+    let mut main_dir: Option<PathBuf> = None;
+    let mut deps_dir: Option<PathBuf> = None;
+    for entry in fs::read_dir(&root).ok().into_iter().flatten().flatten() {
         let dir = entry.path();
         if !dir.is_dir() {
             continue;
         }
-        let id = dir.file_name()?.to_string_lossy().into_owned();
+        let Some(fname) = dir.file_name() else { continue };
+        let id = fname.to_string_lossy().into_owned();
         if !id.starts_with("pkg-") {
             continue;
         }
-        // id 形如 pkg-<arch>-<kind>-<version>[-deps]
+        // id 形如 pkg-<arch>-<kind>-<version>
         let parts: Vec<&str> = id.trim_start_matches("pkg-").splitn(3, '-').collect();
         if parts.len() < 3 {
             continue;
         }
         let (p_arch, p_kind, p_version) = (parts[0], parts[1], parts[2]);
-        if p_arch != arch || p_version != docker_version || p_kind == "deps" {
+        if p_arch != arch {
+            continue;
+        }
+        if p_version == "deps" {
+            // 依赖组按包系匹配即可（与主包 kind 一致优先）
+            if p_kind == preferred && deps_dir.is_none() {
+                deps_dir = Some(dir);
+            }
+            continue;
+        }
+        if p_version != docker_version {
             continue;
         }
         if p_kind == preferred {
-            return Some(dir); // 精确命中
-        }
-        if p_kind == "static" {
-            fallback = Some(dir);
+            main_dir = Some(dir); // 精确命中
+        } else if p_kind == "static" && main_dir.is_none() {
+            main_dir = Some(dir); // 静态包兜底（精确命中后不覆盖）
         }
     }
-    fallback
+    let mut out = vec![];
+    if let Some(m) = main_dir {
+        // 静态包命中时不需要 rpm/deb 依赖组
+        let is_static = m
+            .file_name()
+            .map(|n| n.to_string_lossy().contains("-static-"))
+            .unwrap_or(false);
+        out.push(m);
+        if !is_static {
+            if let Some(d) = deps_dir {
+                out.push(d);
+            }
+        }
+    }
+    out
 }
 
 /// compose 插件路径（按 arch）

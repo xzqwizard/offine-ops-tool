@@ -289,8 +289,13 @@ fn cache_dir(app: &AppHandle) -> AppResult<PathBuf> {
     Ok(d)
 }
 
+/// 缓存文件名必须包含 registry+repo+tag/digest+平台：不同版本/不同源的同名
+/// repo 绝不能共用缓存（否则换 tag 后命中旧 tar，现场 load 到错误版本）。
 fn sanitize_ref(r: &ImageRef, os: &str, arch: &str) -> String {
-    let raw = format!("{}-{}_{}", r.repo.replace('/', "_"), os, arch);
+    // digest 优先（版本唯一）；否则用 tag；registry 前缀区分私有源
+    let version = r.digest.as_deref().unwrap_or(&r.tag);
+    let registry = if r.registry == "docker.io" { "hub" } else { &r.registry };
+    let raw = format!("{registry}_{}-{version}_{os}_{arch}", r.repo.replace('/', "_"));
     raw.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
@@ -353,13 +358,18 @@ pub fn list_image_cache(app: AppHandle) -> AppResult<Vec<CachedImage>> {
 #[tauri::command]
 pub fn delete_cached_image(app: AppHandle, file: String) -> AppResult<()> {
     let p = PathBuf::from(&file);
-    // 安全校验：必须在缓存目录内
+    // 路径穿越防护：canonicalize 规范化 .. 后，必须仍位于缓存目录内
+    // （Path::starts_with 不规范化 ..，直接比较可被 ..\..\ 绕过）
     let dir = cache_dir(&app)?;
-    if !p.starts_with(&dir) {
+    let p_canon = p
+        .canonicalize()
+        .map_err(|_| AppError::Invalid(format!("文件不存在: {file}")))?;
+    let dir_canon = dir.canonicalize()?;
+    if !p_canon.starts_with(&dir_canon) {
         return Err(AppError::Invalid("仅允许删除镜像缓存目录内的文件".into()));
     }
-    fs::remove_file(&p)?;
-    let _ = fs::remove_file(p.with_extension("tar.meta.json"));
+    fs::remove_file(&p_canon)?;
+    let _ = fs::remove_file(p_canon.with_extension("tar.meta.json"));
     Ok(())
 }
 

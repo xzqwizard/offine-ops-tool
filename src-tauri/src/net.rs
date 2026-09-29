@@ -9,7 +9,8 @@ use tauri::{AppHandle, Emitter};
 /// 所有外部子进程（crane 等）注入标准代理环境变量。
 
 /// 解析生效的代理 URL，如 `http://127.0.0.1:7890`、`socks5h://user:pass@host:port`。
-/// 未启用或配置不完整返回 None（直连）。
+/// 未启用或配置不完整返回 None（直连）。用户名/密码做百分号编码（含 @:/# 等字符的
+/// 密码不编码会生成非法 URL）。
 pub fn proxy_url(settings: &AppSettings) -> Option<String> {
     let p = settings.proxy.as_ref()?;
     if !p.enabled {
@@ -26,13 +27,40 @@ pub fn proxy_url(settings: &AppSettings) -> Option<String> {
     match (&p.username, &p.password) {
         (Some(u), Some(pw)) if !u.trim().is_empty() => Some(format!(
             "{scheme}://{}:{}@{}:{}",
-            u.trim(),
-            pw,
+            percent_encode(u.trim()),
+            percent_encode(pw),
             p.host.trim(),
             p.port
         )),
         _ => Some(format!("{scheme}://{}:{}", p.host.trim(), p.port)),
     }
+}
+
+/// 展示用代理地址（密码脱敏）：socks5h://user:***@host:port
+pub fn mask_proxy_url(settings: &AppSettings) -> Option<String> {
+    let raw = proxy_url(settings)?;
+    if let Some(at) = raw.find('@') {
+        let (prefix, rest) = raw.split_at(at);
+        let scheme_end = prefix.find("://").map(|i| i + 3).unwrap_or(0);
+        let user = &prefix[scheme_end..];
+        let user = user.split(':').next().unwrap_or_default();
+        Some(format!("{}://{user}:***@{rest}", &prefix[..scheme_end]))
+    } else {
+        Some(raw)
+    }
+}
+
+/// RFC3986 非保留字符之外的百分号编码（用户名/密码用）
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"._~-".contains(&b) {
+            out.push(b as char)
+        } else {
+            out.push_str(&format!("%{b:02X}"))
+        }
+    }
+    out
 }
 
 /// 供子进程（crane 等）使用的代理环境变量
@@ -181,7 +209,7 @@ pub async fn test_network(
             Some(s) => s,
             None => store::load_settings(&app)?,
         };
-        let proxy_used = proxy_url(&settings);
+        let proxy_used = proxy_url(&settings); // 探测开关判定用完整 URL
         let mut targets: Vec<&str> = Vec::new();
         if proxy_used.is_some() {
             targets.push("https://www.google.com/");
@@ -196,7 +224,8 @@ pub async fn test_network(
             emit_test(&app, url, "done", Some(&r));
             results.push(r);
         }
-        Ok(TestNetworkReport { proxy_used, results })
+        // 对外报告用脱敏地址（明文密码不应出现在界面/日志）
+        Ok(TestNetworkReport { proxy_used: mask_proxy_url(&settings), results })
     })
     .await
     .map_err(|e| AppError::Io(format!("测试任务异常: {e}")))?
