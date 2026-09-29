@@ -594,6 +594,49 @@ fn build_server(
         f.write_all(content.as_bytes())?;
     }
 
+    // ---- Docker 离线安装材料（按 arch/版本/包系匹配安装包库） ----
+    match crate::docker_pkgs::pick_pkg_dir(app, &server.arch, &server.docker_version, &server.os_family) {
+        Some(pkg_dir) => {
+            let pkgs_src = pkg_dir.join("packages");
+            let mut copied = 0u32;
+            for entry in fs::read_dir(&pkgs_src)? {
+                let entry = entry?;
+                if !entry.path().is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                fs::copy(entry.path(), sdir.join("docker-offline/packages").join(&name))?;
+                copied += 1;
+            }
+            emit(
+                app,
+                "docker-pkg",
+                &format!("Docker 安装材料：{}（{copied} 个文件）", pkg_dir.display()),
+            );
+        }
+        None => {
+            warnings.push(format!(
+                "「{}」(Docker {} {} 系) 无匹配离线安装包：构建产物不含 Docker 安装材料，deploy.sh 将要求现场已装 Docker 或人工安装",
+                server.name, server.docker_version, server.os_family
+            ));
+        }
+    }
+    // compose 插件（独立按 arch 匹配）
+    match crate::docker_pkgs::compose_plugin_path(app, &server.arch) {
+        Some(p) => {
+            fs::copy(&p, sdir.join("docker-offline/packages").join("docker-compose"))?;
+        }
+        None => {
+            warnings.push(format!(
+                "「{}」缺 docker compose 插件（{} 架构）：deploy.sh 安装 Docker 后将因缺 compose 中止",
+                server.name, server.arch
+            ));
+        }
+    }
+
     // ---- manifest.json ----
     let manifest = json!({
         "buildId": build_id,
