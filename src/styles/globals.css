@@ -1,0 +1,170 @@
+@import "tailwindcss";
+
+/* === Local Fonts === */
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("/fonts/space-grotesk-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/space-grotesk-latin-500-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/space-grotesk-latin-600-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/space-grotesk-latin-700-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("/fonts/inter-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/inter-latin-500-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Fira Code";
+  font-style: normal;
+  font-weight: 400 500;
+  font-display: swap;
+  src: url("/fonts/fira-code-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Material Symbols Outlined";
+  font-style: normal;
+  font-weight: 100 700;
+  font-display: swap;
+  src: url("/icons/material-symbols-outlined.woff2") format("woff2");
+}
+
+/* === Theme Tokens（与 apk-auto 设计语言一致） === */
+@theme {
+  --font-headline: "Space Grotesk", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-body: "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "Fira Code", "Cascadia Mono", Consolas, monospace;
+
+  --color-surface: var(--t-surface);
+  --color-surface-dim: var(--t-surface-dim);
+  --color-surface-container-low: var(--t-surface-container-low);
+  --color-surface-container: var(--t-surface-container);
+  --color-surface-container-high: var(--t-surface-container-high);
+  --color-surface-container-highest: var(--t-surface-container-highest);
+  --color-surface-bright: var(--t-surface-bright);
+  --color-primary: var(--t-primary);
+  --color-primary-dim: var(--t-primary-dim);
+  --color-on-surface: var(--t-on-surface);
+  --color-on-surface-variant: var(--t-on-surface-variant);
+  --color-outline-variant: var(--t-outline-variant);
+  --color-on-primary: var(--t-on-primary);
+  --color-error: var(--t-error);
+  --color-error-container: var(--t-error-container);
+  --color-glass-header: var(--t-glass-header);
+  --color-success: var(--t-success);
+}
+
+/* === Material Symbols === */
+.material-symbols-outlined {
+  font-family: "Material Symbols Outlined";
+  font-weight: normal;
+  font-style: normal;
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* === Element Plus 主题对接（映射到主题令牌） === */
+html,
+html.dark {
+  --el-color-primary: var(--t-primary);
+  --el-color-success: var(--t-success);
+  --el-color-warning: #e6a23c;
+  --el-color-danger: var(--t-error);
+  --el-color-error: var(--t-error);
+  --el-color-info: var(--t-on-surface-variant);
+  --el-bg-color: var(--t-surface);
+  --el-bg-color-page: var(--t-surface);
+  --el-bg-color-overlay: var(--t-surface-container-low);
+  --el-text-color-primary: var(--t-on-surface);
+  --el-text-color-regular: var(--t-on-surface-variant);
+  --el-text-color-secondary: var(--t-on-surface-variant);
+  --el-border-color: var(--t-outline-variant);
+  --el-border-color-light: var(--t-outline-variant);
+  --el-border-color-lighter: var(--t-outline-variant);
+  --el-fill-color-blank: transparent;
+  --el-fill-color-light: var(--t-surface-container);
+  --el-fill-color: var(--t-surface-container-high);
+  --el-disabled-bg-color: var(--t-surface-container);
+  --el-font-family: var(--font-body);
+}
+
+/* === Animations === */
+.pulsing-orb {
+  box-shadow: 0 0 10px var(--t-primary);
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.5); opacity: 0.5; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+@keyframes slide-up {
+  from { transform: translateY(100%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.2s ease-out;
+}
+
+/* === Base === */
+body {
+  font-family: var(--font-body);
+  overflow: hidden;
+  margin: 0;
+}
+
+/* === Scrollbar === */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--t-outline-variant);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--t-primary-dim);
+}
