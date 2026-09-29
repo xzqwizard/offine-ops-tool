@@ -124,3 +124,20 @@ export const OS_FAMILY_OPTIONS = [
   { value: 'deepin', label: 'Deepin' },
   { value: 'neokylin', label: '中标麒麟' }
 ]
+
+/** 按 OS 族预设的常见系统版本（选择器可过滤/自定义输入） */
+export const OS_VERSION_OPTIONS: Record<string, string[]> = {
+  kylin: ['V10 SP3', 'V10 SP2', 'V10 SP1'],
+  uos: ['Server 20 (1060a)', 'Server 20 (1060e)', 'Server 1050e'],
+  openeuler: ['24.03 LTS', '22.03 LTS SP4', '20.03 LTS SP4'],
+  centos: ['7.9.2009', '7.6.1810', '8.5.2111'],
+  rhel: ['8.6', '9.2', '7.9'],
+  rocky: ['9.3', '8.9'],
+  ubuntu: ['22.04', '20.04', '24.04'],
+  debian: ['12', '11'],
+  deepin: ['23', '20.9'],
+  neokylin: ['V7']
+}
+
+/** Docker 官方提供静态包的架构（其余架构需信创源） */
+export const OFFICIAL_DOCKER_ARCHES = ['amd64', 'arm64']

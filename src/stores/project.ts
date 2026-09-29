@@ -3,6 +3,8 @@ import { ref, computed } from 'vue'
 import { backend } from '@/api/backend'
 import type { Project, ProjectSummary } from '@/types/project'
 
+let saveTimer: number | undefined
+
 export const useProjectStore = defineStore('project', () => {
   const project = ref<Project | null>(null)
   const summaries = ref<ProjectSummary[]>([])
@@ -40,6 +42,26 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
+  /** 修改并立即持久化（表单新增/修改/删除后自动保存） */
+  async function commit(fn: (p: Project) => void) {
+    if (!project.value) return
+    fn(project.value)
+    await save()
+  }
+
+  /** 修改并防抖自动保存（用于名称等连续输入场景） */
+  function scheduleSave(fn: (p: Project) => void, delay = 600) {
+    if (!project.value) return
+    fn(project.value)
+    dirty.value = true
+    if (saveTimer) window.clearTimeout(saveTimer)
+    saveTimer = window.setTimeout(() => {
+      save().catch(() => {
+        /* 失败时保持 dirty，用户可见"待保存"提示 */
+      })
+    }, delay)
+  }
+
   async function remove(id: string) {
     await backend.deleteProject(id)
     if (project.value?.id === id) {
@@ -47,13 +69,6 @@ export const useProjectStore = defineStore('project', () => {
       dirty.value = false
     }
     await refreshSummaries()
-  }
-
-  /** 修改方案内容统一走此入口，确保 dirty 标记不遗漏 */
-  function mutate(fn: (p: Project) => void) {
-    if (!project.value) return
-    fn(project.value)
-    dirty.value = true
   }
 
   function close() {
@@ -72,8 +87,9 @@ export const useProjectStore = defineStore('project', () => {
     open,
     create,
     save,
+    commit,
+    scheduleSave,
     remove,
-    mutate,
     close
   }
 })

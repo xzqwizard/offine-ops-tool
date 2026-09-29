@@ -2,6 +2,7 @@
 import { ref, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
+import { toAppError } from '@/api/backend'
 import { genId } from '@/utils/id'
 import { exposedPortsOf } from '@/utils/validate'
 import type { NetworkRule } from '@/types/project'
@@ -48,17 +49,17 @@ function hasRule(fromId: string, toServerId: string, port: number): boolean {
   )
 }
 
-/** 点击矩阵单元格切换放行 */
+/** 点击矩阵单元格切换放行（静默自动保存，失败时提示） */
 function toggleCell(fromId: string, row: { toServerId: string; host: number }) {
   const existing = rules.value.find(
     (r) => r.fromServerId === fromId && r.toServerId === row.toServerId && r.toPort === row.host
   )
   if (existing) {
-    store.mutate((p) => {
+    store.commit((p) => {
       p.networkRules = p.networkRules.filter((r) => r.id !== existing.id)
-    })
+    }).catch((e) => ElMessage.error(`保存失败: ${toAppError(e).message}`))
   } else {
-    store.mutate((p) => {
+    store.commit((p) => {
       p.networkRules.push({
         id: genId('rule'),
         fromServerId: fromId,
@@ -67,7 +68,7 @@ function toggleCell(fromId: string, row: { toServerId: string; host: number }) {
         protocol: 'tcp',
         description: ''
       })
-    })
+    }).catch((e) => ElMessage.error(`保存失败: ${toAppError(e).message}`))
   }
 }
 
@@ -97,7 +98,7 @@ function openEdit(rule: NetworkRule) {
   dialogOpen.value = true
 }
 
-function handleSave() {
+async function handleSave() {
   const f = form.value
   if (!f.fromServerId || !f.toServerId) {
     ElMessage.warning('请选择来源与目标服务器')
@@ -118,17 +119,21 @@ function handleSave() {
     ElMessage.warning('该访问规则已存在')
     return
   }
-  store.mutate((p) => {
-    if (editingRuleId.value) {
-      const idx = p.networkRules.findIndex((r) => r.id === editingRuleId.value)
-      if (idx >= 0) p.networkRules[idx] = f
-    } else {
-      f.id = genId('rule')
-      p.networkRules.push(f)
-    }
-  })
-  dialogOpen.value = false
-  ElMessage.success('已保存（保存方案后生效）')
+  try {
+    await store.commit((p) => {
+      if (editingRuleId.value) {
+        const idx = p.networkRules.findIndex((r) => r.id === editingRuleId.value)
+        if (idx >= 0) p.networkRules[idx] = f
+      } else {
+        f.id = genId('rule')
+        p.networkRules.push(f)
+      }
+    })
+    dialogOpen.value = false
+    ElMessage.success('已保存')
+  } catch (e) {
+    ElMessage.error(`保存失败: ${toAppError(e).message}`)
+  }
 }
 
 async function handleDelete(rule: NetworkRule) {
@@ -141,9 +146,14 @@ async function handleDelete(rule: NetworkRule) {
   } catch {
     return
   }
-  store.mutate((p) => {
-    p.networkRules = p.networkRules.filter((r) => r.id !== rule.id)
-  })
+  try {
+    await store.commit((p) => {
+      p.networkRules = p.networkRules.filter((r) => r.id !== rule.id)
+    })
+    ElMessage.success('已删除并保存')
+  } catch (e) {
+    ElMessage.error(`删除失败: ${toAppError(e).message}`)
+  }
 }
 
 function serverName(id: string): string {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
@@ -43,19 +43,20 @@ watch(
   }
 )
 
-async function handleSave() {
-  try {
-    await store.save()
-    ElMessage.success('已保存')
-  } catch (e) {
-    ElMessage.error(`保存失败: ${toAppError(e).message}`)
-  }
-}
+// 名称/客户连续输入 → 防抖自动保存
+const nameModel = computed({
+  get: () => store.project?.name ?? '',
+  set: (v: string) => store.scheduleSave((p) => (p.name = v))
+})
+const customerModel = computed({
+  get: () => store.project?.customer ?? '',
+  set: (v: string) => store.scheduleSave((p) => (p.customer = v))
+})
 </script>
 
 <template>
   <div class="max-w-6xl mx-auto" v-loading="loading">
-    <!-- 方案头部：名称/客户 + 保存 -->
+    <!-- 方案头部：名称/客户 自动保存 -->
     <div class="flex items-center gap-4 mb-6">
       <div class="flex-1 min-w-0">
         <div class="flex items-center gap-3">
@@ -64,30 +65,29 @@ async function handleSave() {
             >方案</span
           >
           <input
-            v-model="store.project!.name"
+            v-model="nameModel"
             class="bg-transparent font-headline text-2xl font-bold tracking-tight outline-none border-b border-transparent focus:border-primary min-w-0 flex-1"
-            @input="store.dirty = true"
           />
         </div>
         <input
-          v-model="store.project!.customer"
+          v-model="customerModel"
           placeholder="客户/项目（选填）"
           class="bg-transparent text-sm text-on-surface-variant outline-none border-b border-transparent focus:border-primary mt-1"
-          @input="store.dirty = true"
         />
       </div>
-      <div class="flex items-center gap-3">
-        <span v-if="store.dirty" class="font-mono text-xs text-warning flex items-center gap-1.5">
-          <span class="w-2 h-2 rounded-full bg-warning"></span>未保存
-        </span>
-        <span v-else class="font-mono text-xs text-on-surface-variant/50">已保存</span>
-        <button
-          class="px-6 py-2 rounded-xl font-headline font-bold text-xs uppercase tracking-wider transition-all bg-gradient-to-br from-primary to-primary-dim text-on-primary hover:opacity-90 active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed"
-          :disabled="!store.dirty || store.saving"
-          @click="handleSave"
-        >
-          {{ store.saving ? '保存中…' : '保存方案' }}
-        </button>
+      <div class="flex items-center gap-2 font-mono text-xs">
+        <template v-if="store.saving">
+          <span class="w-2 h-2 rounded-full bg-warning pulsing-orb"></span>
+          <span class="text-warning">保存中…</span>
+        </template>
+        <template v-else-if="store.dirty">
+          <span class="w-2 h-2 rounded-full bg-warning"></span>
+          <span class="text-on-surface-variant">待保存</span>
+        </template>
+        <template v-else>
+          <span class="w-2 h-2 rounded-full bg-success"></span>
+          <span class="text-on-surface-variant/50">已自动保存</span>
+        </template>
       </div>
     </div>
 

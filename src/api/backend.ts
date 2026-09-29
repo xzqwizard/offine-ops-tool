@@ -52,6 +52,10 @@ export const backend = {
 
   async buildOfflinePackage(project: Project): Promise<BuildResult> {
     return invoke<BuildResult>('build_offline_package', { project })
+  },
+
+  async listDockerVersions(arch: string): Promise<string[]> {
+    return invoke<string[]>('list_docker_versions', { arch })
   }
 }
 

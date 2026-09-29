@@ -36,12 +36,12 @@ onUnmounted(() => unlisten?.())
 
 const format = computed({
   get: () => store.project?.buildConfig.packageFormat ?? 'tar.gz',
-  set: (v: string) => store.mutate((p) => (p.buildConfig.packageFormat = v))
+  set: (v: string) => store.scheduleSave((p) => (p.buildConfig.packageFormat = v))
 })
 
 const recompress = computed({
   get: () => store.project?.buildConfig.recompressImages ?? false,
-  set: (v: boolean) => store.mutate((p) => (p.buildConfig.recompressImages = v))
+  set: (v: boolean) => store.scheduleSave((p) => (p.buildConfig.recompressImages = v))
 })
 
 async function handleBuild() {
