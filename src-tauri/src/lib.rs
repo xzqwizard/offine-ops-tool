@@ -1,9 +1,10 @@
-mod builder;
-mod catalog;
+pub mod builder;
+pub mod catalog;
 mod commands;
 mod docker_versions;
 mod engine;
 mod error;
+pub mod images;
 mod models;
 mod net;
 mod store;
@@ -26,6 +27,11 @@ pub fn run() {
             net::test_network,
             engine::engine_status,
             engine::engine_install,
+            images::inspect_image,
+            images::list_image_tags,
+            images::list_image_cache,
+            images::delete_cached_image,
+            images::pull_image,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
