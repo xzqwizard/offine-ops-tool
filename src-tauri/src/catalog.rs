@@ -27,8 +27,17 @@ pub struct MiddlewareTemplate {
     pub env_hints: Vec<EnvHint>,
     #[serde(default)]
     pub data_volume: String,
+    /// 数据卷属主（非 root 镜像必须，如 ES 为 "1000:1000"、bitnami 为 "1001:1001"）
+    #[serde(default)]
+    pub data_user: Option<String>,
+    /// compose command 覆盖（如 redis 官方镜像设置密码：sh -c 'redis-server --requirepass "$$REDIS_PASSWORD"'）
+    #[serde(default)]
+    pub command: Vec<String>,
     #[serde(default)]
     pub health_check: Option<HealthCheck>,
+    /// 健康检查超时秒数（deploy.sh 等待时长，默认 60）
+    #[serde(default)]
+    pub health_timeout_sec: Option<u32>,
     #[serde(default)]
     pub min_memory_gb: f64,
     /// 内核参数要求（如 ES 的 vm.max_map_count>=262144），驱动 precheck

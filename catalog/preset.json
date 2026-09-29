@@ -25,14 +25,15 @@
       "displayName": "Redis 7",
       "category": "缓存",
       "defaultImage": "docker.io/library/redis",
-      "recommendedTags": ["7.2.5", "7.2.4", "6.2.14"],
+      "recommendedTags": ["7.2.5", "7.2.4", "7.4.2"],
       "supportedArches": ["amd64", "arm64"],
       "ports": [{ "name": "redis", "container": 6379, "defaultHost": 6379, "protocol": "tcp" }],
       "envHints": [
-        { "key": "REDIS_PASSWORD", "label": "访问密码（留空则无密码）", "secret": true }
+        { "key": "REDIS_PASSWORD", "label": "访问密码（requirepass，留空则无密码）", "secret": true }
       ],
       "dataVolume": "/data",
-      "healthCheck": { "type": "exec", "cmd": ["redis-cli", "ping"] },
+      "command": ["sh", "-c", "redis-server --requirepass \"$$REDIS_PASSWORD\""],
+      "healthCheck": { "type": "exec", "cmd": ["sh", "-c", "redis-cli ping"] },
       "minMemoryGb": 0.5
     },
     {
@@ -40,7 +41,7 @@
       "displayName": "PostgreSQL 16",
       "category": "数据库",
       "defaultImage": "docker.io/library/postgres",
-      "recommendedTags": ["16.4", "16.3", "15.8"],
+      "recommendedTags": ["16.4", "16.3", "16.2"],
       "supportedArches": ["amd64", "arm64"],
       "ports": [{ "name": "pgsql", "container": 5432, "defaultHost": 5432, "protocol": "tcp" }],
       "envHints": [
@@ -80,9 +81,10 @@
         { "name": "https", "container": 443, "defaultHost": 443, "protocol": "tcp" }
       ],
       "envHints": [],
-      "dataVolume": "/etc/nginx/conf.d",
-      "healthCheck": { "type": "exec", "cmd": ["curl", "-sf", "http://127.0.0.1/"] },
-      "minMemoryGb": 0.25
+      "dataVolume": "/usr/share/nginx/html",
+      "healthCheck": { "type": "exec", "cmd": ["sh", "-c", "curl -s -o /dev/null http://127.0.0.1/ || wget -q -O /dev/null http://127.0.0.1/"] },
+      "minMemoryGb": 0.25,
+      "remark": "默认监听镜像自带 server（80/443）；静态页面放 data/nginx/。如需自定义配置，编辑 stack/docker-compose.yml 增加配置卷挂载"
     },
     {
       "id": "minio",
@@ -134,19 +136,21 @@
         { "key": "KAFKA_CFG_NODE_ID", "label": "节点 ID", "default": "0" },
         { "key": "KAFKA_CFG_PROCESS_ROLES", "label": "节点角色", "default": "controller,broker" },
         { "key": "KAFKA_CFG_LISTENERS", "label": "监听器", "default": "PLAINTEXT://:9092,CONTROLLER://:9093" },
-        { "key": "KAFKA_CFG_ADVERTISED_LISTENERS", "label": "对外监听器", "default": "PLAINTEXT://127.0.0.1:9092" },
+        { "key": "KAFKA_CFG_ADVERTISED_LISTENERS", "label": "对外地址（必填：PLAINTEXT://<本机IP>:9092）", "required": true },
         { "key": "KAFKA_CFG_CONTROLLER_QUORUM_VOTERS", "label": "仲裁投票者", "default": "0@127.0.0.1:9093" }
       ],
       "dataVolume": "/bitnami/kafka",
+      "dataUser": "1001:1001",
       "healthCheck": { "type": "tcp", "cmd": [] },
-      "minMemoryGb": 2
+      "minMemoryGb": 2,
+      "remark": "对外地址必须填本机真实 IP（如 PLAINTEXT://10.10.1.11:9092），否则跨服务器客户端拿到 127.0.0.1 元数据必然断连"
     },
     {
       "id": "elasticsearch-8",
       "displayName": "Elasticsearch 8",
       "category": "搜索/观测",
       "defaultImage": "docker.io/library/elasticsearch",
-      "recommendedTags": ["8.14.3", "8.13.4", "7.17.22"],
+      "recommendedTags": ["8.14.3", "8.13.4", "8.11.4"],
       "supportedArches": ["amd64", "arm64"],
       "ports": [
         { "name": "http", "container": 9200, "defaultHost": 9200, "protocol": "tcp" },
@@ -154,13 +158,17 @@
       ],
       "envHints": [
         { "key": "discovery.type", "label": "发现模式", "default": "single-node" },
-        { "key": "ELASTIC_PASSWORD", "label": "elastic 密码", "secret": true },
+        { "key": "xpack.security.enabled", "label": "关闭安全认证（内网单机默认）", "default": "false" },
+        { "key": "xpack.security.transport.ssl.enabled", "label": "关闭传输层 TLS（内网单机默认）", "default": "false" },
         { "key": "ES_JAVA_OPTS", "label": "JVM 参数", "default": "-Xms2g -Xmx2g" }
       ],
       "dataVolume": "/usr/share/elasticsearch/data",
-      "healthCheck": { "type": "exec", "cmd": ["curl", "-sf", "http://127.0.0.1:9200/_cluster/health"] },
+      "dataUser": "1000:1000",
+      "healthCheck": { "type": "exec", "cmd": ["sh", "-c", "curl -s -o /dev/null http://127.0.0.1:9200/_cluster/health"] },
+      "healthTimeoutSec": 180,
       "minMemoryGb": 4,
-      "kernelReqs": ["vm.max_map_count>=262144"]
+      "kernelReqs": ["vm.max_map_count>=262144"],
+      "remark": "内网单机默认关闭安全认证与 TLS；如需开启请同时调整健康检查与访问凭据"
     },
     {
       "id": "nacos-2",
