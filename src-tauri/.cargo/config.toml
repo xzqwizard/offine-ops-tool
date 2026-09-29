@@ -1,0 +1,13 @@
+# windows-gnu 工具链链接方案（lld）说明：
+# 本机 WinLibs GCC 16.1 的 GNU ld 2.47 链接的大型测试二进制存在
+# "stdout 为管道时进程以 STATUS_ENTRYPOINT_NOT_FOUND 退出"的工具链级问题，
+# rust-lld 更严格可靠（且会暴露资源重复错误），故统一用 lld 链接。
+# - lld 禁止重复资源：gcc specs 默认注入 default-manifest.o 会与 Tauri 内嵌
+#   清单冲突，build.rs 注入 -specs= 指向 .cargo/mingw-specs-nodm.txt
+#   （由 `gcc -dumpspecs` 去除 default-manifest 注入生成）规避。
+# - linker-features 为 unstable 标志，需 RUSTC_BOOTSTRAP + -Z unstable-options。
+[env]
+RUSTC_BOOTSTRAP = "1"
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-Z", "unstable-options", "-C", "linker-features=+lld"]

@@ -1,6 +1,7 @@
 mod builder;
 mod catalog;
 mod commands;
+mod docker_versions;
 mod error;
 mod models;
 mod store;
@@ -19,6 +20,7 @@ pub fn run() {
             commands::get_storage_info,
             catalog::list_catalog,
             builder::build_offline_package,
+            docker_versions::list_docker_versions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
