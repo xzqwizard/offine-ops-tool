@@ -10,7 +10,7 @@ const props = defineProps<{
   modelValue: boolean
   /** null = 新增 */
   editingId: string | null
-  server: ServerInfo | null
+  servers: ServerInfo[]
   templates: MiddlewareTemplate[]
 }>()
 
@@ -21,6 +21,7 @@ const emit = defineEmits<{
 
 const store = useProjectStore()
 
+const formServerId = ref('')
 const mode = ref<'catalog' | 'custom'>('catalog')
 const selectedTemplateId = ref('')
 const tag = ref('')
@@ -40,7 +41,10 @@ const categories = computed(() => {
 const filteredTemplates = computed(() => {
   return props.templates.filter((t) => {
     if (category.value !== '全部' && t.category !== category.value) return false
-    if (keyword.value && !`${t.displayName}${t.defaultImage}`.toLowerCase().includes(keyword.value.toLowerCase()))
+    if (
+      keyword.value &&
+      !`${t.displayName}${t.defaultImage}`.toLowerCase().includes(keyword.value.toLowerCase())
+    )
       return false
     return true
   })
@@ -50,10 +54,12 @@ const selectedTemplate = computed(() =>
   props.templates.find((t) => t.id === selectedTemplateId.value)
 )
 
+const selectedServer = computed(() => props.servers.find((s) => s.id === formServerId.value))
+
 const archMismatch = computed(() => {
-  if (!props.server || !selectedTemplate.value) return false
+  if (!selectedServer.value || !selectedTemplate.value) return false
   if (!selectedTemplate.value.supportedArches.length) return false
-  return !selectedTemplate.value.supportedArches.includes(props.server.arch)
+  return !selectedTemplate.value.supportedArches.includes(selectedServer.value.arch)
 })
 
 watch(
@@ -70,6 +76,7 @@ function init() {
     ? store.project?.instances.find((i) => i.id === props.editingId)
     : null
   if (editing) {
+    formServerId.value = editing.serverId
     mode.value = editing.templateId === 'custom' ? 'custom' : 'catalog'
     selectedTemplateId.value = editing.templateId
     customImage.value = editing.templateId === 'custom' ? editing.image : ''
@@ -81,6 +88,7 @@ function init() {
     )
     localImageTar.value = editing.localImageTar
   } else {
+    formServerId.value = props.servers[0]?.id ?? ''
     mode.value = 'catalog'
     selectedTemplateId.value = ''
     tag.value = ''
@@ -112,11 +120,19 @@ function selectTemplate(t: MiddlewareTemplate) {
     protocol: p.protocol,
     expose: true
   }))
-  params.value = Object.fromEntries(t.envHints.filter((h) => h.default).map((h) => [h.key, h.default]))
+  params.value = Object.fromEntries(
+    t.envHints.filter((h) => h.default).map((h) => [h.key, h.default])
+  )
 }
 
 function addPort() {
-  ports.value.push({ name: `port-${ports.value.length + 1}`, host: 8080, container: 8080, protocol: 'tcp', expose: true })
+  ports.value.push({
+    name: `port-${ports.value.length + 1}`,
+    host: 8080,
+    container: 8080,
+    protocol: 'tcp',
+    expose: true
+  })
 }
 
 function removePort(index: number) {
@@ -124,14 +140,17 @@ function removePort(index: number) {
 }
 
 function handleSave() {
-  if (!props.server) return
+  if (!formServerId.value) {
+    ElMessage.warning('请选择目标服务器')
+    return
+  }
   if (mode.value === 'catalog' && !selectedTemplate.value) {
     ElMessage.warning('请先选择中间件')
     return
   }
   if (archMismatch.value) {
     ElMessage.error(
-      `架构不兼容：${selectedTemplate.value!.displayName} 不支持 ${props.server.arch}，请更换镜像/版本或使用手动输入`
+      `架构不兼容：${selectedTemplate.value!.displayName} 不支持 ${selectedServer.value!.arch}，请更换镜像/版本或改用手动输入`
     )
     return
   }
@@ -172,7 +191,7 @@ function handleSave() {
 
   const inst: MiddlewareInstance = {
     id: props.editingId ?? genId('inst'),
-    serverId: props.server.id,
+    serverId: formServerId.value,
     templateId: mode.value === 'custom' ? 'custom' : selectedTemplate.value!.id,
     image,
     digest: '',
@@ -193,6 +212,19 @@ function handleSave() {
     top="4vh"
     @update:model-value="emit('update:modelValue', $event)"
   >
+    <!-- 目标服务器（弹窗内选择） -->
+    <div class="flex items-center gap-3 mb-4">
+      <span class="text-sm text-on-surface-variant shrink-0">部署到服务器：</span>
+      <el-select v-model="formServerId" placeholder="选择服务器" class="w-72">
+        <el-option
+          v-for="s in servers"
+          :key="s.id"
+          :value="s.id"
+          :label="`${s.name}（${s.arch} / IP ${s.ip || '未填'}）`"
+        />
+      </el-select>
+    </div>
+
     <el-radio-group v-model="mode" class="mb-4" :disabled="!!editingId">
       <el-radio-button value="catalog">从目录选择</el-radio-button>
       <el-radio-button value="custom">手动输入镜像</el-radio-button>
@@ -229,7 +261,10 @@ function handleSave() {
               {{ t.defaultImage }}
             </div>
           </button>
-          <div v-if="!filteredTemplates.length" class="text-xs text-on-surface-variant py-6 text-center">
+          <div
+            v-if="!filteredTemplates.length"
+            class="text-xs text-on-surface-variant py-6 text-center"
+          >
             无匹配目录项
           </div>
         </div>
@@ -238,13 +273,18 @@ function handleSave() {
       <!-- 目录右侧表单 -->
       <div v-if="selectedTemplate" class="overflow-y-auto max-h-[480px] pr-1">
         <el-alert v-if="archMismatch" type="error" :closable="false" class="mb-4"
-          >镜像 {{ selectedTemplate.defaultImage }} 预计不支持 {{ server?.arch }} 架构（以 M1 在线
-          manifest 校验为准），请谨慎选择或改用手动输入</el-alert
+          >镜像 {{ selectedTemplate.defaultImage }} 预计不支持
+          {{ selectedServer?.arch }} 架构（以 M1 在线 manifest 校验为准），请谨慎选择或改用手动输入</el-alert
         >
         <el-form label-width="110px" label-position="left" @submit.prevent>
           <el-form-item label="版本 tag">
             <el-select v-model="tag" filterable allow-create default-first-option class="w-full">
-              <el-option v-for="t in selectedTemplate.recommendedTags" :key="t" :value="t" :label="t" />
+              <el-option
+                v-for="t in selectedTemplate.recommendedTags"
+                :key="t"
+                :value="t"
+                :label="t"
+              />
             </el-select>
             <div class="text-xs text-on-surface-variant mt-1 font-mono">
               {{ selectedTemplate.defaultImage }}:{{ tag || '?' }}
@@ -258,7 +298,14 @@ function handleSave() {
               <el-table-column prop="name" label="名称" width="80" />
               <el-table-column label="宿主端口" width="120">
                 <template #default="{ row }">
-                  <el-input-number v-model="row.host" :min="1" :max="65535" size="small" controls-position="right" class="w-28" />
+                  <el-input-number
+                    v-model="row.host"
+                    :min="1"
+                    :max="65535"
+                    size="small"
+                    controls-position="right"
+                    class="w-28"
+                  />
                 </template>
               </el-table-column>
               <el-table-column label="容器端口" width="90">
@@ -293,7 +340,10 @@ function handleSave() {
             <div v-if="h.required" class="text-xs text-error mt-0.5">必填</div>
           </el-form-item>
           <el-form-item label="本地镜像 tar">
-            <el-input v-model="localImageTar" placeholder="M0：docker save 导出的 tar 文件绝对路径（选填）" />
+            <el-input
+              v-model="localImageTar"
+              placeholder="M0：docker save 导出的 tar 文件绝对路径（选填）"
+            />
             <div class="text-xs text-on-surface-variant mt-1">
               未填写时构建产物将不包含该镜像，部署前需自行 docker load
             </div>
@@ -330,12 +380,26 @@ function handleSave() {
             </el-table-column>
             <el-table-column label="宿主端口" width="130">
               <template #default="{ row }">
-                <el-input-number v-model="row.host" :min="1" :max="65535" size="small" controls-position="right" class="w-28" />
+                <el-input-number
+                  v-model="row.host"
+                  :min="1"
+                  :max="65535"
+                  size="small"
+                  controls-position="right"
+                  class="w-28"
+                />
               </template>
             </el-table-column>
             <el-table-column label="容器端口" width="130">
               <template #default="{ row }">
-                <el-input-number v-model="row.container" :min="1" :max="65535" size="small" controls-position="right" class="w-28" />
+                <el-input-number
+                  v-model="row.container"
+                  :min="1"
+                  :max="65535"
+                  size="small"
+                  controls-position="right"
+                  class="w-28"
+                />
               </template>
             </el-table-column>
             <el-table-column label="协议" width="90">
@@ -362,7 +426,7 @@ function handleSave() {
 
     <template #footer>
       <el-button @click="emit('update:modelValue', false)">取消</el-button>
-      <el-button type="primary" @click="handleSave">确定</el-button>
+      <el-button type="primary" @click="handleSave">确定并保存</el-button>
     </template>
   </el-dialog>
 </template>
