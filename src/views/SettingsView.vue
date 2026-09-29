@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
+import { open as openDirectory } from '@tauri-apps/plugin-dialog'
 import { backend, toAppError } from '@/api/backend'
 import type { AppSettings, StorageInfo, ConnectivityResult, ProxyConfig } from '@/types/project'
 
@@ -95,6 +96,27 @@ function targetLabel(url: string): string {
   return url
 }
 
+/** 目录选择器（Tauri 环境下弹出系统对话框；浏览器开发模式提示不可用） */
+async function pickDirectory(field: 'projectsRoot' | 'imageCacheRoot' | 'dockerPkgRoot' | 'artifactRoot' | 'logRoot') {
+  if (!('__TAURI_INTERNALS__' in window)) {
+    ElMessage.warning('目录选择仅支持桌面应用环境（浏览器调试请手动输入路径）')
+    return
+  }
+  try {
+    const dir = await openDirectory({
+      directory: true,
+      multiple: false,
+      title: '选择目录',
+      defaultPath: storage.value![field] || undefined
+    })
+    if (typeof dir === 'string' && dir) {
+      settings.value![field] = dir
+    }
+  } catch (e) {
+    ElMessage.error(`打开目录选择失败: ${toAppError(e).message}`)
+  }
+}
+
 function addMirror() {
   const v = newMirror.value.trim()
   if (!v) return
@@ -152,11 +174,23 @@ function removeMirror(index: number) {
             :placeholder="`默认: ${storage![f.effKey]}`"
             class="font-mono"
             clearable
-          />
+          >
+            <template #append>
+              <button
+                class="flex items-center gap-1"
+                title="选择目录"
+                @click="pickDirectory(f.key as any)"
+              >
+                <span class="material-symbols-outlined text-base">folder_open</span>
+                选择
+              </button>
+            </template>
+          </el-input>
         </div>
       </div>
       <div class="text-xs text-on-surface-variant/60 mt-4">
-        提示：更换目录后，新数据写入新位置；已有数据的迁移功能将在后续版本提供（当前可手动移动后在此填入新路径）。
+        默认全部在软件所在目录的 data/ 下（便携式布局，整个目录拷走即迁移）；
+        软件若安装在系统保护目录（如 Program Files），请选择其他可写位置。
       </div>
     </section>
 

@@ -2,20 +2,29 @@ use crate::error::{AppError, AppResult};
 use crate::models::*;
 use std::fs;
 use std::path::PathBuf;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 const SETTINGS_FILE: &str = "settings.json";
 const PROJECT_FILE: &str = "project.json";
 
 // ==================== 路径解析 ====================
 
-fn config_dir(app: &AppHandle) -> AppResult<PathBuf> {
-    app.path()
-        .app_config_dir()
-        .map_err(|e| AppError::Io(format!("无法确定配置目录: {e}")))
+/// 软件所在目录（便携式布局）：数据跟随程序目录而非用户目录，
+/// 整个目录拷走即迁移。开发模式下位于 target/<profile>/。
+fn app_base_dir() -> AppResult<PathBuf> {
+    let exe = std::env::current_exe()
+        .map_err(|e| AppError::Io(format!("无法定位程序位置: {e}")))?;
+    exe.parent()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| AppError::Io("无法取得程序所在目录".into()))
 }
 
-/// 未配置覆盖时的默认存储根（Windows 下位于 %APPDATA%/<identifier>）
+/// 配置文件目录：<软件目录>/data/
+fn config_dir(_app: &AppHandle) -> AppResult<PathBuf> {
+    Ok(app_base_dir()?.join("data"))
+}
+
+/// 未配置覆盖时的默认存储根（全部在软件所在目录的 data/ 下，便携可迁移）
 struct DefaultRoots {
     projects_root: PathBuf,
     image_cache_root: PathBuf,
@@ -24,22 +33,14 @@ struct DefaultRoots {
     log_root: PathBuf,
 }
 
-fn default_roots(app: &AppHandle) -> AppResult<DefaultRoots> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| AppError::Io(format!("无法确定应用数据目录: {e}")))?;
-    let artifact_root = app
-        .path()
-        .document_dir()
-        .map(|d| d.join("OfflinePreOpsTool").join("dist"))
-        .unwrap_or_else(|_| base.join("dist"));
+fn default_roots(_app: &AppHandle) -> AppResult<DefaultRoots> {
+    let data = app_base_dir()?.join("data");
     Ok(DefaultRoots {
-        projects_root: base.join("projects"),
-        image_cache_root: base.join("cache"),
-        docker_pkg_root: base.join("cache").join("docker-pkgs"),
-        artifact_root,
-        log_root: base.join("logs"),
+        projects_root: data.join("projects"),
+        image_cache_root: data.join("cache"),
+        docker_pkg_root: data.join("cache").join("docker-pkgs"),
+        artifact_root: data.join("dist"),
+        log_root: data.join("logs"),
     })
 }
 
