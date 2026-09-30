@@ -175,11 +175,15 @@ fn inspect_image_sync(app: &AppHandle, image: &str) -> AppResult<ImageInspect> {
                 let body = String::from_utf8_lossy(&o.stdout).into_owned();
                 if let Ok(idx) = serde_json::from_str::<RawIndex>(&body) {
                     if !idx.manifests.is_empty() {
+                        // 过滤 unknown/unknown（Docker buildx 的 attestation/SBOM 证明
+                        // 条目，不是可运行平台）并去重
+                        use std::collections::BTreeSet;
                         let arches: Vec<String> = idx
                             .manifests
                             .iter()
                             .filter_map(|m| m.platform.as_ref())
                             .filter(|p| !p.os.is_empty() && !p.architecture.is_empty())
+                            .filter(|p| p.os != "unknown" && p.architecture != "unknown")
                             .map(|p| {
                                 match &p.variant {
                                     Some(v) if !v.is_empty() => {
@@ -188,6 +192,8 @@ fn inspect_image_sync(app: &AppHandle, image: &str) -> AppResult<ImageInspect> {
                                     _ => format!("{}/{}", p.os, p.architecture),
                                 }
                             })
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
                             .collect();
                         let digest = query_digest(app, &cand)?;
                         return Ok(ImageInspect {

@@ -112,6 +112,7 @@ async function checkImage() {
   }
   inspecting.value = true
   inspect.value = null
+  inspectRef.value = ref
   try {
     inspect.value = await backend.inspectImage(ref)
   } catch (e) {
@@ -121,10 +122,32 @@ async function checkImage() {
   }
 }
 
-/** 在线检查结果：所选服务器架构是否受支持（null=未检查） */
+/** 在线检查结果：所选服务器架构是否受支持（null=未检查或检查的不是当前引用）。
+ * 匹配规则：忽略 variant 后缀——arm64 服务器可运行 linux/arm64 与 linux/arm64:v8；
+ * 32 位 arm（linux/arm:v7）不与 arm64 混淆。 */
+const inspectRef = ref('')
+/** 单个平台条目是否匹配服务器架构（忽略 variant：arm64:v8 属于 arm64） */
+function archMatches(a: string): boolean {
+  if (!selectedServer.value) return false
+  const base = `linux/${selectedServer.value.arch}`
+  return a === base || a.startsWith(`${base}:`) || a.startsWith(`${base}/`)
+}
 const onlineArchOk = computed<boolean | null>(() => {
   if (!inspect.value || !selectedServer.value) return null
-  return inspect.value.arches.includes(`linux/${selectedServer.value.arch}`)
+  // 检查结果必须对应当前引用（改了 tag/镜像后旧结论作废）
+  if (inspectRef.value !== currentReference.value) return null
+  const base = `linux/${selectedServer.value.arch}`
+  return inspect.value.arches.some(
+    (a) => a === base || a.startsWith(`${base}:`) || a.startsWith(`${base}/`)
+  )
+})
+
+/** 切到手动输入时自动带入当前引用，方便在架构不匹配时直接改镜像地址 */
+watch(mode, (m) => {
+  if (m === 'custom' && !customImage.value.trim()) {
+    const t = selectedTemplate.value
+    customImage.value = t ? `${t.defaultImage}:${tag.value || 'latest'}` : ''
+  }
 })
 
 watch(
@@ -310,7 +333,7 @@ function handleSave() {
       </el-select>
     </div>
 
-    <el-radio-group v-model="mode" class="mb-3" :disabled="!!editingId">
+    <el-radio-group v-model="mode" class="mb-3">
       <el-radio-button value="catalog">从目录选择</el-radio-button>
       <el-radio-button value="custom">手动输入镜像</el-radio-button>
     </el-radio-group>
@@ -334,9 +357,9 @@ function handleSave() {
           :key="a"
           size="small"
           class="font-mono"
-          :type="selectedServer && a === `linux/${selectedServer.arch}` ? 'success' : 'info'"
+          :type="selectedServer && archMatches(a) ? 'success' : 'info'"
         >
-          {{ a }}{{ selectedServer && a === `linux/${selectedServer.arch}` ? ' ✓' : '' }}
+          {{ a }}{{ selectedServer && archMatches(a) ? ' ✓' : '' }}
         </el-tag>
         <span
           v-if="onlineArchOk === false"
