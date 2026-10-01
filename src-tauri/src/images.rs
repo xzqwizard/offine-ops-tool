@@ -243,6 +243,26 @@ fn query_digest(app: &AppHandle, reference: &str) -> AppResult<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// 查询镜像在指定平台的层总大小（进度条分母；失败返回 0=不显示进度）
+fn total_download_hint(app: &AppHandle, candidates: &[String], platform: &str) -> u64 {
+    for cand in candidates {
+        if let Ok(o) = run_crane(app, &["manifest", "--platform", platform, cand]) {
+            if !o.status.success() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&o.stdout)) {
+                if let Some(layers) = v.get("layers").and_then(|l| l.as_array()) {
+                    let total: u64 = layers.iter().filter_map(|l| l.get("size").and_then(|s| s.as_u64())).sum();
+                    if total > 0 {
+                        return total;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
 /// 查询仓库 tag 列表（部分镜像源不代理 tags 接口，自动回退，后台线程执行）
 #[tauri::command]
 pub async fn list_image_tags(app: AppHandle, image: String) -> AppResult<Vec<String>> {
@@ -447,6 +467,46 @@ pub fn pull_image_inner(
             .unwrap_or(0)
     );
     let tmp = dir.join(format!("{unique}.downloading"));
+
+    // 进度监视：查平台 manifest 层总量，轮询临时文件增长推百分比/速度
+    let platform = format!("{os}/{arch}");
+    let total_hint = total_download_hint(app, &candidates(&settings, &r), &platform);
+    if total_hint > 0 {
+        let watch_tmp = tmp.clone();
+        let watch_app = app.clone();
+        let watch_ref = image.to_string();
+        let watch_arch = arch.to_string();
+        std::thread::spawn(move || {
+            let mut last_bytes = 0u64;
+            let mut last_time = std::time::Instant::now();
+            for _ in 0..(60 * 60 * 2) {
+                // 700ms 间隔，最长监视约 80 分钟
+                if !watch_tmp.exists() {
+                    break
+                }
+                let Ok(md) = fs::metadata(&watch_tmp) else { break };
+                let cur = md.len();
+                let elapsed = last_time.elapsed().as_millis().max(1);
+                let speed = (cur.saturating_sub(last_bytes)) as f64 / (elapsed as f64 / 1000.0);
+                last_bytes = cur;
+                last_time = std::time::Instant::now();
+                let percent = ((cur as f64 / total_hint as f64) * 100.0).min(99.0);
+                let _ = watch_app.emit(
+                    "image-pull-progress",
+                    serde_json::json!({
+                        "reference": watch_ref, "arch": watch_arch,
+                        "bytes": cur, "total": total_hint,
+                        "percent": percent, "speedBps": speed as u64,
+                    }),
+                );
+                if cur >= total_hint {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(700));
+            }
+        });
+    }
+
     let mut errors: Vec<String> = Vec::new();
     let mut ok_source = String::new();
 

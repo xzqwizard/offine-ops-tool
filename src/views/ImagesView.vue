@@ -7,6 +7,12 @@ import type { EngineStatus, CachedImage, ImagePullEvent } from '@/types/images'
 import { ARCH_OPTIONS } from '@/types/project'
 
 const engine = ref<EngineStatus | null>(null)
+
+// 拉取进度（百分比/速度，来自后端临时文件监视）
+const pullPercent = ref<number | null>(null)
+const pullSpeed = ref(0)
+const pullBytes = ref(0)
+const pullTotal = ref(0)
 const installing = ref(false)
 const installLogs = ref<string[]>([])
 const cache = ref<CachedImage[]>([])
@@ -18,6 +24,7 @@ const pulling = ref(false)
 const pullLogs = ref<string[]>([])
 
 let unlistenPull: UnlistenFn | null = null
+let unlistenProgress: UnlistenFn | null = null
 let disposed = false
 
 onMounted(async () => {
@@ -26,8 +33,26 @@ onMounted(async () => {
     const fn = await listen<ImagePullEvent>('image-pull', (e) => {
       pullLogs.value.push(e.payload.detail)
     })
-    if (disposed) fn()
-    else unlistenPull = fn
+    const fnProgress = await listen<{
+      reference: string
+      arch: string
+      bytes: number
+      total: number
+      percent: number
+      speedBps: number
+    }>('image-pull-progress', (e) => {
+      pullPercent.value = e.payload.percent
+      pullSpeed.value = e.payload.speedBps
+      pullBytes.value = e.payload.bytes
+      pullTotal.value = e.payload.total
+    })
+    if (disposed) {
+      fn()
+      fnProgress()
+    } else {
+      unlistenPull = fn
+      unlistenProgress = fnProgress
+    }
   } catch {
     /* 非 Tauri 环境忽略 */
   }
@@ -85,6 +110,10 @@ async function handlePull() {
   }
   pulling.value = true
   pullLogs.value = []
+  pullPercent.value = null
+  pullSpeed.value = 0
+  pullBytes.value = 0
+  pullTotal.value = 0
   try {
     const r = await backend.pullImage(image.trim(), arch)
     if (r.cached) {
@@ -98,7 +127,15 @@ async function handlePull() {
     ElMessage.error(`拉取失败: ${toAppError(e).message}`)
   } finally {
     pulling.value = false
+    pullPercent.value = null
   }
+}
+
+function fmtSpeed(bps: number): string {
+  if (bps >= 1048576) return `${(bps / 1048576).toFixed(1)} MB/s`
+  if (bps >= 1024) return `${(bps / 1024).toFixed(0)} KB/s`
+  return `${bps} B/s`
+}
 }
 
 async function handleDelete(c: CachedImage) {
@@ -214,6 +251,17 @@ function fmtTime(iso: string): string {
         >
           {{ pulling ? '拉取中…' : '拉取' }}
         </button>
+      </div>
+      <!-- 拉取进度（百分比/速度/已下载量） -->
+      <div v-if="pulling && pullPercent !== null" class="mt-3">
+        <div class="flex items-center justify-between text-xs font-mono mb-1">
+          <span class="text-primary">{{ pullPercent.toFixed(1) }}%</span>
+          <span class="text-on-surface-variant">
+            {{ (pullBytes / 1048576).toFixed(1) }} / {{ (pullTotal / 1048576).toFixed(1) }} MB ·
+            {{ fmtSpeed(pullSpeed) }}
+          </span>
+        </div>
+        <el-progress :percentage="Math.floor(pullPercent)" :stroke-width="10" :show-text="false" />
       </div>
       <div
         v-if="pullLogs.length"
