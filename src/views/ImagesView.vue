@@ -136,7 +136,6 @@ function fmtSpeed(bps: number): string {
   if (bps >= 1024) return `${(bps / 1024).toFixed(0)} KB/s`
   return `${bps} B/s`
 }
-}
 
 async function handleDelete(c: CachedImage) {
   try {
