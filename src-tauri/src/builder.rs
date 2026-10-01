@@ -836,7 +836,7 @@ fn build_server(
                     "image",
                     &format!("缓存未命中，在线拉取 {} (linux/{})", inst.image, server.arch),
                 );
-                match crate::images::pull_image_inner(app, &inst.image, "linux", &server.arch, &cache)
+                match crate::images::pull_image_inner(app, &inst.image, "linux", &server.arch, &cache, project.registry.as_ref())
                 {
                     Ok(_) => Some(cache),
                     Err(e) => {

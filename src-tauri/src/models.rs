@@ -7,6 +7,18 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RegistryConfig {
+    /// 私有仓库地址（如 registry.example.cn 或含端口 host:5000）
+    pub url: String,
+    #[serde(default)]
+    pub username: String,
+    /// TODO(M3)：迁 OS 凭据库；当前随方案文件存储于本机
+    #[serde(default)]
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Project {
     pub schema_version: u32,
     pub id: String,
@@ -23,6 +35,9 @@ pub struct Project {
     pub instances: Vec<MiddlewareInstance>,
     #[serde(default)]
     pub network_rules: Vec<NetworkRule>,
+    /// 项目级私有镜像仓库（拉取/查询时优先于镜像源列表）
+    #[serde(default)]
+    pub registry: Option<RegistryConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

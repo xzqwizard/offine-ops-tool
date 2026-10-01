@@ -89,7 +89,7 @@ async function loadOnlineTags() {
   if (!selectedTemplate.value) return
   tagsLoading.value = true
   try {
-    const tags = await backend.listImageTags(selectedTemplate.value.defaultImage)
+    const tags = await backend.listImageTags(selectedTemplate.value.defaultImage, store.project?.registry ?? undefined)
     onlineTags.value = tags
     tagsLoaded.value = true
     ElMessage.success(`已获取 ${tags.length} 个版本（可输入过滤）`)
@@ -118,7 +118,7 @@ async function checkImage() {
   inspect.value = null
   inspectRef.value = ref
   try {
-    inspect.value = await backend.inspectImage(ref)
+    inspect.value = await backend.inspectImage(ref, store.project?.registry ?? undefined)
   } catch (e) {
     ElMessage.error(`镜像检查失败: ${toAppError(e).message}`)
   } finally {

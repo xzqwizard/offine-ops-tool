@@ -85,12 +85,12 @@ export const backend = {
     return invoke<EngineStatus>('engine_install', { force })
   },
 
-  async inspectImage(image: string): Promise<ImageInspect> {
-    return invoke<ImageInspect>('inspect_image', { image })
+  async inspectImage(image: string, registry?: unknown): Promise<ImageInspect> {
+    return invoke<ImageInspect>('inspect_image', { image, registry: registry ?? null })
   },
 
-  async listImageTags(image: string): Promise<string[]> {
-    return invoke<string[]>('list_image_tags', { image })
+  async listImageTags(image: string, registry?: unknown): Promise<string[]> {
+    return invoke<string[]>('list_image_tags', { image, registry: registry ?? null })
   },
 
   async listImageCache(): Promise<CachedImage[]> {
@@ -101,8 +101,12 @@ export const backend = {
     return invoke<void>('delete_cached_image', { file })
   },
 
-  async pullImage(image: string, arch: string): Promise<PullResult> {
-    return invoke<PullResult>('pull_image', { image, arch })
+  async pullImage(
+    image: string,
+    arch: string,
+    registry?: unknown
+  ): Promise<PullResult> {
+    return invoke<PullResult>('pull_image', { image, arch, registry: registry ?? null })
   },
 
   async listDockerPkgs(): Promise<DockerPkgEntry[]> {

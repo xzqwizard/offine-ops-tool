@@ -79,13 +79,24 @@ pub fn parse_reference(input: &str) -> AppResult<ImageRef> {
 }
 
 /// 按设置生成依次尝试的完整引用（仅 docker.io 引用做镜像源回退；私有/其他源原样）
-fn candidates(settings: &crate::models::AppSettings, r: &ImageRef) -> Vec<String> {
+fn candidates(
+    settings: &crate::models::AppSettings,
+    r: &ImageRef,
+    registry: Option<&crate::models::RegistryConfig>,
+) -> Vec<String> {
     let suffix = match &r.digest {
         Some(d) => format!("{}@{d}", r.repo),
         None => format!("{}:{}", r.repo, r.tag),
     };
+    let mut hosts: Vec<String> = Vec::new();
+    // 项目级私有仓库优先
+    if let Some(reg) = registry {
+        let host = reg.url.trim().trim_end_matches('/').to_string();
+        if !host.is_empty() && !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
     if r.registry == "docker.io" {
-        let mut hosts: Vec<String> = Vec::new();
         for m in &settings.registry_mirrors {
             let host = m.trim().trim_end_matches('/').to_string();
             if host.is_empty() {
@@ -101,8 +112,50 @@ fn candidates(settings: &crate::models::AppSettings, r: &ImageRef) -> Vec<String
         }
         hosts.iter().map(|h| format!("{h}/{suffix}")).collect()
     } else {
-        vec![format!("{}/{suffix}", r.registry)]
+        // 显式 registry 引用：私有仓库恰好就是它时由上面的 hosts 命中；否则原样
+        let mut out: Vec<String> = hosts.iter().map(|h| format!("{h}/{suffix}")).collect();
+        out.push(format!("{}/{suffix}", r.registry));
+        out
     }
+}
+
+/// 私有仓库认证（crane auth login；无密码时匿名）
+fn registry_login(app: &AppHandle, registry: Option<&crate::models::RegistryConfig>) -> AppResult<()> {
+    let Some(reg) = registry else { return Ok(()) };
+    let host = reg.url.trim().trim_end_matches('/');
+    if host.is_empty() {
+        return Ok(())
+    }
+    if reg.username.is_empty() && reg.password.is_empty() {
+        return Ok(()) // 匿名私有仓库直接访问
+    }
+    let mut args: Vec<String> = vec!["auth".into(), "login".into(), host.into()];
+    if !reg.username.is_empty() {
+        args.push("-u".into());
+        args.push(reg.username.clone());
+    }
+    if !reg.password.is_empty() {
+        args.push("-p".into());
+        args.push(reg.password.clone());
+    }
+    let exe = crate::engine::crane_path(app)?;
+    let settings = store::load_settings(app)?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(&args);
+    for (k, v) in crate::net::proxy_envs(&settings) {
+        cmd.env(k, v);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| AppError::Io(format!("crane auth login 执行失败: {e}")))?;
+    if !out.status.success() {
+        return Err(AppError::Io(format!(
+            "私有仓库 {} 认证失败: {}",
+            host,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
 }
 
 // ==================== 查询 ====================
@@ -157,18 +210,27 @@ struct RawConfig {
 
 /// 查询镜像的架构支持矩阵与 digest（按镜像源顺序尝试，后台线程执行）
 #[tauri::command]
-pub async fn inspect_image(app: AppHandle, image: String) -> AppResult<ImageInspect> {
-    tauri::async_runtime::spawn_blocking(move || inspect_image_sync(&app, &image))
+pub async fn inspect_image(
+    app: AppHandle,
+    image: String,
+    registry: Option<crate::models::RegistryConfig>,
+) -> AppResult<ImageInspect> {
+    tauri::async_runtime::spawn_blocking(move || inspect_image_sync(&app, &image, registry.as_ref()))
         .await
         .map_err(|e| AppError::Io(format!("查询任务异常: {e}")))?
 }
 
-fn inspect_image_sync(app: &AppHandle, image: &str) -> AppResult<ImageInspect> {
+fn inspect_image_sync(
+    app: &AppHandle,
+    image: &str,
+    registry: Option<&crate::models::RegistryConfig>,
+) -> AppResult<ImageInspect> {
     let settings = store::load_settings(app)?;
+    registry_login(app, registry)?;
     let r = parse_reference(image)?;
     let mut errors: Vec<String> = Vec::new();
 
-    for cand in candidates(&settings, &r) {
+    for cand in candidates(&settings, &r, registry) {
         // 1) manifest：判断是否 index 并收集 platform
         match run_crane(app, &["manifest", "--platform", "all", &cand]) {
             Ok(o) if o.status.success() => {
@@ -265,17 +327,26 @@ fn total_download_hint(app: &AppHandle, candidates: &[String], platform: &str) -
 
 /// 查询仓库 tag 列表（部分镜像源不代理 tags 接口，自动回退，后台线程执行）
 #[tauri::command]
-pub async fn list_image_tags(app: AppHandle, image: String) -> AppResult<Vec<String>> {
-    tauri::async_runtime::spawn_blocking(move || list_image_tags_sync(&app, &image))
+pub async fn list_image_tags(
+    app: AppHandle,
+    image: String,
+    registry: Option<crate::models::RegistryConfig>,
+) -> AppResult<Vec<String>> {
+    tauri::async_runtime::spawn_blocking(move || list_image_tags_sync(&app, &image, registry.as_ref()))
         .await
         .map_err(|e| AppError::Io(format!("tag 查询任务异常: {e}")))?
 }
 
-fn list_image_tags_sync(app: &AppHandle, image: &str) -> AppResult<Vec<String>> {
+fn list_image_tags_sync(
+    app: &AppHandle,
+    image: &str,
+    registry: Option<&crate::models::RegistryConfig>,
+) -> AppResult<Vec<String>> {
     let settings = store::load_settings(app)?;
+    registry_login(app, registry)?;
     let r = parse_reference(image)?;
     let mut errors: Vec<String> = Vec::new();
-    for cand in candidates(&settings, &r) {
+    for cand in candidates(&settings, &r, registry) {
         let repo_only = cand.split('@').next().unwrap_or(&cand);
         let repo_only = match repo_only.rfind(':') {
             Some(i) if i > repo_only.rfind('/').unwrap_or(0) => &repo_only[..i],
@@ -420,13 +491,23 @@ fn emit(app: &AppHandle, status: &str, detail: &str) {
 
 /// 拉取镜像到缓存（跨架构 docker-archive，后台线程执行）。命中缓存直接返回。
 #[tauri::command]
-pub async fn pull_image(app: AppHandle, image: String, arch: String) -> AppResult<PullResult> {
-    tauri::async_runtime::spawn_blocking(move || pull_image_sync(&app, &image, &arch))
+pub async fn pull_image(
+    app: AppHandle,
+    image: String,
+    arch: String,
+    registry: Option<crate::models::RegistryConfig>,
+) -> AppResult<PullResult> {
+    tauri::async_runtime::spawn_blocking(move || pull_image_sync(&app, &image, &arch, registry.as_ref()))
         .await
         .map_err(|e| AppError::Io(format!("拉取任务异常: {e}")))?
 }
 
-fn pull_image_sync(app: &AppHandle, image: &str, arch: &str) -> AppResult<PullResult> {
+fn pull_image_sync(
+    app: &AppHandle,
+    image: &str,
+    arch: &str,
+    registry: Option<&crate::models::RegistryConfig>,
+) -> AppResult<PullResult> {
     let os = "linux";
     let final_path = cache_file_for(app, image, os, arch)?;
     if final_path.is_file() {
@@ -441,7 +522,7 @@ fn pull_image_sync(app: &AppHandle, image: &str, arch: &str) -> AppResult<PullRe
             elapsed_ms: 0,
         });
     }
-    let result = pull_image_inner(app, image, os, arch, &final_path)?;
+    let result = pull_image_inner(app, image, os, arch, &final_path, registry)?;
     Ok(result)
 }
 
@@ -451,8 +532,10 @@ pub fn pull_image_inner(
     os: &str,
     arch: &str,
     final_path: &Path,
+    registry: Option<&crate::models::RegistryConfig>,
 ) -> AppResult<PullResult> {
     let settings = store::load_settings(app)?;
+    registry_login(app, registry)?;
     let r = parse_reference(image)?;
     let start = Instant::now();
     let dir = final_path.parent().unwrap_or(Path::new("."));
@@ -470,7 +553,7 @@ pub fn pull_image_inner(
 
     // 进度监视：查平台 manifest 层总量，轮询临时文件增长推百分比/速度
     let platform = format!("{os}/{arch}");
-    let total_hint = total_download_hint(app, &candidates(&settings, &r), &platform);
+    let total_hint = total_download_hint(app, &candidates(&settings, &r, registry), &platform);
     if total_hint > 0 {
         let watch_tmp = tmp.clone();
         let watch_app = app.clone();
@@ -510,7 +593,7 @@ pub fn pull_image_inner(
     let mut errors: Vec<String> = Vec::new();
     let mut ok_source = String::new();
 
-    for cand in candidates(&settings, &r) {
+    for cand in candidates(&settings, &r, registry) {
         emit(app, "pulling", &format!("{} → {os}/{arch}", cand));
         let platform = format!("{os}/{arch}");
         match run_crane(app, &["pull", "--platform", &platform, "--format=tarball", &cand, &tmp.to_string_lossy()]) {

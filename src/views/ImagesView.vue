@@ -6,6 +6,10 @@ import { backend, toAppError } from '@/api/backend'
 import type { EngineStatus, CachedImage, ImagePullEvent } from '@/types/images'
 import { ARCH_OPTIONS } from '@/types/project'
 
+import { useProjectStore } from '@/stores/project'
+const projectStore = useProjectStore()
+const projectRegistry = computed(() => projectStore.project?.registry ?? undefined)
+
 const engine = ref<EngineStatus | null>(null)
 
 // 拉取进度（百分比/速度，来自后端临时文件监视）
@@ -115,7 +119,7 @@ async function handlePull() {
   pullBytes.value = 0
   pullTotal.value = 0
   try {
-    const r = await backend.pullImage(image.trim(), arch)
+    const r = await backend.pullImage(image.trim(), arch, projectRegistry)
     if (r.cached) {
       pullLogs.value.push(`缓存命中: ${r.cacheFile}`)
     }

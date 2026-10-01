@@ -27,6 +27,7 @@ pub fn create_project(app: AppHandle, name: String, customer: String) -> AppResu
         servers: Vec::new(),
         instances: Vec::new(),
         network_rules: Vec::new(),
+        registry: None,
     };
     store::save_project(&app, &project)?;
     Ok(project)

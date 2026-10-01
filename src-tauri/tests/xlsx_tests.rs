@@ -43,6 +43,7 @@ fn sample_project() -> Project {
                 local_image_tar: String::new(),
             },
         ],
+        registry: None,
         network_rules: vec![NetworkRule {
             id: "r1".into(), from_server_id: "s1".into(), to_server_id: "s2".into(),
             to_port: 3306, protocol: "tcp".into(), description: String::new() + "应用访问数据库",

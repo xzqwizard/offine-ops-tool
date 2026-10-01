@@ -55,6 +55,12 @@ export interface NetworkRule {
   description: string
 }
 
+export interface RegistryConfig {
+  url: string
+  username: string
+  password: string
+}
+
 export interface Project {
   schemaVersion: number
   id: string
@@ -66,6 +72,8 @@ export interface Project {
   servers: ServerInfo[]
   instances: MiddlewareInstance[]
   networkRules: NetworkRule[]
+  /** 项目级私有镜像仓库（拉取/查询时优先于镜像源列表） */
+  registry: RegistryConfig | null
 }
 
 export interface ProjectSummary {

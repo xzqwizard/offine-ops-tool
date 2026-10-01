@@ -52,6 +52,30 @@ const customerModel = computed({
   get: () => store.project?.customer ?? '',
   set: (v: string) => store.scheduleSave((p) => (p.customer = v))
 })
+
+// 项目级私有镜像仓库（折叠区；启用后拉取/查询优先走它）
+const registryOpen = ref(false)
+const registryEnabled = computed({
+  get: () => !!store.project?.registry,
+  set: (v: boolean) =>
+    store.scheduleSave((p) => {
+      p.registry = v
+        ? { url: '', username: '', password: '' }
+        : null
+    })
+})
+const registryUrl = computed({
+  get: () => store.project?.registry?.url ?? '',
+  set: (v: string) => store.scheduleSave((p) => { if (p.registry) p.registry.url = v })
+})
+const registryUser = computed({
+  get: () => store.project?.registry?.username ?? '',
+  set: (v: string) => store.scheduleSave((p) => { if (p.registry) p.registry.username = v })
+})
+const registryPass = computed({
+  get: () => store.project?.registry?.password ?? '',
+  set: (v: string) => store.scheduleSave((p) => { if (p.registry) p.registry.password = v })
+})
 </script>
 
 <template>
@@ -88,6 +112,42 @@ const customerModel = computed({
           <span class="w-2 h-2 rounded-full bg-success"></span>
           <span class="text-on-surface-variant/50">已自动保存</span>
         </template>
+      </div>
+    </div>
+
+    <!-- 私有镜像仓库（项目级，折叠） -->
+    <div class="mb-4">
+      <button
+        class="flex items-center gap-2 text-xs text-on-surface-variant hover:text-primary transition-colors"
+        @click="registryOpen = !registryOpen"
+      >
+        <span class="material-symbols-outlined text-base">{{
+          registryOpen ? 'expand_less' : 'expand_more'
+        }}</span>
+        私有镜像仓库{{ registryEnabled ? `（已启用：${registryUrl || '未填地址'}）` : '（未启用）' }}
+      </button>
+      <div
+        v-if="registryOpen"
+        class="mt-2 bg-surface-container-low rounded-xl border border-outline-variant p-4 flex flex-col gap-3"
+      >
+        <div class="flex items-center gap-3">
+          <el-switch v-model="registryEnabled" size="small" />
+          <span class="text-xs text-on-surface-variant">
+            启用后：镜像拉取/版本查询优先走该仓库（如客户提供的 Harbor），失败再回退镜像源列表
+          </span>
+        </div>
+        <div v-if="registryEnabled" class="grid grid-cols-3 gap-3">
+          <el-input v-model="registryUrl" placeholder="仓库地址，如 harbor.example.cn" class="font-mono" size="small" />
+          <el-input v-model="registryUser" placeholder="用户名（匿名留空）" size="small" />
+          <el-input
+            v-model="registryPass"
+            type="password"
+            show-password
+            autocomplete="new-password"
+            placeholder="密码（匿名留空）"
+            size="small"
+          />
+        </div>
       </div>
     </div>
 
