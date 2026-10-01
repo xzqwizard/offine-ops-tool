@@ -79,6 +79,28 @@ async function handleDelete(inst: MiddlewareInstance) {
   }
 }
 
+/** 批量保存实例（多选服务器部署）：逐个校验，全部通过才落盘 */
+function saveInstances(insts: MiddlewareInstance[]) {
+  for (const inst of insts) {
+    const err = validateInstance(inst)
+    if (err) {
+      ElMessage.warning(err)
+      return
+    }
+  }
+  store
+    .commit((p) => {
+      for (const inst of insts) {
+        p.instances.push(inst)
+      }
+    })
+    .then(() => {
+      dialogOpen.value = false
+      ElMessage.success(`已在 ${insts.length} 台服务器上添加`)
+    })
+    .catch((e) => ElMessage.error(`保存失败: ${toAppError(e).message}`))
+}
+
 /** 保存实例（新增或更新），含 R2 同机宿主端口冲突校验；通过后自动保存 */
 function saveInstance(inst: MiddlewareInstance) {
   const err = validateInstance(inst)
@@ -215,6 +237,7 @@ function validateInstance(inst: MiddlewareInstance): string | null {
       :servers="servers"
       :templates="catalog"
       @save="saveInstance"
+      @save-many="saveInstances"
     />
   </div>
 </template>

@@ -7,6 +7,7 @@ import type { MiddlewareTemplate } from '@/types/catalog'
 import type { ImageInspect } from '@/types/images'
 import type { MiddlewareInstance, PortBinding, ServerInfo } from '@/types/project'
 import { genId } from '@/utils/id'
+import { genStrongPassword } from '@/utils/password'
 
 const props = defineProps<{
   modelValue: boolean
@@ -19,11 +20,14 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'update:modelValue', v: boolean): void
   (e: 'save', inst: MiddlewareInstance): void
+  (e: 'saveMany', insts: MiddlewareInstance[]): void
 }>()
 
 const store = useProjectStore()
 
 const formServerId = ref('')
+/** 新增模式的批量目标（多选） */
+const formServerIds = ref<string[]>([])
 const mode = ref<'catalog' | 'custom'>('catalog')
 const selectedTemplateId = ref('')
 const tag = ref('')
@@ -182,6 +186,7 @@ function init() {
     : null
   if (editing) {
     formServerId.value = editing.serverId
+    formServerIds.value = [editing.serverId]
     mode.value = editing.templateId === 'custom' ? 'custom' : 'catalog'
     selectedTemplateId.value = editing.templateId
     customImage.value = editing.templateId === 'custom' ? editing.image : ''
@@ -195,6 +200,7 @@ function init() {
     editingDigest.value = editing.digest
   } else {
     formServerId.value = props.servers[0]?.id ?? ''
+    formServerIds.value = props.servers[0]?.id ? [props.servers[0].id] : []
     mode.value = 'catalog'
     selectedTemplateId.value = ''
     tag.value = ''
@@ -247,7 +253,12 @@ function removePort(index: number) {
 }
 
 function handleSave() {
-  if (!formServerId.value) {
+  // 编辑=单服务器；新增=可多选批量（一台不兼容跳过并提示）
+  const targetIds =
+    props.editingId || formServerIds.value.length <= 1
+      ? [formServerId.value]
+      : formServerIds.value.filter(Boolean)
+  if (!targetIds.length || targetIds.some((id) => !id)) {
     ElMessage.warning('请选择目标服务器')
     return
   }
@@ -255,16 +266,15 @@ function handleSave() {
     ElMessage.warning('请先选择中间件')
     return
   }
-  if (archMismatch.value) {
+  if (props.editingId && selectedServer.value && archMismatch.value) {
     ElMessage.error(
-      `架构不兼容：${selectedTemplate.value!.displayName} 不支持 ${selectedServer.value!.arch}，请更换镜像/版本或改用手动输入`
+      `架构不兼容：${selectedTemplate.value!.displayName} 不支持 ${selectedServer.value.arch}，请更换镜像/版本或改用手动输入`
     )
     return
   }
-  // 在线检查结果优先：已检查且明确不支持所选架构时阻断
-  if (onlineArchOk.value === false) {
+  if (props.editingId && selectedServer.value && onlineArchOk.value === false) {
     ElMessage.error(
-      `在线检查确认：${currentReference.value} 不支持 linux/${selectedServer.value!.arch}`
+      `在线检查确认：${currentReference.value} 不支持 linux/${selectedServer.value.arch}`
     )
     return
   }
@@ -303,22 +313,50 @@ function handleSave() {
     if (v !== null && v !== undefined && String(v).trim() !== '') cleanParams[k] = v
   }
 
-  const inst: MiddlewareInstance = {
+  // 批量模式：静态目录/在线检查不支持的架构跳过（构建校验兜底，这里给明确提示）
+  const skipped: string[] = []
+  const finalIds =
+    props.editingId || targetIds.length === 1
+      ? targetIds
+      : targetIds.filter((id) => {
+          const s = props.servers.find((x) => x.id === id)
+          if (!s) return false
+          const mismatch =
+            selectedTemplate.value?.supportedArches.length &&
+            !selectedTemplate.value.supportedArches.includes(s.arch)
+          if (mismatch) skipped.push(`${s.name}(${s.arch})`)
+          return !mismatch
+        })
+  if (!finalIds.length) {
+    ElMessage.error(`所选服务器的架构均不支持该中间件：${skipped.join('、')}`)
+    return
+  }
+  if (skipped.length) {
+    ElMessage.warning(`已跳过架构不兼容的服务器：${skipped.join('、')}`)
+  }
+
+  const digest =
+    inspect.value && inspectRef.value === image && inspect.value.digest
+      ? inspect.value.digest
+      : editingDigest.value
+
+  const instances: MiddlewareInstance[] = finalIds.map((serverId) => ({
     id: props.editingId ?? genId('inst'),
-    serverId: formServerId.value,
+    serverId,
     templateId: mode.value === 'custom' ? 'custom' : selectedTemplate.value!.id,
     image,
-    // 仅当在线检查针对的就是当前保存的引用时才采用其 digest，否则保留原值
-    digest:
-      inspect.value && inspectRef.value === image && inspect.value.digest
-        ? inspect.value.digest
-        : editingDigest.value,
+    digest,
     instanceName: instanceName.value.trim(),
     params: cleanParams,
     ports: JSON.parse(JSON.stringify(ports.value)),
     localImageTar: localImageTar.value.trim()
+  }))
+
+  if (instances.length === 1 && (props.editingId || formServerIds.value.length <= 1)) {
+    emit('save', instances[0])
+  } else {
+    emit('saveMany', instances)
   }
-  emit('save', inst)
 }
 </script>
 
@@ -330,10 +368,15 @@ function handleSave() {
     top="4vh"
     @update:model-value="emit('update:modelValue', $event)"
   >
-    <!-- 目标服务器（弹窗内选择） -->
+    <!-- 目标服务器（新增可多选批量部署，编辑单台） -->
     <div class="flex items-center gap-3 mb-4">
       <span class="text-sm text-on-surface-variant shrink-0">部署到服务器：</span>
-      <el-select v-model="formServerId" placeholder="选择服务器" class="w-72">
+      <el-select
+        v-if="editingId"
+        v-model="formServerId"
+        placeholder="选择服务器"
+        class="w-72"
+      >
         <el-option
           v-for="s in servers"
           :key="s.id"
@@ -341,6 +384,25 @@ function handleSave() {
           :label="`${s.name}（${s.arch} / IP ${s.ip || '未填'}）`"
         />
       </el-select>
+      <el-select
+        v-else
+        v-model="formServerIds"
+        multiple
+        collapse-tags
+        collapse-tags-tooltip
+        placeholder="选择服务器（可多选批量部署）"
+        class="flex-1 max-w-xl"
+      >
+        <el-option
+          v-for="s in servers"
+          :key="s.id"
+          :value="s.id"
+          :label="`${s.name}（${s.arch} / IP ${s.ip || '未填'}）`"
+        />
+      </el-select>
+      <span v-if="!editingId && formServerIds.length > 1" class="text-[10px] text-on-surface-variant/50 shrink-0">
+        批量模式：参数共享，架构不兼容的服务器自动跳过
+      </span>
     </div>
 
     <el-radio-group v-model="mode" class="mb-3">
@@ -503,7 +565,18 @@ function handleSave() {
               type="password"
               show-password
               autocomplete="new-password"
-            />
+            >
+              <template #append>
+                <button
+                  type="button"
+                  title="自动生成强密码（16位，含大小写/数字/符号）"
+                  @click="params[h.key] = genStrongPassword()"
+                >
+                  <span class="material-symbols-outlined text-base">casino</span>
+                  生成
+                </button>
+              </template>
+            </el-input>
             <el-input v-else v-model="params[h.key]" :placeholder="h.default || '选填'" />
             <div v-if="h.required" class="text-xs text-error mt-0.5">必填</div>
           </el-form-item>
