@@ -111,3 +111,34 @@ pub fn save_settings(app: AppHandle, settings: AppSettings) -> AppResult<Storage
 pub fn get_storage_info(app: AppHandle) -> AppResult<StorageInfo> {
     store::effective_storage(&app)
 }
+
+// ==================== 磁盘空间 ====================
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskSpaceInfo {
+    pub path: String,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// 查询存储根所在盘的剩余空间（构建前预检用）
+#[tauri::command]
+pub fn get_disk_space(app: AppHandle, path: String) -> AppResult<DiskSpaceInfo> {
+    use fs2::{available_space, total_space};
+    let p = std::path::PathBuf::from(path.trim());
+    let target = if p.exists() { p } else {
+        // 目标不存在时向上找存在的祖先（盘符根一定存在）
+        p.ancestors().skip(1).find(|a| a.exists())
+            .ok_or_else(|| crate::error::AppError::Invalid(format!("路径无效: {path}")))?
+            .to_path_buf()
+    };
+    let free = available_space(&target)
+        .map_err(|e| crate::error::AppError::Io(format!("查询磁盘空间失败: {e}")))?;
+    let total = total_space(&target).unwrap_or(0);
+    Ok(DiskSpaceInfo {
+        path: path.trim().to_string(),
+        free_bytes: free,
+        total_bytes: total,
+    })
+}

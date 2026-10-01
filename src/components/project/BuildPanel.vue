@@ -162,6 +162,36 @@ async function handleBuild() {
     ElMessage.error(`存在 ${issues.filter((i) => i.level === 'error').length} 个校验错误，请先在「校验」页签处理`)
     return
   }
+  // 磁盘空间预检：估算（已知镜像来源体积 ×2.5 冗余 + 1GB），不足时二次确认
+  try {
+    const space = await backend.getDiskSpace(artifactRoot.value)
+    const knownBytes = store.project.instances.reduce((sum, i) => {
+      if (!i.localImageTar) return sum
+      return sum // 本地 tar 体积前端拿不到，由估算冗余覆盖
+    }, 0)
+    let estimated = 1024 * 1024 * 1024 // 基础 1GB
+    const cacheList = await backend.listImageCache().catch(() => [])
+    const missingPull = store.project.instances.filter(
+      (i) => !i.localImageTar &&
+        !cacheList.some((c) => c.reference === i.image && c.platform.includes(store.project!.servers.find((s) => s.id === i.serverId)?.arch ?? ''))
+    )
+    estimated += missingPull.length * 600 * 1024 * 1024 // 每个未知在线镜像按 600MB 估算
+    estimated += knownBytes * 2.5
+    if (space.freeBytes < estimated) {
+      try {
+        await ElMessageBox.confirm(
+          `产物磁盘空间可能不足：预计需要约 ${(estimated / 1073741824).toFixed(1)} GB（在线拉取镜像大小未知按 600MB/个估算），` +
+            `${artifactRoot.value} 所在盘剩余 ${(space.freeBytes / 1073741824).toFixed(1)} GB。仍要继续构建吗？`,
+          '磁盘空间预检',
+          { type: 'warning', confirmButtonText: '继续构建', cancelButtonText: '取消' }
+        )
+      } catch {
+        return
+      }
+    }
+  } catch {
+    /* 空间查询失败不阻断构建 */
+  }
   const pkgProblems = await checkDockerPkgs()
   if (pkgProblems.length) {
     ElMessage.error(`Docker 离线材料不全，已阻止构建：${pkgProblems.join('；')}。请到「Docker 安装包库」导入/下载`)

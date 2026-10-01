@@ -26,6 +26,7 @@ pub fn run() {
             commands::get_settings,
             commands::save_settings,
             commands::get_storage_info,
+            commands::get_disk_space,
             catalog::list_catalog,
             builder::build_offline_package,
             docker_versions::list_docker_versions,

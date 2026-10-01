@@ -145,6 +145,10 @@ export const backend = {
     return invoke<void>('open_dir_in_explorer', { dir })
   },
 
+  async getDiskSpace(path: string): Promise<{ path: string; freeBytes: number; totalBytes: number }> {
+    return invoke('get_disk_space', { path })
+  },
+
   /** baselineBuildId 传空/null = 完整包；传基线构建号 = 增量升级包 */
   async buildOfflinePackage(
     project: Project,
