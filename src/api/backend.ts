@@ -149,6 +149,14 @@ export const backend = {
     return invoke<void>('open_dir_in_explorer', { dir })
   },
 
+  async backupAppData(outputPath: string): Promise<string> {
+    return invoke<string>('backup_app_data', { outputPath })
+  },
+
+  async restoreAppData(backupPath: string): Promise<string> {
+    return invoke<string>('restore_app_data', { backupPath })
+  },
+
   async getDiskSpace(path: string): Promise<{ path: string; freeBytes: number; totalBytes: number }> {
     return invoke('get_disk_space', { path })
   },

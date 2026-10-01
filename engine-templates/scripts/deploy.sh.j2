@@ -54,7 +54,7 @@ else
   if bash "$BASE_DIR/scripts/precheck.sh" --strict; then
     ok "预检通过"
   else
-    fail "预检未通过，详见上方输出。强制部署请人工确认后重试。"
+    fail "[错误码 D1] 环境预检未通过（架构不匹配/端口占用/磁盘不足等），详见上方 ✗ 项与 docs/OPS-GUIDE.md 第5章排查表"
     exit 1
   fi
 fi
@@ -68,7 +68,7 @@ else
     info "从离线材料安装 Docker..."
     run bash "$DOCKER_OFFLINE_DIR/install-docker.sh"
   else
-    fail "未安装 Docker，且包内无离线安装材料（docker-offline/packages 为空）"
+    fail "[错误码 D2] 未安装 Docker 且包内无离线材料：在工具端 Docker 安装包库补齐后重新构建"
     fail "请先在工具端配置 Docker 离线安装包后重新构建，或人工安装 Docker {{ server.docker_version }} 后重试"
     exit 1
   fi
@@ -78,7 +78,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   docker compose version >/dev/null 2>&1 || info "[dry-run] 注意：本机暂未安装 docker compose（正式部署时将由离线材料安装）"
 else
   if ! docker compose version >/dev/null 2>&1; then
-    fail "缺少 docker compose v2 插件，请安装后重试（包内 docker-offline/ 含材料时 install-docker.sh 会一并安装）"
+    fail "[错误码 D3] 缺少 docker compose v2 插件：在工具端补对应架构 compose 插件后重新构建"
     exit 1
   fi
 fi
@@ -160,10 +160,11 @@ step "6/6 部署报告"
 echo
 echo "------------------------------------------------------------"
 if [ "$HEALTH_FAIL" -gt 0 ]; then
-  warn "有 $HEALTH_FAIL 个服务未通过健康检查，请查上方日志与 $LOG_DIR/deploy-report.txt"
+  warn "[错误码 D4] 有 $HEALTH_FAIL 个服务未通过健康检查：查 docker logs 与 $LOG_DIR/deploy-report.txt，处置见 docs/OPS-GUIDE.md 第5章"
 else
   ok "全部服务就绪。日常运维请使用: bash scripts/ops.sh （帮助: ops.sh help）"
   ok "运维文档: docs/OPS-GUIDE.md | 端口说明: docs/PORT-MATRIX.md"
+  ok "建议立即配置每日自动备份：bash scripts/ops.sh cron-backup"
 fi
 echo "------------------------------------------------------------"
 [ "$HEALTH_FAIL" -eq 0 ] || exit 3

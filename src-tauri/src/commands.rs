@@ -143,3 +143,92 @@ pub fn get_disk_space(app: AppHandle, path: String) -> AppResult<DiskSpaceInfo> 
         total_bytes: total,
     })
 }
+
+// ==================== 工具数据备份（方案/设置随包迁移，不含镜像缓存与产物） ====================
+
+/// 备份工具数据（projects/settings/logs 的源数据；cache/dist 体积大且可再生，排除）
+#[tauri::command]
+pub fn backup_app_data(app: AppHandle, output_path: String) -> AppResult<String> {
+    use std::io::Write as _;
+    let base = app_base(&app)?;
+    let file = std::fs::File::create(&output_path)
+        .map_err(|e| crate::error::AppError::Io(format!("创建备份文件失败: {e}")))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut count = 0u32;
+    for sub in ["projects", "settings.json"] {
+        let p = base.join(sub);
+        if p.is_file() {
+            zip.start_file(sub, options)
+                .map_err(|e| crate::error::AppError::Io(e.to_string()))?;
+            std::io::copy(&mut std::fs::File::open(&p)?, &mut zip)?;
+            count += 1;
+        } else if p.is_dir() {
+            add_dir_to_zip(&mut zip, &p, sub, options)?;
+        }
+    }
+    zip.finish().map_err(|e| crate::error::AppError::Io(e.to_string()))?;
+    Ok(format!("已备份 {count} 项 → {output_path}"))
+}
+
+fn add_dir_to_zip(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    dir: &std::path::Path,
+    prefix: &str,
+    options: zip::write::SimpleFileOptions,
+) -> AppResult<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = format!("{prefix}/{}", entry.file_name().to_string_lossy());
+        if path.is_dir() {
+            add_dir_to_zip(zip, &path, &name, options)?;
+        } else {
+            zip.start_file(&name, options)
+                .map_err(|e| crate::error::AppError::Io(e.to_string()))?;
+            std::io::copy(&mut std::fs::File::open(&path)?, zip)?;
+        }
+    }
+    Ok(())
+}
+
+/// 从备份恢复（覆盖式；恢复后重启应用生效）
+#[tauri::command]
+pub fn restore_app_data(app: AppHandle, backup_path: String) -> AppResult<String> {
+    let base = app_base(&app)?;
+    let file = std::fs::File::open(&backup_path)
+        .map_err(|e| crate::error::AppError::Io(format!("打开备份失败: {e}")))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|e| crate::error::AppError::Io(format!("备份文件格式错误: {e}")))?;
+    let mut count = 0u32;
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| crate::error::AppError::Io(e.to_string()))?;
+        if entry.is_dir() {
+            continue;
+        }
+        // 路径穿越防护
+        let name = entry.name().to_string();
+        if name.contains("..") {
+            continue;
+        }
+        let out_path = base.join(&name);
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = std::fs::File::create(&out_path)?;
+        std::io::copy(&mut entry, &mut out)?;
+        count += 1;
+    }
+    Ok(format!("已恢复 {count} 个文件（重启应用后生效）"))
+}
+
+fn app_base(app: &AppHandle) -> AppResult<std::path::PathBuf> {
+    let exe = std::env::current_exe()
+        .map_err(|e| crate::error::AppError::Io(format!("无法定位程序位置: {e}")))?;
+    exe.parent()
+        .map(|p| p.join("data"))
+        .ok_or_else(|| crate::error::AppError::Io("无法取得数据目录".into()))
+}

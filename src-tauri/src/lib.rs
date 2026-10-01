@@ -27,6 +27,8 @@ pub fn run() {
             commands::save_settings,
             commands::get_storage_info,
             commands::get_disk_space,
+            commands::backup_app_data,
+            commands::restore_app_data,
             catalog::list_catalog,
             builder::build_offline_package,
             docker_versions::list_docker_versions,

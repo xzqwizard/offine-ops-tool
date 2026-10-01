@@ -28,6 +28,7 @@ usage() {
   exec     <svc> [cmd...]          进入容器执行命令
   stats             资源占用（CPU/内存/网络）
   backup            备份数据卷到 backup/ 目录（tar 快照）
+  cron-backup       配置每日 02:00 自动备份
   doctor            全面诊断（容器/端口/磁盘/日志错误关键字）
   config            显示编排关键信息（不含密码）
   version           本包信息
@@ -53,6 +54,25 @@ cmd_status() {
     PORTS=$( { docker port "$S" 2>/dev/null || true; } | awk -F' -> ' '{printf "%s,", $2}' | sed 's/,$//')
     printf "%-22s %-12s %-10s %s\n" "$S" "$STATE" "$HC" "${PORTS:-}"
   done
+}
+
+cmd_cron_backup() {
+  # 每日 02:00 自动备份（root 用 /etc/cron.d，普通用户用 crontab）
+  CRON_LINE="0 2 * * * cd \"$BASE_DIR\" && bash scripts/ops.sh backup >> logs/cron-backup.log 2>&1"
+  if [ "$(id -u)" -eq 0 ]; then
+    {
+      echo 'SHELL=/bin/bash'
+      echo 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+      echo "$CRON_LINE"
+    } > /etc/cron.d/offlinepreops-backup
+    chmod 644 /etc/cron.d/offlinepreops-backup
+    echo "已配置每日 02:00 自动备份（/etc/cron.d/offlinepreops-backup）"
+  else
+    (crontab -l 2>/dev/null | grep -v offlinepreops; echo "$CRON_LINE") | crontab -
+    echo "已配置每日 02:00 自动备份（用户 crontab）"
+  fi
+  echo "  $CRON_LINE"
+  echo "备份日志: $BASE_DIR/logs/cron-backup.log；自动保留最近 5 份"
 }
 
 cmd_doctor() {
@@ -117,6 +137,7 @@ case "${1:-menu}" in
   exec)    need_svc "${2:-}"; S="$2"; shift 2; c exec "$S" "${@:-sh}" ;;
   stats)   docker stats --no-stream $(docker compose -f "$COMPOSE_FILE" ps -q) 2>/dev/null || docker stats --no-stream ;;
   backup)  cmd_backup ;;
+  cron-backup) cmd_cron_backup ;;
   doctor)  cmd_doctor ;;
   config)  cmd_config ;;
   version) cmd_config ;;
@@ -130,7 +151,8 @@ case "${1:-menu}" in
       echo "------------------------------------------------------"
       echo "  1) 状态总览   2) 日志(选服务)   3) 重启(选服务)"
       echo "  4) 停止       5) 启动           6) 资源占用"
-      echo "  7) 备份       8) 诊断 doctor    0) 退出"
+      echo "  7) 备份       8) 诊断 doctor"
+      echo "  9) 定时备份    0) 退出"
       read -rp "请选择: " CHOICE
       case "$CHOICE" in
         1) cmd_status ;;
@@ -141,6 +163,7 @@ case "${1:-menu}" in
         6) docker stats --no-stream ;;
         7) cmd_backup ;;
         8) cmd_doctor ;;
+        9) cmd_cron_backup ;;
         0|*) exit 0 ;;
       esac
     done

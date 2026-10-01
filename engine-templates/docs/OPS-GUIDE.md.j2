@@ -63,6 +63,17 @@ bash scripts/ops.sh backup
 
 ## 5. 故障排查对照表
 
+### 5.0 部署错误码（deploy.sh 输出）
+
+| 错误码 | 含义 | 处置 |
+|---|---|---|
+| D1 | 环境预检未通过 | 看预检 ✗ 项：架构不匹配=拿错包；端口占用=ss -lntp 查占用进程；磁盘不足=清理数据盘 |
+| D2 | 无 Docker 且包内无安装材料 | 联系工具端补齐 Docker 离线安装包后重新构建；或人工安装与方案一致的 Docker 版本 |
+| D3 | 缺 docker compose v2 插件 | 联系工具端补对应架构 compose 插件；或人工安装 docker-compose-plugin |
+| D4 | 健康检查超时 | 看 5.1 对照表逐项排查；确认 `docker logs` 无异常后可重跑 `bash scripts/deploy.sh` |
+
+### 5.1 运行期症状
+
 | 症状 | 排查 | 常见原因 |
 |---|---|---|
 | 容器反复重启 | `docker logs --tail 100 <服务>` | 配置/密码错误、端口冲突、数据目录权限 |

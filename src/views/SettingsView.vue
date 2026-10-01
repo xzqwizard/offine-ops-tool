@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, onUnmounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { open as openDirectory } from '@tauri-apps/plugin-dialog'
+import { open as openDirectory, save as saveFileDialog, open as openFileDialog } from "@tauri-apps/plugin-dialog"
 import { backend, toAppError } from '@/api/backend'
 import type {
   AppSettings,
@@ -196,6 +196,65 @@ async function pickDirectory(field: 'projectsRoot' | 'imageCacheRoot' | 'dockerP
   }
 }
 
+// ---- 工具数据备份（方案与设置，不含镜像缓存/产物） ----
+const backing = ref(false)
+
+async function handleBackupData() {
+  if (!('__TAURI_INTERNALS__' in window)) return
+  try {
+    const path = await saveFileDialog({
+      title: '备份工具数据',
+      defaultPath: `offlinepreops-backup-${new Date().toISOString().slice(0, 10)}.zip`,
+      filters: [{ name: 'ZIP 备份', extensions: ['zip'] }]
+    })
+    if (!path) return
+    backing.value = true
+    try {
+      const msg = await backend.backupAppData(path)
+      ElMessage.success(msg)
+    } catch (e) {
+      ElMessage.error(`备份失败: ${toAppError(e).message}`)
+    } finally {
+      backing.value = false
+    }
+  } catch {
+    /* 取消 */
+  }
+}
+
+async function handleRestoreData() {
+  if (!('__TAURI_INTERNALS__' in window)) return
+  try {
+    const files = await openFileDialog({
+      multiple: false,
+      title: '选择备份文件',
+      filters: [{ name: 'ZIP 备份', extensions: ['zip'] }]
+    })
+    const path = Array.isArray(files) ? files[0] : files
+    if (!path) return
+    try {
+      await ElMessageBox.confirm(
+        '恢复将覆盖当前的方案与设置（镜像缓存不受影响），恢复完成后需重启应用。确定继续？',
+        '恢复确认',
+        { type: 'warning', confirmButtonText: '恢复', cancelButtonText: '取消' }
+      )
+    } catch {
+      return
+    }
+    backing.value = true
+    try {
+      const msg = await backend.restoreAppData(path)
+      ElMessage.success(msg)
+    } catch (e) {
+      ElMessage.error(`恢复失败: ${toAppError(e).message}`)
+    } finally {
+      backing.value = false
+    }
+  } catch {
+    /* 取消 */
+  }
+}
+
 function addMirror() {
   const v = newMirror.value.trim()
   if (!v) return
@@ -385,6 +444,32 @@ function removeMirror(index: number) {
             使用界面当前配置测试（无需先保存）；401 状态即代表源可达
           </span>
         </div>
+      </div>
+    </section>
+
+    <!-- 工具数据备份 -->
+    <section class="bg-surface-container-low rounded-xl border border-outline-variant p-5 mb-6">
+      <h3 class="text-sm font-headline font-bold text-primary uppercase tracking-widest mb-3">
+        工具数据备份
+      </h3>
+      <div class="flex items-center gap-3 flex-wrap">
+        <button
+          class="px-4 py-1.5 rounded-lg text-xs font-bold border border-primary/50 text-primary hover:bg-primary/10 transition-colors"
+          :disabled="backing"
+          @click="handleBackupData"
+        >
+          备份方案与设置（zip）
+        </button>
+        <button
+          class="px-4 py-1.5 rounded-lg text-xs font-bold border border-outline-variant text-on-surface-variant hover:border-primary hover:text-primary transition-colors"
+          :disabled="backing"
+          @click="handleRestoreData"
+        >
+          从备份恢复
+        </button>
+      </div>
+      <div class="text-[10px] text-on-surface-variant/50 mt-2">
+        备份含全部方案与设置（不含镜像缓存与构建产物，体积很小）；换机/重装时恢复用
       </div>
     </section>
 
