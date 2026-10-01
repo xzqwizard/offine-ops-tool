@@ -159,11 +159,11 @@ export function validateProject(
 
   // ---- 本地镜像提示 ----
   for (const inst of project.instances) {
-    if (!inst.localImageTar) {
+    if (!inst.localImageTar && !inst.digest) {
       issues.push({
         code: 'I-102',
         level: 'info',
-        message: `「${inst.instanceName}」未指定本地镜像 tar，M0 阶段构建产物将不含该镜像（需现场自行 docker load）`
+        message: `「${inst.instanceName}」按镜像引用在线拉取（构建时可自动拉取或从缓存复用）；也可在实例表单指定本地 docker save 的 tar`
       })
     }
   }

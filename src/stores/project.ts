@@ -4,8 +4,10 @@ import { backend } from '@/api/backend'
 import type { Project, ProjectSummary } from '@/types/project'
 
 let saveTimer: number | undefined
-/** 保存序号：丢弃乱序返回的过期保存响应，防止旧快照覆盖新数据 */
+/** 保存序号：丢弃乱序返回的过期保存响应 */
 let saveSeq = 0
+/** 保存链：所有保存请求严格串行执行（后端整体覆盖写，乱序落盘会用旧快照覆盖新数据） */
+let saveChain: Promise<void> = Promise.resolve()
 
 export const useProjectStore = defineStore('project', () => {
   const project = ref<Project | null>(null)
@@ -26,21 +28,27 @@ export const useProjectStore = defineStore('project', () => {
     summaries.value = await backend.listProjects()
   }
 
-  /** 执行保存；仅最新一次保存的结果会写回内存 */
-  async function save() {
-    if (!project.value) return
-    const seq = ++saveSeq
-    saving.value = true
-    try {
-      const saved = await backend.saveProject(project.value)
-      // 过期响应丢弃（更晚发起的保存已在途/已完成）
-      if (seq !== saveSeq || !project.value || saved.id !== project.value.id) return
-      project.value = saved
-      if (seq === saveSeq) dirty.value = false
-      await refreshSummaries()
-    } finally {
-      if (seq === saveSeq) saving.value = false
+  /** 执行保存（排队串行）。仅"发起后无编辑"的响应才回写内存，防止在途快照回滚用户输入 */
+  function save(): Promise<void> {
+    const run = async () => {
+      if (!project.value) return
+      const seq = ++saveSeq
+      const revBefore = revision.value
+      saving.value = true
+      try {
+        const saved = await backend.saveProject(project.value)
+        if (seq !== saveSeq || !project.value || saved.id !== project.value.id) return
+        // 响应回来前发生了编辑：不回写（会丢编辑），保持 dirty 由后续保存落盘
+        if (revision.value !== revBefore) return
+        project.value = saved
+        dirty.value = false
+        await refreshSummaries()
+      } finally {
+        if (seq === saveSeq) saving.value = false
+      }
     }
+    saveChain = saveChain.then(run, run)
+    return saveChain
   }
 
   /** 修改并立即持久化（表单新增/修改/删除后自动保存） */
@@ -67,13 +75,14 @@ export const useProjectStore = defineStore('project', () => {
     }, delay)
   }
 
-  /** 立即落盘未保存的防抖修改（切方案/删除前调用） */
+  /** 立即落盘未保存的修改（切方案/删除前调用）：flush 防抖定时器并等待在途/排队保存完成 */
   async function flushPending() {
     if (saveTimer) {
       window.clearTimeout(saveTimer)
       saveTimer = undefined
-      if (dirty.value) await save()
     }
+    if (dirty.value) await save()
+    await saveChain.catch(() => {})
   }
 
   async function open(id: string) {

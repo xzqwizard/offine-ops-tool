@@ -53,7 +53,8 @@ function hasRule(fromId: string, toServerId: string, port: number): boolean {
   )
 }
 
-/** 点击矩阵单元格切换放行（静默自动保存，失败时提示） */
+/** 点击矩阵单元格切换放行（静默自动保存，失败时提示）。
+ * 协议取该端口定义的协议（udp 端口的放行规则必须是 udp） */
 function toggleCell(fromId: string, row: { toServerId: string; host: number }) {
   const existing = rules.value.find(
     (r) => r.fromServerId === fromId && r.toServerId === row.toServerId && r.toPort === row.host
@@ -63,13 +64,17 @@ function toggleCell(fromId: string, row: { toServerId: string; host: number }) {
       p.networkRules = p.networkRules.filter((r) => r.id !== existing.id)
     }).catch((e) => ElMessage.error(`保存失败: ${toAppError(e).message}`))
   } else {
+    const protocol =
+      store.project?.instances
+        .find((i) => i.serverId === row.toServerId)
+        ?.ports.find((p) => p.host === row.host)?.protocol ?? 'tcp'
     store.commit((p) => {
       p.networkRules.push({
         id: genId('rule'),
         fromServerId: fromId,
         toServerId: row.toServerId,
         toPort: row.host,
-        protocol: 'tcp',
+        protocol,
         description: ''
       })
     }).catch((e) => ElMessage.error(`保存失败: ${toAppError(e).message}`))

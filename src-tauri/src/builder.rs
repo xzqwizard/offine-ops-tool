@@ -22,6 +22,8 @@ pub struct BuildImageInfo {
     pub file: String,
     pub sha256: Option<String>,
     pub size_bytes: u64,
+    /// 镜像 digest（来自方案锁定或拉取元数据，产物审计用）
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -105,6 +107,77 @@ pub fn render(env: &Environment<'_>, name: &str, ctx: &serde_json::Value) -> App
 }
 
 // ==================== 工具函数 ====================
+
+/// shell 单引号包裹（元素内 ' 转义为 '\''）
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// 读取 docker-archive tar 内 manifest.json 的 RepoTags 列表
+fn read_tar_repo_tags(path: &Path) -> AppResult<Vec<String>> {
+    let f = File::open(path)?;
+    let mut archive = tar::Archive::new(BufReader::new(f));
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let name = entry.path()?.to_string_lossy().replace('\\', "/");
+        if name == "manifest.json" {
+            let mut body = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut body)?;
+            let v: serde_json::Value = serde_json::from_str(&body)?;
+            let mut out = Vec::new();
+            if let Some(arr) = v.as_array() {
+                for item in arr {
+                    if let Some(tags) = item.get("RepoTags").and_then(|t| t.as_array()) {
+                        for t in tags {
+                            if let Some(s) = t.as_str() {
+                                out.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(out);
+        }
+    }
+    Ok(vec![])
+}
+
+/// 实例镜像的 digest：方案锁定值优先，其次缓存 meta 里的拉取 digest
+fn image_digest(app: &AppHandle, inst: &crate::models::MiddlewareInstance, src: &Path) -> String {
+    if !inst.digest.is_empty() {
+        return inst.digest.clone();
+    }
+    let meta = src.with_extension("tar.meta.json");
+    if let Ok(raw) = fs::read_to_string(&meta) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(d) = v.get("digest").and_then(|x| x.as_str()) {
+                return d.to_string();
+            }
+        }
+    }
+    let _ = app;
+    String::new()
+}
+
+/// compose 项目名：仅 [a-z0-9_-] 且字母数字开头（compose 强制规则，
+/// 中文/大写/点号会导致现场 `docker compose config` 报错）
+fn compose_name(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.trim().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' {
+            out.push(c)
+        } else if c.is_ascii_uppercase() {
+            out.push(c.to_ascii_lowercase())
+        }
+        // 中文与其它字符丢弃
+    }
+    let t = out.trim_matches('-').to_string();
+    if t.is_empty() || !t.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false) {
+        "stack".into()
+    } else {
+        t
+    }
+}
 
 /// 名称转文件/目录安全的片段：保留 Unicode 字母数字（含中文）与 - _ .，
 /// 其余替换为 '-'；控制为可控长度。中文服务器/实例名是常态，不能折叠为空。
@@ -446,11 +519,28 @@ fn build_server(
                 .unwrap_or_else(|| "/data".into());
             let data_user = tpl.and_then(|t| t.data_user.clone());
             let command = tpl.map(|t| t.command.clone()).unwrap_or_default();
-            let health_cmd: Option<Vec<String>> = tpl
+            let health_cmd: Option<String> = tpl
                 .and_then(|t| t.health_check.as_ref())
                 .and_then(|h| {
                     if h.r#type == "exec" && !h.cmd.is_empty() {
-                        Some(h.cmd.clone())
+                        // 逐元素 shell 单引号化：含空格/||/()/$ 的元素（如 sh -c "curl a || wget b"）
+                        // 裸拼接会被 deploy.sh 的 bash 解释成自己的运算符，体检必坏
+                        Some(
+                            h.cmd
+                                .iter()
+                                .map(|c| shell_quote(c))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        )
+                    } else {
+                        None
+                    }
+                });
+            let health_tcp: Option<u32> = tpl
+                .and_then(|t| t.health_check.as_ref())
+                .and_then(|h| {
+                    if h.r#type == "tcp" {
+                        inst.ports.iter().find(|p| p.expose).map(|p| p.container)
                     } else {
                         None
                     }
@@ -468,6 +558,7 @@ fn build_server(
                 "data_user": data_user,
                 "command": command,
                 "health_cmd": health_cmd,
+                "health_tcp": health_tcp,
                 "health_timeout": health_timeout,
                 "ports_csv": ports_csv,
                 "backup_hint": backup_hint(&inst.template_id, &server.deploy_base_dir),
@@ -582,7 +673,7 @@ fn build_server(
         "local_ports": local_ports,
         "uname_arch": uname_of(&server.arch),
         "dir_name": dir_name,
-        "stack_name": sanitize(&project.name),
+        "stack_name": compose_name(&project.name),
         "mem_need_gb": std::cmp::max(mem_need_gb, 1),
         "disk_need_mb": 15360u32, // M0 预估：系统 10G + 镜像余量
         "kernel_reqs": kernel_reqs,
@@ -642,6 +733,28 @@ fn build_server(
         );
         let dst = sdir.join("images").join(&file_name);
         copy_file_with_progress(app, &src, &dst, &inst.instance_name)?;
+        // 本地导入的 tar 校验 RepoTags 与实例引用一致：不一致时现场 docker load 后
+        // compose 按引用找不到镜像（离线无法拉取），提前在构建期暴露
+        if !inst.local_image_tar.trim().is_empty() {
+            match read_tar_repo_tags(&dst) {
+                Ok(tags) if !tags.is_empty() => {
+                    if !tags.iter().any(|t| t == &inst.image) {
+                        warnings.push(format!(
+                            "「{}」本地 tar 的镜像标签 {:?} 与实例引用 {} 不一致：现场 docker load 后 compose 将找不到该镜像，请确认 tar 来源",
+                            inst.instance_name, tags, inst.image
+                        ));
+                    }
+                }
+                Ok(_) => warnings.push(format!(
+                    "「{}」本地 tar 内未解析到 RepoTags，无法校验与引用 {} 的一致性",
+                    inst.instance_name, inst.image
+                )),
+                Err(e) => warnings.push(format!(
+                    "「{}」本地 tar 读取失败（{}）：可能不是 docker save 格式",
+                    inst.instance_name, e
+                )),
+            }
+        }
         let sha = sha256_file(&dst).ok();
         let size = dst.metadata().map(|m| m.len()).unwrap_or(0);
         images_info.push(BuildImageInfo {
@@ -649,6 +762,7 @@ fn build_server(
             file: format!("images/{file_name}"),
             sha256: sha,
             size_bytes: size,
+            digest: image_digest(app, inst, &src),
         });
     }
 
@@ -672,6 +786,13 @@ fn build_server(
     ];
     for (tpl, path) in writes {
         let content = render(env, tpl, &ctx)?;
+        // compose 渲染产物做 YAML 语法校验：非法 YAML 在现场 compose config 才暴露
+        // 就太晚（离线环境排障困难），构建期必须拦截
+        if path.to_string_lossy().ends_with("docker-compose.yml") {
+            serde_yaml::from_str::<serde_yaml::Value>(&content).map_err(|e| {
+                AppError::Serialize(format!("生成的 docker-compose.yml 语法非法: {e}"))
+            })?;
+        }
         let mut f = File::create(&path)?;
         f.write_all(content.as_bytes())?;
     }
@@ -684,6 +805,17 @@ fn build_server(
             server.name, server.docker_version, server.os_family
         ));
     } else {
+        let is_static = pkg_dirs
+            .iter()
+            .any(|d| d.file_name().map(|n| n.to_string_lossy().contains("-static-")).unwrap_or(false));
+        // rpm/deb 主包但缺依赖组（cli/containerd）：现场 localinstall 依赖解析会失败
+        let deps_found = pkg_dirs.iter().any(|d| d.file_name().map(|n| n.to_string_lossy().contains("-deps")).unwrap_or(false));
+        if !is_static && !deps_found && crate::docker_pkgs::os_pkg_class(&server.os_family) != "static" {
+            warnings.push(format!(
+                "「{}」的 Docker {} 包缺少依赖组（docker-ce-cli/containerd 等）：建议在安装包库一并导入，否则现场离线安装可能因依赖不全失败",
+                server.name, server.docker_version
+            ));
+        }
         let mut copied = 0u32;
         for pkg_dir in &pkg_dirs {
             let pkgs_src = pkg_dir.join("packages");

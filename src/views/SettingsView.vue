@@ -268,8 +268,9 @@ function removeMirror(index: number) {
         </div>
       </div>
       <div class="text-xs text-on-surface-variant/60 mt-4">
-        默认全部在软件所在目录的 data/ 下（便携式布局，整个目录拷走即迁移）；
-        软件若安装在系统保护目录（如 Program Files），请选择其他可写位置。
+        默认全部在软件所在目录的 data/ 下（便携式布局，整个目录拷走即迁移）；软件若安装在系统保护目录（如
+        Program Files），请选择其他可写位置。注意：更改路径只影响新数据写入，
+        <b>不会自动搬运</b>已有数据（请手动移动旧目录内容到新位置，镜像缓存可重新拉取）。
       </div>
     </section>
 
@@ -327,6 +328,7 @@ function removeMirror(index: number) {
             v-model="settings!.proxy!.port"
             :min="1"
             :max="65535"
+            :value-on-clear="7890"
             class="w-full"
             controls-position="right"
           />

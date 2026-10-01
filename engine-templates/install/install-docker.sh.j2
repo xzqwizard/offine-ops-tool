@@ -17,11 +17,14 @@ bad()  { echo -e "    \033[31m✗ $1\033[0m"; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || bad "需要 root 权限"
 
+# 已装 Docker：版本一致则跳过引擎安装（但继续处理 compose 插件）；
+# 版本不一致不覆盖，人工确认
+SKIP_ENGINE=0
 if command -v docker >/dev/null 2>&1; then
   CUR=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')
   if [ "$CUR" = "$TARGET_VER" ]; then
-    ok "Docker $CUR 已安装且与目标版本一致，跳过安装"
-    exit 0
+    ok "Docker $CUR 已安装且与目标版本一致，跳过引擎安装"
+    SKIP_ENGINE=1
   else
     step "已安装 Docker $CUR 与目标 $TARGET_VER 不一致"
     echo "    本脚本不覆盖已有安装；如需替换请人工确认后先卸载。"
@@ -29,24 +32,25 @@ if command -v docker >/dev/null 2>&1; then
   fi
 fi
 
-[ -d "$PKG_DIR" ] || bad "缺少离线材料目录 $PKG_DIR"
+if [ "$SKIP_ENGINE" -eq 0 ]; then
+  [ -d "$PKG_DIR" ] || bad "缺少离线材料目录 $PKG_DIR"
 
-# ---------- 按 OS 族选择安装方式 ----------
-OS_ID=$(. /etc/os-release 2>/dev/null && echo "${ID:-}" || echo "")
-step "安装 Docker（OS: ${OS_ID:-unknown}）"
+  # ---------- 按 OS 族选择安装方式 ----------
+  OS_ID=$(. /etc/os-release 2>/dev/null && echo "${ID:-}" || echo "")
+  step "安装 Docker（OS: ${OS_ID:-unknown}）"
 
-if ls "$PKG_DIR"/*.rpm >/dev/null 2>&1 && command -v yum >/dev/null 2>&1; then
-  yum localinstall -y --disablerepo=* "$PKG_DIR"/*.rpm
-elif ls "$PKG_DIR"/*.rpm >/dev/null 2>&1 && command -v dnf >/dev/null 2>&1; then
-  dnf localinstall -y --disablerepo=* "$PKG_DIR"/*.rpm
-elif ls "$PKG_DIR"/*.deb >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
-  dpkg -i "$PKG_DIR"/*.deb || apt-get install -f -y --no-download
-elif ls "$PKG_DIR"/docker-*.tgz >/dev/null 2>&1; then
-  # 官方静态二进制
-  TMP=$(mktemp -d)
-  tar -xzf "$PKG_DIR"/docker-*.tgz -C "$TMP"
-  cp -f "$TMP"/docker/* /usr/bin/
-  cat > /etc/systemd/system/docker.service <<'UNIT'
+  if ls "$PKG_DIR"/*.rpm >/dev/null 2>&1 && command -v yum >/dev/null 2>&1; then
+    yum localinstall -y --disablerepo=* "$PKG_DIR"/*.rpm
+  elif ls "$PKG_DIR"/*.rpm >/dev/null 2>&1 && command -v dnf >/dev/null 2>&1; then
+    dnf localinstall -y --disablerepo=* "$PKG_DIR"/*.rpm
+  elif ls "$PKG_DIR"/*.deb >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
+    dpkg -i "$PKG_DIR"/*.deb || apt-get install -f -y --no-download
+  elif ls "$PKG_DIR"/docker-*.tgz >/dev/null 2>&1; then
+    # 官方静态二进制
+    TMP=$(mktemp -d)
+    tar -xzf "$PKG_DIR"/docker-*.tgz -C "$TMP"
+    cp -f "$TMP"/docker/* /usr/bin/
+    cat > /etc/systemd/system/docker.service <<'UNIT'
 [Unit]
 Description=Docker Application Container Engine
 After=network.target
@@ -58,41 +62,45 @@ LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target
 UNIT
-  systemctl daemon-reload
-else
-  bad "packages/ 中无可识别的安装材料（rpm/deb/docker-*.tgz）"
-fi
+    systemctl daemon-reload
+  else
+    bad "packages/ 中无可识别的安装材料（rpm/deb/docker-*.tgz）"
+  fi
 
-# ---------- daemon.json ----------
-mkdir -p /etc/docker
-if [ ! -f /etc/docker/daemon.json ]; then
-  cat > /etc/docker/daemon.json <<JSON
+  # ---------- daemon.json ----------
+  mkdir -p /etc/docker
+  if [ ! -f /etc/docker/daemon.json ]; then
+    cat > /etc/docker/daemon.json <<JSON
 {
   "data-root": "{{ server.docker_data_root }}",
   "log-driver": "json-file",
   "log-opts": { "max-size": "100m", "max-file": "3" }
 }
 JSON
-  ok "已写入 /etc/docker/daemon.json（data-root={{ server.docker_data_root }}，日志轮转 100m×3）"
-else
-  echo "    /etc/docker/daemon.json 已存在，未改动（如需 data-root={{ server.docker_data_root }} 请人工确认）"
+    ok "已写入 /etc/docker/daemon.json（data-root={{ server.docker_data_root }}，日志轮转 100m×3）"
+  else
+    echo "    /etc/docker/daemon.json 已存在，未改动（如需 data-root={{ server.docker_data_root }} 请人工确认）"
+  fi
+  mkdir -p "{{ server.docker_data_root }}"
+
+  # ---------- 启动与自检 ----------
+  systemctl enable docker >/dev/null 2>&1 || true
+  systemctl restart docker
+  sleep 2
+  docker info >/dev/null 2>&1 || bad "docker info 异常，请 journalctl -u docker 排查"
+  ok "Docker 安装完成: $(docker --version)"
 fi
-mkdir -p "{{ server.docker_data_root }}"
 
-# ---------- 启动与自检 ----------
-systemctl enable docker >/dev/null 2>&1 || true
-systemctl restart docker
-sleep 2
-docker info >/dev/null 2>&1 || bad "docker info 异常，请 journalctl -u docker 排查"
-ok "Docker 安装完成: $(docker --version)"
-
-# ---------- compose 插件 ----------
-if [ -f "$PKG_DIR/docker-compose" ]; then
+# ---------- compose 插件（已装 Docker 场景同样需要） ----------
+if docker compose version >/dev/null 2>&1; then
+  ok "docker compose 插件已可用: $(docker compose version)"
+elif [ -f "$PKG_DIR/docker-compose" ]; then
   mkdir -p /usr/local/lib/docker/cli-plugins
   cp -f "$PKG_DIR/docker-compose" /usr/local/lib/docker/cli-plugins/docker-compose
   chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
   ok "docker compose 插件已安装: $(docker compose version)"
-elif ! docker compose version >/dev/null 2>&1; then
+else
   echo "    ! 未提供 docker-compose 插件二进制，且系统缺失 compose v2 —— deploy 将中止"
   echo "      请在工具端补充 compose 插件（按 {{ server.arch }}）后重新生成本包"
+  exit 3
 fi

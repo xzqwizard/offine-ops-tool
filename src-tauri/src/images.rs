@@ -436,10 +436,17 @@ pub fn pull_image_inner(
     let r = parse_reference(image)?;
     let start = Instant::now();
     let dir = final_path.parent().unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(
-        ".{}.downloading",
-        final_path.file_name().unwrap_or_default().to_string_lossy()
-    ));
+    // 唯一临时名：并发拉取同一镜像（手动 + 构建自动）不得共写同一临时文件，
+    // 否则交错写入产出损坏 tar 并毒化缓存
+    let unique = format!(
+        ".{}.{}.tmp",
+        final_path.file_name().unwrap_or_default().to_string_lossy(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tmp = dir.join(format!("{unique}.downloading"));
     let mut errors: Vec<String> = Vec::new();
     let mut ok_source = String::new();
 
@@ -470,13 +477,16 @@ pub fn pull_image_inner(
 
     // RepoTags 改写为用户原始引用，保证 docker load 后与 compose 一致
     emit(app, "rewrite", "规范化镜像标签（RepoTags）…");
-    let rewrite_tmp = dir.join(format!(
-        ".{}.rewriting",
-        final_path.file_name().unwrap_or_default().to_string_lossy()
-    ));
+    let rewrite_tmp = dir.join(format!("{unique}.rewriting"));
     rewrite_docker_archive(&tmp, &rewrite_tmp, image)?;
     let _ = fs::remove_file(&tmp);
-    fs::rename(&rewrite_tmp, final_path)?;
+    // rename 冲突防护：另一并发拉取已抢先落位时，以现有文件为准（同引用同平台内容一致）
+    match fs::rename(&rewrite_tmp, final_path) {
+        Ok(()) => {}
+        Err(_) => {
+            let _ = fs::remove_file(&rewrite_tmp);
+        }
+    }
 
     let digest = query_digest(app, &ok_source).unwrap_or_default();
     let size = final_path.metadata().map(|m| m.len()).unwrap_or(0);

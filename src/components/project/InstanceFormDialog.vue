@@ -126,11 +126,21 @@ async function checkImage() {
  * 匹配规则：忽略 variant 后缀——arm64 服务器可运行 linux/arm64 与 linux/arm64:v8；
  * 32 位 arm（linux/arm:v7）不与 arm64 混淆。 */
 const inspectRef = ref('')
-/** 单个平台条目是否匹配服务器架构（忽略 variant：arm64:v8 属于 arm64） */
+/** 单个平台条目是否匹配服务器架构。
+ * 忽略 variant（arm64:v8 属于 arm64）；处理 OCI 架构名别名：
+ * 镜像清单用 goarch（loong64），服务器侧用 loongarch64。 */
+const ARCH_ALIASES: Record<string, string[]> = {
+  loongarch64: ['loongarch64', 'loong64'],
+  arm64: ['arm64', 'aarch64'],
+  amd64: ['amd64', 'x86_64', '386']
+}
 function archMatches(a: string): boolean {
   if (!selectedServer.value) return false
-  const base = `linux/${selectedServer.value.arch}`
-  return a === base || a.startsWith(`${base}:`) || a.startsWith(`${base}/`)
+  const names = ARCH_ALIASES[selectedServer.value.arch] ?? [selectedServer.value.arch]
+  return names.some((n) => {
+    const base = `linux/${n}`
+    return a === base || a.startsWith(`${base}:`) || a.startsWith(`${base}/`)
+  })
 }
 const onlineArchOk = computed<boolean | null>(() => {
   if (!inspect.value || !selectedServer.value) return null
@@ -298,10 +308,10 @@ function handleSave() {
     serverId: formServerId.value,
     templateId: mode.value === 'custom' ? 'custom' : selectedTemplate.value!.id,
     image,
-    // 编辑保留原 digest；在线检查成功且镜像未变时更新为查询到的 digest
+    // 仅当在线检查针对的就是当前保存的引用时才采用其 digest，否则保留原值
     digest:
-      inspect.value && inspect.value.source && currentReference.value === image
-        ? inspect.value.digest || editingDigest.value
+      inspect.value && inspectRef.value === image && inspect.value.digest
+        ? inspect.value.digest
         : editingDigest.value,
     instanceName: instanceName.value.trim(),
     params: cleanParams,

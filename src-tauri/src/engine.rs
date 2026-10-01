@@ -111,7 +111,13 @@ fn engine_install_sync(app: &AppHandle, force: bool) -> AppResult<EngineStatus> 
         .ok_or_else(|| AppError::Io("checksums.txt 中未找到 Windows 资产条目".into()))?;
 
     emit(app, "download", &format!("下载 {asset_name}（约 15MB）…"));
-    let tmp = dir.join(format!(".{asset_name}.downloading"));
+    let tmp = dir.join(format!(
+        ".{asset_name}.{}.downloading",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     let mut curl_args: Vec<String> = vec!["-sSL".into(), "--max-time".into(), "300".into()];
     if let Some(p) = proxy_url(&settings) {
         curl_args.push("-x".into());

@@ -73,9 +73,14 @@ else
     exit 1
   fi
 fi
-if ! docker compose version >/dev/null 2>&1; then
-  fail "缺少 docker compose v2 插件，请安装后重试（包内 docker-offline/ 含材料时 install-docker.sh 会一并安装）"
-  exit 1
+# dry-run 下目标机可能尚未安装 Docker/compose，版本检查只做提示不阻断
+if [ "$DRY_RUN" -eq 1 ]; then
+  docker compose version >/dev/null 2>&1 || info "[dry-run] 注意：本机暂未安装 docker compose（正式部署时将由离线材料安装）"
+else
+  if ! docker compose version >/dev/null 2>&1; then
+    fail "缺少 docker compose v2 插件，请安装后重试（包内 docker-offline/ 含材料时 install-docker.sh 会一并安装）"
+    exit 1
+  fi
 fi
 
 # ---------- 3. 装载镜像 ----------
@@ -96,6 +101,14 @@ fi
 step "4/6 启动服务编排"
 cd "$BASE_DIR"
 run docker compose -f "$COMPOSE_FILE" config --quiet
+# 非 root 镜像的数据目录预创建并授权（否则 compose 以 root 建目录后
+# 容器内 uid 无写权限，启动即 Permission denied 崩溃循环）
+{% for inst in instances %}
+{% if inst.data_user %}
+run mkdir -p "$STACK_DIR/data/{{ inst.instance_name }}"
+run chown "{{ inst.data_user }}" "$STACK_DIR/data/{{ inst.instance_name }}"
+{% endif %}
+{% endfor %}
 info "compose 配置校验通过，启动..."
 run docker compose -f "$COMPOSE_FILE" up -d
 
@@ -112,7 +125,11 @@ while [ $TRY -lt $MAX ]; do
   STATE=$(docker inspect -f '{{'{{'}}.State.Running{{'}}'}}' "{{ inst.instance_name }}" 2>/dev/null || echo false)
   if [ "$STATE" = "true" ]; then
 {% if inst.health_cmd %}
-    if docker exec "{{ inst.instance_name }}" {{ inst.health_cmd | join(' ') }} >/dev/null 2>&1; then
+    if docker exec "{{ inst.instance_name }}" {{ inst.health_cmd }} >/dev/null 2>&1; then
+      READY=1; break
+    fi
+{% elif inst.health_tcp %}
+    if timeout 3 bash -c "</dev/tcp/127.0.0.1/{{ inst.health_tcp }}" 2>/dev/null; then
       READY=1; break
     fi
 {% else %}
@@ -137,7 +154,7 @@ step "6/6 部署报告"
   echo "时间: $(date '+%F %T')"
   echo "构建: {{ build_id }}"
   echo
-  docker compose -f "$COMPOSE_FILE" ps
+  docker compose -f "$COMPOSE_FILE" ps 2>/dev/null || true
 } | tee "$LOG_DIR/deploy-report.txt"
 
 echo

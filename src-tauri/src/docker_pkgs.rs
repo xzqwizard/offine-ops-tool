@@ -65,7 +65,9 @@ fn pkg_root(app: &AppHandle) -> AppResult<PathBuf> {
 /// （与主包版本无关），构建时与命中主包合并拷贝
 pub fn parse_pkg_filename(name: &str) -> Option<(String, String, String, bool)> {
     let lower = name.to_lowercase();
-    if lower.starts_with("docker-compose") {
+    // 注意顺序：docker-compose-plugin-*.rpm 是包管理器插件包（aux），
+    // 必须先走 rpm/deb 分支；独立二进制 compose 形如 docker-compose-linux-x86_64（无扩展名）
+    if lower.starts_with("docker-compose") && !lower.ends_with(".rpm") && !lower.ends_with(".deb") {
         let arch = if lower.contains("x86_64") || lower.contains("amd64") {
             "amd64"
         } else if lower.contains("aarch64") || lower.contains("arm64") {
@@ -343,7 +345,13 @@ fn download_docker_static_sync(app: &AppHandle, arch: &str, version: &str) -> Ap
     };
     let url = format!("https://download.docker.com/linux/static/stable/{dir}/docker-{version}.tgz");
     emit(app, "download", &format!("下载 {url}"));
-    let tmp = std::env::temp_dir().join(format!("docker-{arch}-{version}.tgz.downloading"));
+    let tmp = std::env::temp_dir().join(format!(
+        "docker-{arch}-{version}-{}.tgz.downloading",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     let mut curl_args: Vec<String> = vec!["-sSL".into(), "--max-time".into(), "600".into()];
     if let Some(p) = proxy_url(&settings) {
         curl_args.push("-x".into());
@@ -426,7 +434,13 @@ fn download_compose_plugin_sync(app: &AppHandle, arch: &str) -> AppResult<Compos
     let root = pkg_root(app)?;
     let dst_dir = root.join("compose").join(arch);
     fs::create_dir_all(&dst_dir)?;
-    let tmp = dst_dir.join(".downloading");
+    let tmp = dst_dir.join(format!(
+        ".{}.downloading",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     let mut curl_args: Vec<String> = vec!["-sSL".into(), "--max-time".into(), "300".into()];
     if let Some(p) = proxy_url(&settings) {
         curl_args.push("-x".into());
@@ -529,6 +543,12 @@ pub fn pick_pkg_dirs(app: &AppHandle, arch: &str, docker_version: &str, os_famil
         }
     }
     out
+}
+
+/// 是否存在指定架构+包系的依赖组（cli/containerd 等）
+pub fn has_deps(app: &AppHandle, arch: &str, kind: &str) -> bool {
+    let Ok(root) = pkg_root(app) else { return false };
+    root.join(format!("pkg-{arch}-{kind}-deps")).join("packages").is_dir()
 }
 
 /// compose 插件路径（按 arch）

@@ -55,11 +55,44 @@ const recompress = computed({
 /** 构建时自动拉取缺失镜像（缓存未命中时在线拉取，本次构建内存态，不入方案） */
 const autoPull = ref(true)
 
+/** R10 预检：每台服务器需有匹配 (arch, dockerVersion) 的安装包组（rpm/deb/static 任一）
+ *  且对应架构 compose 插件；否则产物到现场装不了 Docker（设计文档定为阻断级） */
+async function checkDockerPkgs(): Promise<string[]> {
+  const project = store.project!
+  const problems: string[] = []
+  let pkgs: { id: string }[] = []
+  let compose: { arch: string; installed: boolean }[] = []
+  try {
+    ;[pkgs, compose] = await Promise.all([backend.listDockerPkgs(), backend.listComposePlugins()])
+  } catch {
+    return [] // 库读取失败不阻断（后端构建时仍会告警）
+  }
+  for (const s of project.servers) {
+    const matched = pkgs.some((p) =>
+      p.id === `pkg-${s.arch}-rpm-${s.dockerVersion}` ||
+      p.id === `pkg-${s.arch}-deb-${s.dockerVersion}` ||
+      p.id === `pkg-${s.arch}-static-${s.dockerVersion}`
+    )
+    if (!matched) {
+      problems.push(`服务器「${s.name}」(Docker ${s.dockerVersion}/${s.arch}) 无匹配离线安装包`)
+    }
+    if (!compose.some((c) => c.arch === s.arch && c.installed)) {
+      problems.push(`服务器「${s.name}」缺 ${s.arch} 架构 docker compose 插件`)
+    }
+  }
+  return problems
+}
+
 async function handleBuild() {
   if (!store.project) return
   const issues: ValidationIssue[] = validateProject(store.project, templates.value)
   if (hasBlockingErrors(issues)) {
     ElMessage.error(`存在 ${issues.filter((i) => i.level === 'error').length} 个校验错误，请先在「校验」页签处理`)
+    return
+  }
+  const pkgProblems = await checkDockerPkgs()
+  if (pkgProblems.length) {
+    ElMessage.error(`Docker 离线材料不全，已阻止构建：${pkgProblems.join('；')}。请到「Docker 安装包库」导入/下载`)
     return
   }
   if (store.dirty) {

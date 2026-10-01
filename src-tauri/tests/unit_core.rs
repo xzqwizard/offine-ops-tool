@@ -30,11 +30,26 @@ fn sample_ctx() -> serde_json::Value {
             "data_volume": "/var/lib/mysql",
             "data_user": null,
             "command": [],
-            "health_cmd": ["mysqladmin", "ping"],
+            "health_cmd": "'sh' '-c' 'curl -s -o /dev/null http://127.0.0.1/'",
+            "health_tcp": null,
             "health_timeout": 90,
             "ports_csv": "3306→3306",
-            "backup_hint": "mysqldump ...",
+            "backup_hint": "mysyqldump ...",
             "min_memory_gb": 1.0
+        },
+        {
+            "instance_name": "redis", "image": "docker.io/library/redis:7.2.5",
+            "env": [ { "k": "REDIS_PASSWORD", "v": "p''a$$x" } ],
+            "ports": [{ "host": 6379, "container": 6379, "protocol": "tcp", "expose": true }],
+            "data_volume": "/data",
+            "data_user": null,
+            "command": ["sh", "-c", "redis-server --requirepass \"$$REDIS_PASSWORD\""],
+            "health_cmd": null,
+            "health_tcp": 6379,
+            "health_timeout": 60,
+            "ports_csv": "6379→6379",
+            "backup_hint": "",
+            "min_memory_gb": 0.5
         }],
         "images": [{ "file": "images/mysql_8.0.42.tar", "reference": "docker.io/library/mysql:8.0.42" }],
         "services_csv": "mysql",
@@ -68,17 +83,50 @@ fn compose_contains_service_and_env() {
     assert!(out.contains("mysql:"));
     // 镜像引用带引号（防 YAML 特殊字符）
     assert!(out.contains("image: \"docker.io/library/mysql:8.0.42\""));
-    // env 值用单引号包裹（$ 与 " 不会破坏 compose）
+    // env 值用单引号包裹（$ 与 " 不会破坏 compose），值内 ' 转义为 ''
     assert!(out.contains("MYSQL_ROOT_PASSWORD: 'p@ss'"));
+    assert!(out.contains("REDIS_PASSWORD: 'p''a$$x'"));
     // 仅 expose=true 的端口进入 ports；33060 不应出现
     assert!(out.contains("\"3306:3306\""));
     assert!(!out.contains("33060"));
-    // 健康超时透传
+    // command 元素单引号包裹：含双引号的 redis requirepass 命令是合法 YAML
+    assert!(out.contains("command: ['sh', '-c', 'redis-server --requirepass \"$$REDIS_PASSWORD\"']"));
+    // 整体必须是合法 YAML（现场 compose config 前拦截）
+    serde_yaml::from_str::<serde_yaml::Value>(&out).expect("compose 渲染结果非法 YAML");
+}
+
+#[test]
+fn deploy_health_check_references_and_tcp() {
+    let env = template_env().unwrap();
     let deploy = render(&env, "scripts/deploy.sh.j2", &sample_ctx()).unwrap();
+    // 健康超时透传
     assert!(deploy.contains("MAX=90"));
     // 镜像路径不得双重拼接（img.file 已含 images/ 前缀）
     assert!(deploy.contains("$BASE_DIR/images/mysql_8.0.42.tar"));
     assert!(!deploy.contains("images/images/"));
+    // exec 型体检逐元素引用（builder 已 shell_quote）
+    assert!(deploy.contains("docker exec \"mysql\" 'sh' '-c'"));
+    // tcp 型体检（redis）走 /dev/tcp 探测
+    assert!(deploy.contains("</dev/tcp/127.0.0.1/6379"));
+    // 生成的脚本本身必须是合法 bash
+    let dir = std::env::temp_dir().join(format!("opost-deploychk-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("deploy.sh");
+    std::fs::write(&f, deploy.replace("\r\n", "\n")).unwrap();
+    // 探测 Git Bash（PATH 上的 bash 可能是 WSL，无法访问 C:/ 路径）；不可用则跳过语法检查
+    let candidates = [
+        "C:/Program Files/Git/usr/bin/bash.exe",
+        "C:/Program Files (x86)/Git/usr/bin/bash.exe",
+        "D:/Environment/Git/usr/bin/bash.exe",
+        "D:/Software/Git/usr/bin/bash.exe",
+    ];
+    let bash = candidates.iter().find(|p| std::path::Path::new(p).is_file());
+    if let Some(bash) = bash {
+        let bash_path = f.to_string_lossy().replace('\\', "/");
+        let out = std::process::Command::new(bash).args(["-n", &bash_path]).output().unwrap();
+        assert!(out.status.success(), "deploy.sh 语法错误: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

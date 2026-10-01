@@ -28,6 +28,7 @@ hex = "0.4"
 tar = "0.4"
 flate2 = "1"
 rust_xlsxwriter = "0.99.1"
+serde_yaml = "0.9.34"
 
 [profile.release]
 panic = "abort"
