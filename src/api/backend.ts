@@ -43,6 +43,10 @@ export const backend = {
     return invoke<Project>('load_project', { id })
   },
 
+  async cloneProject(id: string, newName: string): Promise<Project> {
+    return invoke<Project>('clone_project', { id, newName })
+  },
+
   async deleteProject(id: string): Promise<void> {
     return invoke<void>('delete_project', { id })
   },

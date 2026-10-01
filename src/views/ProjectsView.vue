@@ -3,13 +3,27 @@ import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
-import { toAppError } from '@/api/backend'
+import { backend, toAppError } from '@/api/backend'
+import { ARCH_TEMPLATES, buildProjectFromTemplate, type ArchTemplate } from '@/utils/archTemplates'
+import type { MiddlewareTemplate } from '@/types/catalog'
 
 const router = useRouter()
 const store = useProjectStore()
 const loading = ref(false)
 const createOpen = ref(false)
 const form = ref({ name: '', customer: '' })
+
+// 复制方案
+const cloneOpen = ref(false)
+const cloneTarget = ref<{ id: string; name: string } | null>(null)
+const cloneName = ref('')
+
+// 从模板创建
+const tplOpen = ref(false)
+const tplSelected = ref<ArchTemplate | null>(null)
+const tplName = ref('')
+const tplCustomer = ref('')
+const catalogCache: MiddlewareTemplate[] = []
 
 onMounted(async () => {
   loading.value = true
@@ -35,6 +49,65 @@ async function handleCreate() {
     router.push({ name: 'project-edit', params: { id: p.id } })
   } catch (e) {
     ElMessage.error(`创建失败: ${toAppError(e).message}`)
+  }
+}
+
+function openClone(id: string, name: string) {
+  cloneTarget.value = { id, name }
+  cloneName.value = `${name}（副本）`
+  cloneOpen.value = true
+}
+
+async function handleClone() {
+  if (!cloneTarget.value || !cloneName.value.trim()) {
+    ElMessage.warning('请输入新方案名称')
+    return
+  }
+  try {
+    const p = await backend.cloneProject(cloneTarget.value.id, cloneName.value)
+    cloneOpen.value = false
+    ElMessage.success(`已复制为「${p.name}」（服务器 IP 已清空待填）`)
+    await store.refreshSummaries()
+    router.push({ name: 'project-edit', params: { id: p.id } })
+  } catch (e) {
+    ElMessage.error(`复制失败: ${toAppError(e).message}`)
+  }
+}
+
+function openTpl() {
+  tplSelected.value = null
+  tplName.value = ''
+  tplCustomer.value = ''
+  tplOpen.value = true
+}
+
+async function handleTplCreate() {
+  if (!tplSelected.value) {
+    ElMessage.warning('请选择架构模板')
+    return
+  }
+  if (!tplName.value.trim()) {
+    ElMessage.warning('请输入方案名称')
+    return
+  }
+  try {
+    let catalog = catalogCache
+    if (!catalog.length) {
+      catalog = (await backend.listCatalog()).templates
+      catalogCache.push(...catalog)
+    }
+    const p = await store.create(tplName.value, tplCustomer.value)
+    // 叠放模板内容后整体保存（create 只落了空方案）
+    p.customer = tplCustomer.value
+    buildProjectFromTemplate(p, tplSelected.value, catalog)
+    const saved = await backend.saveProject(p)
+    store.project = saved
+    await store.refreshSummaries()
+    tplOpen.value = false
+    ElMessage.success(`方案「${saved.name}」已按模板生成（补填服务器 IP 后即可校验构建）`)
+    router.push({ name: 'project-edit', params: { id: saved.id } })
+  } catch (e) {
+    ElMessage.error(`模板创建失败: ${toAppError(e).message}`)
   }
 }
 
@@ -112,9 +185,10 @@ function fmtTime(iso: string) {
             <span class="font-mono text-xs text-on-surface-variant">{{ fmtTime(row.updatedAt) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="120" align="center">
+        <el-table-column label="操作" width="170" align="center">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="openProject(row.id)">打开</el-button>
+            <el-button link type="primary" size="small" @click="openClone(row.id, row.name)">复制</el-button>
             <el-button link type="danger" size="small" @click="handleDelete(row.id, row.name)">
               删除
             </el-button>
@@ -133,8 +207,48 @@ function fmtTime(iso: string) {
         </el-form-item>
       </el-form>
       <template #footer>
+        <el-button @click="tplOpen = true">从模板创建…</el-button>
         <el-button @click="createOpen = false">取消</el-button>
         <el-button type="primary" @click="handleCreate">创建</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 复制方案 -->
+    <el-dialog v-model="cloneOpen" title="复制方案" width="460">
+      <p class="text-sm text-on-surface-variant mb-4">
+        复制「{{ cloneTarget?.name }}」的全部服务器、中间件与端口规则；服务器 IP 清空待填。
+      </p>
+      <el-input v-model="cloneName" placeholder="新方案名称" maxlength="60" />
+      <template #footer>
+        <el-button @click="cloneOpen = false">取消</el-button>
+        <el-button type="primary" @click="handleClone">复制并打开</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 从架构模板创建 -->
+    <el-dialog v-model="tplOpen" title="从架构模板创建方案" width="560">
+      <div class="flex flex-col gap-2 mb-4">
+        <button
+          v-for="t in ARCH_TEMPLATES"
+          :key="t.id"
+          class="text-left px-4 py-3 rounded-lg border transition-colors"
+          :class="tplSelected?.id === t.id ? 'border-primary bg-surface-container-high' : 'border-outline-variant bg-surface-container-low hover:border-primary/50'"
+          @click="tplSelected = t"
+        >
+          <div class="text-sm font-medium">{{ t.name }}</div>
+          <div class="text-xs text-on-surface-variant mt-0.5">{{ t.desc }}</div>
+        </button>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <el-input v-model="tplName" placeholder="方案名称（必填）" maxlength="60" />
+        <el-input v-model="tplCustomer" placeholder="客户/项目（选填）" maxlength="60" />
+      </div>
+      <div class="text-[10px] text-on-surface-variant/50 mt-2">
+        将自动生成服务器与中间件实例骨架（密码自动生成，IP 留空待填），打开后核对参数即可校验构建
+      </div>
+      <template #footer>
+        <el-button @click="tplOpen = false">取消</el-button>
+        <el-button type="primary" :disabled="!tplSelected" @click="handleTplCreate">生成并打开</el-button>
       </template>
     </el-dialog>
   </div>

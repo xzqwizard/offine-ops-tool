@@ -20,6 +20,7 @@ pub fn run() {
             commands::create_project,
             commands::save_project,
             commands::load_project,
+            commands::clone_project,
             commands::delete_project,
             commands::get_settings,
             commands::save_settings,
