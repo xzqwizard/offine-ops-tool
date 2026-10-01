@@ -1,4 +1,5 @@
 pub mod builder;
+pub mod build_history;
 pub mod catalog;
 mod commands;
 pub mod docker_pkgs;
@@ -43,6 +44,9 @@ pub fn run() {
             docker_pkgs::download_docker_static,
             docker_pkgs::download_compose_plugin,
             xlsx_export::export_port_matrix_xlsx,
+            build_history::list_build_history,
+            build_history::delete_build,
+            build_history::open_dir_in_explorer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# ============================================================
+# 离线升级脚本 - 由离线部署运维工具生成（勿手改）
+# 方案: {{ project_name }} | 服务器: {{ server.name }} ({{ server.arch }})
+# 基线: {{ baseline_build_id }} → 本次: {{ build_id }}
+# 用法: bash upgrade.sh [--dry-run]
+# 内容: 装载变更镜像 → 备份当前 compose → 应用新编排（仅重建镜像变更的服务）
+#       → 健康检查 → 失败提示回退
+# ============================================================
+set -euo pipefail
+
+DRY_RUN=0
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+
+BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+IMAGES_DIR="$BASE_DIR/images"
+STACK_DIR="$BASE_DIR/stack"
+COMPOSE_FILE="$STACK_DIR/docker-compose.yml"
+BACKUP_COMPOSE="$STACK_DIR/docker-compose.yml.prev-{{ build_id }}"
+LOG_DIR="$BASE_DIR/logs"
+mkdir -p "$LOG_DIR"
+
+run() {
+  if [ "$DRY_RUN" -eq 1 ]; then echo "    [dry-run] $*"; else "$@"; fi
+}
+
+step()  { echo -e "\n\033[1;36m==> $1\033[0m"; }
+info()  { echo "    $1"; }
+ok()    { echo -e "    \033[32m✓ $1\033[0m"; }
+warn()  { echo -e "    \033[33m! $1\033[0m"; }
+fail()  { echo -e "    \033[31m✗ $1\033[0m"; }
+
+exec > >(tee -a "$LOG_DIR/upgrade-$(date '+%Y%m%d-%H%M%S').log") 2>&1
+
+echo "============================================================"
+echo " 离线升级 · {{ project_name }} / {{ server.name }}"
+echo " 基线 {{ baseline_build_id }} → {{ build_id }}"
+echo "============================================================"
+
+if ! docker compose version >/dev/null 2>&1; then
+  fail "缺少 docker compose v2 插件，无法升级"
+  exit 1
+fi
+
+# ---------- 1. 装载变更镜像 ----------
+step "1/4 装载变更镜像（{{ images | length }} 个）"
+{% if images | length == 0 %}
+info "本次无镜像变更（仅配置变更）"
+{% endif %}
+{% for img in images %}
+if [ -f "$BASE_DIR/{{ img.file }}" ]; then
+  info "docker load: {{ img.file }}（{{ img.reference }}）"
+  run docker load -i "$BASE_DIR/{{ img.file }}"
+else
+  warn "缺少镜像文件 {{ img.file }}，对应服务可能无法升级"
+fi
+{% endfor %}
+
+# ---------- 2. 备份当前编排 ----------
+step "2/4 备份当前编排"
+if [ -f "$COMPOSE_FILE" ]; then
+  run cp "$COMPOSE_FILE" "$BACKUP_COMPOSE"
+  ok "已备份为 $(basename "$BACKUP_COMPOSE")"
+else
+  warn "未找到当前编排文件（$COMPOSE_FILE）——请确认在原部署目录执行升级"
+  exit 1
+fi
+
+# ---------- 3. 应用新编排并重建 ----------
+step "3/4 应用新编排（仅镜像变更的服务会被重建）"
+cd "$BASE_DIR"
+run docker compose -f "$COMPOSE_FILE" config --quiet
+run docker compose -f "$COMPOSE_FILE" up -d
+
+# ---------- 4. 健康检查 ----------
+step "4/4 健康检查"
+HEALTH_FAIL=0
+{% for inst in instances %}
+printf "    %-20s " "{{ inst.instance_name }}"
+TRY=0; MAX={{ inst.health_timeout | default(60) }}; READY=0
+while [ $TRY -lt $MAX ]; do
+  STATE=$(docker inspect -f '{{'{{'}}.State.Running{{'}}'}}' "{{ inst.instance_name }}" 2>/dev/null || echo false)
+  if [ "$STATE" = "true" ]; then
+{% if inst.health_cmd %}
+    if docker exec "{{ inst.instance_name }}" {{ inst.health_cmd }} >/dev/null 2>&1; then
+      READY=1; break
+    fi
+{% elif inst.health_tcp %}
+    if timeout 3 bash -c "</dev/tcp/127.0.0.1/{{ inst.health_tcp }}" 2>/dev/null; then
+      READY=1; break
+    fi
+{% else %}
+    READY=1; break
+{% endif %}
+  fi
+  printf "."; TRY=$((TRY+3)); sleep 3
+done
+if [ $READY -eq 1 ]; then
+  echo -e " \033[32m✓ 运行中/健康\033[0m"
+else
+  echo -e " \033[31m✗ 超时未就绪\033[0m"; HEALTH_FAIL=$((HEALTH_FAIL+1))
+  docker logs --tail 50 "{{ inst.instance_name }}" 2>/dev/null | sed 's/^/        /' || true
+fi
+{% endfor %}
+
+echo
+echo "------------------------------------------------------------"
+if [ "$HEALTH_FAIL" -gt 0 ]; then
+  warn "有 $HEALTH_FAIL 个服务未通过健康检查，可执行回退："
+  warn "  cp '$BACKUP_COMPOSE' '$COMPOSE_FILE' && docker compose -f '$COMPOSE_FILE' up -d"
+  exit 3
+else
+  ok "升级完成：{{ baseline_build_id }} → {{ build_id }}"
+  ok "旧编排已备份（$(basename "$BACKUP_COMPOSE")），确认稳定后可删除"
+fi
+echo "------------------------------------------------------------"

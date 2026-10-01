@@ -10,6 +10,7 @@ import type {
 } from '@/types/project'
 import type { CatalogFile } from '@/types/catalog'
 import type { BuildResult } from '@/types/build'
+import type { BuildHistoryEntry } from '@/types/buildHistory'
 import type {
   CachedImage,
   EngineStatus,
@@ -65,10 +66,6 @@ export const backend = {
 
   async listCatalog(): Promise<CatalogFile> {
     return invoke<CatalogFile>('list_catalog')
-  },
-
-  async buildOfflinePackage(project: Project, autoPull: boolean): Promise<BuildResult> {
-    return invoke<BuildResult>('build_offline_package', { project, autoPull })
   },
 
   async listDockerVersions(arch: string): Promise<string[]> {
@@ -134,6 +131,31 @@ export const backend = {
 
   async exportPortMatrixXlsx(project: Project, outputPath: string): Promise<string> {
     return invoke<string>('export_port_matrix_xlsx', { project, outputPath })
+  },
+
+  async listBuildHistory(): Promise<BuildHistoryEntry[]> {
+    return invoke<BuildHistoryEntry[]>('list_build_history')
+  },
+
+  async deleteBuild(dir: string): Promise<void> {
+    return invoke<void>('delete_build', { dir })
+  },
+
+  async openDirInExplorer(dir: string): Promise<void> {
+    return invoke<void>('open_dir_in_explorer', { dir })
+  },
+
+  /** baselineBuildId 传空/null = 完整包；传基线构建号 = 增量升级包 */
+  async buildOfflinePackage(
+    project: Project,
+    autoPull: boolean,
+    baselineBuildId?: string | null
+  ): Promise<BuildResult> {
+    return invoke<BuildResult>('build_offline_package', {
+      project,
+      autoPull,
+      baselineBuildId: baselineBuildId ?? null
+    })
   }
 }
 

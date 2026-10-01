@@ -358,10 +358,14 @@ pub async fn build_offline_package(
     app: AppHandle,
     project: Project,
     auto_pull: Option<bool>,
+    baseline_build_id: Option<String>,
 ) -> AppResult<BuildResult> {
     tauri::async_runtime::spawn_blocking(move || {
         let auto_pull = auto_pull.unwrap_or(true);
-        let r = build(&app, &project, auto_pull);
+        let r = match &baseline_build_id {
+            Some(b) if !b.is_empty() => build_upgrade(&app, &project, auto_pull, b),
+            _ => build(&app, &project, auto_pull),
+        };
         match &r {
             Ok(res) => emit(&app, "done", &format!("构建完成: {}", res.build_id)),
             Err(e) => emit(&app, "error", &e.to_string()),
@@ -377,6 +381,66 @@ fn emit(app: &AppHandle, step: &str, detail: &str) {
 }
 
 fn build(app: &AppHandle, project: &Project, auto_pull: bool) -> AppResult<BuildResult> {
+    build_inner(app, project, auto_pull, None)
+}
+
+/// 增量升级包：以 baseline 构建的 manifest 为基线，
+/// 仅打包"新增/版本变更"的镜像与新编排，附 upgrade.sh（带回退）
+fn build_upgrade(
+    app: &AppHandle,
+    project: &Project,
+    auto_pull: bool,
+    baseline_build_id: &str,
+) -> AppResult<BuildResult> {
+    let baseline = crate::build_history::read_baseline(app, baseline_build_id, &project.name)?;
+    // 校验基线归属同一方案
+    let b_project = baseline["projectId"].as_str().unwrap_or_default();
+    if b_project != project.id {
+        return Err(AppError::Invalid(
+            "基线构建不属于当前方案，无法对比生成升级包".into(),
+        ));
+    }
+    emit(
+        app,
+        "baseline",
+        &format!("以构建 {baseline_build_id} 为基线生成升级包"),
+    );
+    build_inner(app, project, auto_pull, Some((&baseline, baseline_build_id)))
+}
+
+/// 基线镜像集合：每服务器一个 HashSet<"image@digest-or-tag">
+fn baseline_image_set(
+    baseline: &serde_json::Value,
+    server_name: &str,
+) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    if let Some(servers) = baseline["servers"].as_array() {
+        for s in servers {
+            if s["name"].as_str() != Some(server_name) {
+                continue;
+            }
+            if let Some(imgs) = s["images"].as_array() {
+                for i in imgs {
+                    let reference = i["reference"].as_str().unwrap_or_default();
+                    let digest = i["digest"].as_str().unwrap_or_default();
+                    set.insert(if digest.is_empty() {
+                        reference.to_string()
+                    } else {
+                        format!("{reference}@{digest}")
+                    });
+                }
+            }
+        }
+    }
+    set
+}
+
+fn build_inner(
+    app: &AppHandle,
+    project: &Project,
+    auto_pull: bool,
+    upgrade: Option<(&serde_json::Value, &str)>,
+) -> AppResult<BuildResult> {
     let now = store::now_rfc3339();
     let build_id = format!("b-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
     let catalog = catalog::preset()?;
@@ -407,7 +471,26 @@ fn build(app: &AppHandle, project: &Project, auto_pull: bool) -> AppResult<Build
 
     for server in &project.servers {
         emit(app, "server", &format!("处理服务器: {} ({})", server.name, server.arch));
-        let sr = build_server(app, project, server, &catalog, &env, &out_root, &build_id, &now, auto_pull)?;
+        let baseline_set = upgrade
+            .map(|(b, _)| baseline_image_set(b, &server.name))
+            .unwrap_or_default();
+        let sr = build_server(
+            app,
+            project,
+            server,
+            &catalog,
+            &env,
+            &out_root,
+            &build_id,
+            &now,
+            auto_pull,
+            if upgrade.is_some() {
+                Some(&baseline_set)
+            } else {
+                None
+            },
+            upgrade.map(|(_, id)| id),
+        )?;
         result.warnings.extend(sr.warnings.clone());
         result.servers.push(sr);
     }
@@ -459,6 +542,27 @@ fn build(app: &AppHandle, project: &Project, auto_pull: bool) -> AppResult<Build
     }
     fs::write(out_root.join("build-report.md"), &report)?;
 
+    // ---- 构建索引（机器可读：升级包对比基线 / 构建历史列表） ----
+    let index = json!({
+        "buildId": result.build_id,
+        "projectId": project.id,
+        "projectName": project.name,
+        "generatedAt": result.generated_at,
+        "kind": if upgrade.is_some() { "upgrade" } else { "full" },
+        "baselineBuildId": upgrade.map(|(_, id)| id),
+        "servers": result.servers.iter().map(|s| json!({
+            "name": s.name, "arch": s.arch, "dirName": s.dir_name,
+            "packageFile": s.package_file, "sizeBytes": s.size_bytes,
+            "images": s.images.iter().map(|i| json!({
+                "reference": i.reference, "digest": i.digest, "file": i.file
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    });
+    fs::write(
+        out_root.join("build-manifest.json"),
+        serde_json::to_string_pretty(&index)?,
+    )?;
+
     emit(app, "done", &format!("产物输出: {}", result.output_dir));
     Ok(result)
 }
@@ -474,9 +578,18 @@ fn build_server(
     build_id: &str,
     now: &str,
     auto_pull: bool,
+    // 升级模式：该服务器的基线镜像集合（Some=仅打包差异镜像）
+    baseline_set: Option<&std::collections::HashSet<String>>,
+    // 升级模式的基线构建号
+    baseline_build_id: Option<&str>,
 ) -> AppResult<BuildServerResult> {
+    let is_upgrade = baseline_set.is_some();
     let tpl_of = |id: &str| catalog.templates.iter().find(|t| t.id == id);
-    let dir_name = format!("{}_{}", sanitize(&server.name), server.arch);
+    let dir_name = if is_upgrade {
+        format!("upgrade-{}_{}", sanitize(&server.name), server.arch)
+    } else {
+        format!("{}_{}", sanitize(&server.name), server.arch)
+    };
     let sdir = out_root.join(&dir_name);
     for d in ["stack", "images", "scripts", "docker-offline/packages", "docs", "firewall", "logs"] {
         fs::create_dir_all(sdir.join(d))?;
@@ -674,6 +787,7 @@ fn build_server(
         "uname_arch": uname_of(&server.arch),
         "dir_name": dir_name,
         "stack_name": compose_name(&project.name),
+        "baseline_build_id": baseline_build_id.unwrap_or(""),
         "mem_need_gb": std::cmp::max(mem_need_gb, 1),
         "disk_need_mb": 15360u32, // M0 预估：系统 10G + 镜像余量
         "kernel_reqs": kernel_reqs,
@@ -681,9 +795,25 @@ fn build_server(
     });
 
     // ---- 镜像解析与复制：本地 tar > 缓存 > 在线拉取（auto_pull） ----
+    // 升级模式：与基线集合比对，未变更的镜像跳过（不装入升级包）
     let mut images_info: Vec<BuildImageInfo> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for inst in &instances {
+        if let Some(base) = baseline_set {
+            let key = if inst.digest.is_empty() {
+                inst.image.clone()
+            } else {
+                format!("{}@{}", inst.image, inst.digest)
+            };
+            if base.contains(&key) {
+                emit(
+                    app,
+                    "image",
+                    &format!("「{}」与基线一致，跳过（{}）", inst.instance_name, inst.image),
+                );
+                continue;
+            }
+        }
         let resolved: Option<std::path::PathBuf> = if !inst.local_image_tar.trim().is_empty() {
             let p = PathBuf::from(inst.local_image_tar.trim());
             if p.is_file() {
@@ -773,17 +903,25 @@ fn build_server(
         .map(|i| json!({ "file": i.file, "reference": i.reference }))
         .collect::<Vec<_>>());
 
-    let writes: Vec<(&str, PathBuf)> = vec![
-        ("compose/docker-compose.yml.j2", sdir.join("stack/docker-compose.yml")),
-        ("scripts/precheck.sh.j2", sdir.join("scripts/precheck.sh")),
-        ("scripts/deploy.sh.j2", sdir.join("scripts/deploy.sh")),
-        ("scripts/ops.sh.j2", sdir.join("scripts/ops.sh")),
-        ("scripts/apply-firewall.sh.j2", sdir.join("scripts/apply-firewall.sh")),
-        ("install/install-docker.sh.j2", sdir.join("docker-offline/install-docker.sh")),
-        ("docs/README.md.j2", sdir.join("README.md")),
-        ("docs/OPS-GUIDE.md.j2", sdir.join("docs/OPS-GUIDE.md")),
-        ("docs/PORT-MATRIX.md.j2", sdir.join("docs/PORT-MATRIX.md")),
-    ];
+    let writes: Vec<(&str, PathBuf)> = if is_upgrade {
+        vec![
+            ("compose/docker-compose.yml.j2", sdir.join("stack/docker-compose.yml")),
+            ("scripts/upgrade.sh.j2", sdir.join("scripts/upgrade.sh")),
+            ("scripts/ops.sh.j2", sdir.join("scripts/ops.sh")),
+        ]
+    } else {
+        vec![
+            ("compose/docker-compose.yml.j2", sdir.join("stack/docker-compose.yml")),
+            ("scripts/precheck.sh.j2", sdir.join("scripts/precheck.sh")),
+            ("scripts/deploy.sh.j2", sdir.join("scripts/deploy.sh")),
+            ("scripts/ops.sh.j2", sdir.join("scripts/ops.sh")),
+            ("scripts/apply-firewall.sh.j2", sdir.join("scripts/apply-firewall.sh")),
+            ("install/install-docker.sh.j2", sdir.join("docker-offline/install-docker.sh")),
+            ("docs/README.md.j2", sdir.join("README.md")),
+            ("docs/OPS-GUIDE.md.j2", sdir.join("docs/OPS-GUIDE.md")),
+            ("docs/PORT-MATRIX.md.j2", sdir.join("docs/PORT-MATRIX.md")),
+        ]
+    };
     for (tpl, path) in writes {
         let content = render(env, tpl, &ctx)?;
         // compose 渲染产物做 YAML 语法校验：非法 YAML 在现场 compose config 才暴露
@@ -797,8 +935,9 @@ fn build_server(
         f.write_all(content.as_bytes())?;
     }
 
-    // ---- Docker 离线安装材料（主包组 + 依赖组：arch/版本/包系匹配） ----
-    let pkg_dirs = crate::docker_pkgs::pick_pkg_dirs(app, &server.arch, &server.docker_version, &server.os_family);
+    // ---- Docker 离线安装材料（升级包不需要：目标机已具备 Docker 环境） ----
+    if !is_upgrade {
+        let pkg_dirs = crate::docker_pkgs::pick_pkg_dirs(app, &server.arch, &server.docker_version, &server.os_family);
     if pkg_dirs.is_empty() {
         warnings.push(format!(
             "「{}」(Docker {} {} 系) 无匹配离线安装包：构建产物不含 Docker 安装材料，deploy.sh 将要求现场已装 Docker 或人工安装",
@@ -850,6 +989,7 @@ fn build_server(
             ));
         }
     }
+    } // end if !is_upgrade
 
     // ---- manifest.json ----
     let manifest = json!({
