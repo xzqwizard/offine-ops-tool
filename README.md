@@ -1,52 +1,58 @@
-# OfflinePreOpsTool（离线部署运维工具）
+# OfflinePreOpsTool
 
-面向政务等完全离线（内网）环境的一站式离线部署方案生成工具：
+Windows 桌面工具，用于整理服务器/中间件方案，准备 Docker 安装材料和镜像，在有外网的办公机生成每台服务器的离线全量包或增量升级包。目标 Linux 主机使用包内脚本部署、巡检、冷备份和恢复。
 
-- 在**有外网的办公机**上定义服务器清单（区分 CPU 架构/OS）、挑选中间件与版本、定义服务器间端口访问关系；
-- 在线（或本地导入）拉取对应架构的 Docker 镜像，为**每台服务器生成自包含离线包**：
-  - Docker 引擎离线安装包（按架构/OS 匹配）
-  - 全部镜像 tar（docker save 格式）
-  - `deploy.sh` 一键部署脚本（预检→装 Docker→导镜像→起服务→健康检查）
-  - `ops.sh` 日常运维脚本（重启/日志/备份/升级/回滚/诊断）
-  - 自动生成的运维操作文档与端口矩阵
+## 当前能力
 
-## 文档
+| 环节 | 当前实现 | 验证边界 |
+|---|---|---|
+| 方案和中间件目录 | 导入、复制、模板冻结、后端校验；本机凭据用 Windows DPAPI 加密 | 便携导出、ZIP 备份、构建快照不含仓库/代理/中间件密码；导入后需重新填写 |
+| 镜像 | 按来源/平台/digest 隔离缓存，验证 tar 标签、平台、层和校验和；缺镜像阻断构建 | 在线拉取需要 crane；本地 docker-save tar 不能证明远端仓库 digest |
+| 安装材料 | amd64/arm64 官方静态包与 Compose 在线下载；RPM/DEB 需同 OS、版本、架构和组件声明；其它架构手工导入 | 导入静态包校验 ELF；信创发行版、内核和包依赖需在目标机验收 |
+| 构建和现场脚本 | 完整包门禁、稳定身份、SHA256、升级前冷备、失败自动回退、按来源限制 Docker 端口 | Windows 模拟流程已覆盖；真实容器和防火墙由 Linux CI / 目标机验收 |
+| 签名 | 尚未实现 | 开启签名的方案会被后端拒绝，不能误标为已签名交付 |
 
-- [方案设计（v1.1）](docs/方案设计.md) —— 架构、数据模型、技术选型、脚本设计、里程碑与风险
+`docs/代码审查与业务闭环核查-2026-10-02.md` 记录原始审查及本轮修复状态。方案设计见 `docs/方案设计.md`。
 
-## 开发
+## 开发和验证
+
+Windows 开发机需要 Node 22、pnpm 10、Rust 1.97.1、Tauri 2 的系统依赖。当前仓库的 Windows GNU 构建使用 MinGW windres、GCC specs、rust-lld 和 WebView2；`src-tauri/.cargo/config.toml` 说明了本机链接设置。MSVC 与 Linux 走标准 Tauri 构建路径。Linux CI 另需 WebKitGTK 4.1、GTK、librsvg、appindicator 等系统包。
 
 ```bash
-pnpm install        # 安装前端依赖
-pnpm tauri dev      # 开发模式运行（需要 Rust 工具链）
-pnpm build          # 前端类型检查 + 构建
-cargo test          # 后端单元测试（在 src-tauri/ 下执行）
+pnpm install --frozen-lockfile
+pnpm test
+pnpm build
+cd src-tauri
+cargo fmt -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 ```
 
-### 当前进度（M0 竖切已完成）
+本地桌面运行：`pnpm tauri dev`。前端单独用 `pnpm dev` 可预览界面，但 Tauri 命令不会在普通浏览器中执行。
 
-- [x] Tauri 2 + Vue 3 + Vite + Tailwind 4 + Element Plus + Pinia 骨架
-- [x] 设计系统：五套主题（暗色/亮色/科技绿/商务蓝/极光紫）、玻璃标题栏、侧边导航
-- [x] 方案管理：新建/列表/删除/编辑（服务器清单、中间件编排、端口矩阵、校验、构建五个页签）
-- [x] 服务器管理：架构（含信创 arm64/loongarch64）/OS/资源配置，唯一性与级联删除
-- [x] 中间件目录：预置 10 个常用中间件 + 手动输入镜像，端口/参数编辑，同机端口冲突校验
-- [x] 端口矩阵：可点击矩阵 + 访问规则明细，防火墙脚本生成
-- [x] 构建中心：minijinja 渲染 deploy/ops/precheck/apply-firewall 脚本、compose、运维文档；
-      本地镜像 tar 装入包内，tar.gz 打包（镜像 store 模式不二次压缩），SHA256SUMS，进度事件
-- [x] 设置：存储根路径全部可自定义（防 C 盘堆积）、镜像源管理
-- [ ] M1：skopeo 在线拉取（跨架构）、Registry tag/架构查询、镜像缓存去重
-- [ ] M2：Docker 离线安装包库管理、端口开通申请表 xlsx 导出、拓扑图
-- [ ] M3：升级/回滚脚本完善、GPG 签名、信创 OS 真机验证
+GitHub Actions 的 `.github/workflows/verify.yml` 在 Ubuntu 上增加了真实 Docker 部署、重复部署、来源允许/拒绝、PostgreSQL 数据冷备/恢复、升级和回滚冒烟测试。此工作流的实际结果以首次 CI 运行记录为准。其它数据库、中间件、国产 OS/架构与生产防火墙后端仍需使用真实镜像/硬件和业务数据逐项验收。
 
-### 产物结构（每台服务器一个自包含包）
+## RPM/DEB 材料声明
 
-```text
-<server>_<arch>/
-├── manifest.json / SHA256SUMS / README.md
-├── docker-offline/   # Docker 引擎离线安装（install-docker.sh + packages/）
-├── images/           # 镜像 tar（本地导入或 M1 在线拉取）
-├── stack/            # docker-compose.yml + data/
-├── scripts/          # deploy.sh / ops.sh / precheck.sh / apply-firewall.sh
-├── firewall/ docs/   # 端口说明、OPS-GUIDE.md、PORT-MATRIX.md
-└── logs/
+导入每个本地 RPM/DEB 时，在同目录提供 `<文件名>.pkg.json`。每个文件独立声明；同一 Docker 版本及 OS 的材料需包括 `engine`、`cli`、`containerd` 三类角色，其他依赖填 `dependency`。`engineVersion` 是精确匹配的 Docker 版本；附件组的 `dockerVersion` 填 `deps`。SHA256 填实际文件的 64 位十六进制值。
+
+```json
+{
+  "arch": "amd64",
+  "kind": "deb",
+  "dockerVersion": "27.5.1",
+  "engineVersion": "27.5.1",
+  "osFamily": "ubuntu",
+  "osVersion": "24.04",
+  "sha256": { "docker-ce_27.5.1_amd64.deb": "<64位十六进制 SHA256>" },
+  "components": { "docker-ce_27.5.1_amd64.deb": "engine" }
+}
 ```
+
+文件名不符合官方惯例时由声明确定类型、版本和角色；不匹配的 OS、组件不齐或校验失败会阻断全量包构建。官方静态包与 Compose 插件仍可通过应用下载；在线源暂仅提供 amd64/arm64。其它架构必须准备并验证对应的 64 位 Linux 静态包、Compose 插件或同发行版原生包。
+
+## 交付约束
+
+全量包每台服务器包含 `manifest.json`、`SHA256SUMS`、`deployment.env`、`docker-offline/`、`images/`、`stack/`、`scripts/` 和 `docs/`。增量包包含新编排/脚本/文档及变化镜像，必须绑定当前已部署构建号。失败构建会出现在历史中，但不能作为升级基线。打包模式默认快速 gzip；目录模式保留各服务器自身的 `SHA256SUMS`，不生成外层 `SHA256SUMS.all`。
+
+Linux 现场按包内 `README.md` 和 `docs/OPS-GUIDE.md` 操作。冷备份在停止该方案服务后制作并校验；恢复会保留恢复前目录，管理员确认后清理。防火墙脚本仅支持 Docker IPv4 iptables `DOCKER-USER`，并需单独执行 `--apply`；无来源规则的发布端口将拒绝外部新连接。
