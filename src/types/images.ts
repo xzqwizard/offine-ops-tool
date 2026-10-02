@@ -39,6 +39,7 @@ export interface PullResult {
 }
 
 export interface ImagePullEvent {
+  taskId: string
   status: string
   detail: string
 }

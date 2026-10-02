@@ -2,7 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { useProjectStore } from '@/stores/project'
 import { backend, toAppError } from '@/api/backend'
-import { validateProject, hasBlockingErrors, type ValidationIssue } from '@/utils/validate'
+import { hasBlockingErrors, type ValidationIssue } from '@/utils/validate'
 import type { MiddlewareTemplate } from '@/types/catalog'
 import { ElMessage } from 'element-plus'
 
@@ -20,14 +20,16 @@ onMounted(async () => {
   }
 })
 
-function runCheck() {
+async function runCheck() {
+  if (!store.project || checking.value) return
+  const revision = store.revision
+  const id = store.project.id
   checking.value = true
   try {
-    issues.value = store.project ? validateProject(store.project, templates.value) : []
-    checkedRevision.value = store.revision
-  } finally {
-    checking.value = false
-  }
+    const checked = await backend.validateProject(JSON.parse(JSON.stringify(store.project)))
+    if (store.project?.id === id) { issues.value = checked; checkedRevision.value = revision }
+  } catch (e) { ElMessage.error(`校验失败: ${toAppError(e).message}`) }
+  finally { checking.value = false }
 }
 
 // 任何修改（防抖/commit 保存均会自增 revision）后提示结果过期

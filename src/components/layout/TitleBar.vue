@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { useProjectStore } from '@/stores/project'
+import { useBuildTaskStore } from '@/stores/buildTask'
+import { ElMessage } from 'element-plus'
+import { toAppError } from '@/api/backend'
 import pkg from '../../../package.json'
 import ThemeSwitcher from './ThemeSwitcher.vue'
 
@@ -11,6 +15,9 @@ const appWindow = inTauri ? getCurrentWindow() : null
 const isMaximized = ref(false)
 let unlisten: (() => void) | null = null
 let disposed = false
+let closeUnlisten: (() => void) | undefined
+let closing = false
+let allowClose = false
 
 async function refreshMaxState() {
   if (!appWindow) return
@@ -24,6 +31,21 @@ async function refreshMaxState() {
 onMounted(async () => {
   await refreshMaxState()
   if (!appWindow) return
+  closeUnlisten = await appWindow.onCloseRequested(async (event) => {
+    if (allowClose) return
+    event.preventDefault()
+    if (closing) return
+    closing = true
+    try {
+      if (useBuildTaskStore().busy) ElMessage.info('等待构建任务结束后关闭')
+      await useBuildTaskStore().waitForIdle()
+      await useProjectStore().flushPending()
+      allowClose = true
+      await appWindow?.close()
+    } catch (e) { ElMessage.error(`关闭前保存失败: ${toAppError(e).message}`) }
+    finally { closing = false }
+  })
+  if (disposed) closeUnlisten()
   try {
     const fn = await appWindow.onResized(refreshMaxState)
     if (disposed) fn()
@@ -36,6 +58,7 @@ onMounted(async () => {
 onUnmounted(() => {
   disposed = true
   unlisten?.()
+  closeUnlisten?.()
 })
 
 async function toggleMaximize() {

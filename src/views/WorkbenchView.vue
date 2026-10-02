@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatTime } from '@/utils/time'
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
@@ -35,6 +36,7 @@ onMounted(async () => {
 const buildStats = computed(() => {
   const m = new Map<string, { last: string; count: number; size: number }>()
   for (const h of history.value) {
+    if (h.status !== 'complete') continue
     const cur = m.get(h.projectId) ?? { last: '', count: 0, size: 0 }
     cur.count += 1
     cur.size += h.totalSizeBytes
@@ -50,9 +52,7 @@ function fmtSize(bytes: number): string {
   return `${(bytes / 1024).toFixed(0)} KB`
 }
 
-function fmtTime(iso: string): string {
-  return iso ? iso.replace('T', ' ').replace(/([+-]d{2}:d{2}|Z)$/, '') : '—'
-}
+const fmtTime = formatTime
 </script>
 
 <template>

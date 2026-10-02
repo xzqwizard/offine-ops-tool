@@ -10,6 +10,8 @@ let saveSeq = 0
 let saveChain: Promise<void> = Promise.resolve()
 
 export const useProjectStore = defineStore('project', () => {
+  let loadSeq = 0
+  const loading = ref(false)
   const project = ref<Project | null>(null)
   const summaries = ref<ProjectSummary[]>([])
   const dirty = ref(false)
@@ -30,19 +32,20 @@ export const useProjectStore = defineStore('project', () => {
 
   /** 执行保存（排队串行）。仅"发起后无编辑"的响应才回写内存，防止在途快照回滚用户输入 */
   function save(): Promise<void> {
+    const snapshot = project.value ? JSON.parse(JSON.stringify(project.value)) as Project : null
+    const revBefore = revision.value
     const run = async () => {
-      if (!project.value) return
+      if (!snapshot) return
       const seq = ++saveSeq
-      const revBefore = revision.value
       saving.value = true
       try {
-        const saved = await backend.saveProject(project.value)
+        const saved = await backend.saveProject(snapshot)
         if (seq !== saveSeq || !project.value || saved.id !== project.value.id) return
         // 响应回来前发生了编辑：不回写（会丢编辑），保持 dirty 由后续保存落盘
         if (revision.value !== revBefore) return
         project.value = saved
         dirty.value = false
-        await refreshSummaries()
+        await refreshSummaries().catch(() => undefined)
       } finally {
         if (seq === saveSeq) saving.value = false
       }
@@ -82,13 +85,25 @@ export const useProjectStore = defineStore('project', () => {
       saveTimer = undefined
     }
     if (dirty.value) await save()
-    await saveChain.catch(() => {})
+    await saveChain
+    if (dirty.value) await save()
   }
 
   async function open(id: string) {
+    const seq = ++loadSeq
     await flushPending()
-    project.value = await backend.loadProject(id)
-    dirty.value = false
+    if (seq !== loadSeq) return
+    project.value = null
+    loading.value = true
+    try {
+      const loaded = await backend.loadProject(id)
+      if (seq !== loadSeq) return
+      project.value = loaded
+      dirty.value = false
+      revision.value++
+    } finally {
+      if (seq === loadSeq) loading.value = false
+    }
   }
 
   async function create(name: string, customer: string): Promise<Project> {
@@ -109,13 +124,16 @@ export const useProjectStore = defineStore('project', () => {
     await refreshSummaries()
   }
 
-  function close() {
+  async function close() {
+    await flushPending()
+    ++loadSeq
     project.value = null
     dirty.value = false
   }
 
   return {
     project,
+    loading,
     summaries,
     dirty,
     saving,

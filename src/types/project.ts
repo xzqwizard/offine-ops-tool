@@ -1,7 +1,7 @@
 // 与 src-tauri/src/models.rs 的 serde camelCase 输出一一对应
 
 export interface BuildConfig {
-  packageFormat: 'tar.gz' | 'zip' | 'tar' | 'dir' | string
+  packageFormat: 'tar.gz' | 'dir'
   recompressImages: boolean
   sign: boolean
 }
@@ -74,6 +74,7 @@ export interface Project {
   networkRules: NetworkRule[]
   /** 项目级私有镜像仓库（拉取/查询时优先于镜像源列表） */
   registry: RegistryConfig | null
+  templateSnapshots?: import('./catalog').MiddlewareTemplate[]
 }
 
 export interface ProjectSummary {

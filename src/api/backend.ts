@@ -4,11 +4,12 @@ import type {
   BackendError,
   ConnectivityResult,
   Project,
+  RegistryConfig,
   ProjectSummary,
   StorageInfo,
   TestNetworkReport
 } from '@/types/project'
-import type { CatalogFile } from '@/types/catalog'
+import type { CatalogFile, MiddlewareTemplate } from '@/types/catalog'
 import type { BuildResult } from '@/types/build'
 import type { BuildHistoryEntry } from '@/types/buildHistory'
 import type {
@@ -28,6 +29,9 @@ import type {
  * 若未来切换桌面框架（如 Electron），仅需替换此文件实现。
  */
 export const backend = {
+  async validateProject(project: Project): Promise<import('@/utils/validate').ValidationIssue[]> {
+    return invoke('validate_project', { project })
+  },
   async listProjects(): Promise<ProjectSummary[]> {
     return invoke<ProjectSummary[]>('list_projects')
   },
@@ -68,7 +72,7 @@ export const backend = {
     return invoke<CatalogFile>('list_catalog')
   },
 
-  async saveCustomTemplate(template: unknown, category: string): Promise<CatalogFile> {
+  async saveCustomTemplate(template: MiddlewareTemplate, category: string): Promise<CatalogFile> {
     return invoke<CatalogFile>('save_custom_template', { template, category })
   },
 
@@ -123,11 +127,11 @@ export const backend = {
     return invoke<EngineStatus>('engine_install', { force })
   },
 
-  async inspectImage(image: string, registry?: unknown): Promise<ImageInspect> {
+  async inspectImage(image: string, registry?: RegistryConfig): Promise<ImageInspect> {
     return invoke<ImageInspect>('inspect_image', { image, registry: registry ?? null })
   },
 
-  async listImageTags(image: string, registry?: unknown): Promise<string[]> {
+  async listImageTags(image: string, registry?: RegistryConfig): Promise<string[]> {
     return invoke<string[]>('list_image_tags', { image, registry: registry ?? null })
   },
 
@@ -142,9 +146,10 @@ export const backend = {
   async pullImage(
     image: string,
     arch: string,
-    registry?: unknown
+    registry?: RegistryConfig,
+    taskId?: string
   ): Promise<PullResult> {
-    return invoke<PullResult>('pull_image', { image, arch, registry: registry ?? null })
+    return invoke<PullResult>('pull_image', { image, arch, registry: registry ?? null, taskId: taskId ?? null })
   },
 
   async listDockerPkgs(): Promise<DockerPkgEntry[]> {
@@ -203,12 +208,14 @@ export const backend = {
   async buildOfflinePackage(
     project: Project,
     autoPull: boolean,
-    baselineBuildId?: string | null
+    baselineBuildId?: string | null,
+    taskId?: string
   ): Promise<BuildResult> {
     return invoke<BuildResult>('build_offline_package', {
       project,
       autoPull,
-      baselineBuildId: baselineBuildId ?? null
+      baselineBuildId: baselineBuildId ?? null,
+      taskId: taskId ?? null
     })
   }
 }

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { withTag } from '@/utils/imageReference'
 import { ref, computed, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
@@ -84,6 +85,7 @@ const inspect = ref<ImageInspect | null>(null)
 const inspecting = ref(false)
 /** 编辑实例时保留原 digest（避免编辑一次就丢失已锁定的 sha256） */
 const editingDigest = ref('')
+const editingReference = ref('')
 
 async function loadOnlineTags() {
   if (!selectedTemplate.value) return
@@ -105,7 +107,7 @@ const currentReference = computed(() => {
   if (mode.value === 'custom') {
     return customImage.value.trim() || ''
   }
-  return selectedTemplate.value ? `${selectedTemplate.value.defaultImage}:${tag.value || 'latest'}` : ''
+  return selectedTemplate.value ? withTag(selectedTemplate.value.defaultImage, tag.value) : ''
 })
 
 async function checkImage() {
@@ -118,7 +120,8 @@ async function checkImage() {
   inspect.value = null
   inspectRef.value = ref
   try {
-    inspect.value = await backend.inspectImage(ref, store.project?.registry ?? undefined)
+    const checked = await backend.inspectImage(ref, store.project?.registry ?? undefined)
+    if (inspectRef.value === ref && currentReference.value === ref) inspect.value = checked
   } catch (e) {
     ElMessage.error(`镜像检查失败: ${toAppError(e).message}`)
   } finally {
@@ -136,7 +139,7 @@ const inspectRef = ref('')
 const ARCH_ALIASES: Record<string, string[]> = {
   loongarch64: ['loongarch64', 'loong64'],
   arm64: ['arm64', 'aarch64'],
-  amd64: ['amd64', 'x86_64', '386']
+  amd64: ['amd64', 'x86_64']
 }
 function archMatches(a: string): boolean {
   if (!selectedServer.value) return false
@@ -204,6 +207,7 @@ async function saveAsCustom() {
         remark: `自定义：${customImage.value.trim()}`
       }
       await backend.saveCustomTemplate(tpl, '我的中间件')
+      window.dispatchEvent(new Event('catalog-updated'))
       ElMessage.success(`已保存「${value.trim()}」，下次可从目录直接选择`)
     })
   } catch (e) {
@@ -220,7 +224,7 @@ async function saveAsCustom() {
 watch(mode, (m) => {
   if (m === 'custom' && !customImage.value.trim()) {
     const t = selectedTemplate.value
-    customImage.value = t ? `${t.defaultImage}:${tag.value || 'latest'}` : ''
+    customImage.value = t ? withTag(t.defaultImage, tag.value) : ''
   }
 })
 
@@ -263,6 +267,7 @@ function init() {
     )
     localImageTar.value = editing.localImageTar
     editingDigest.value = editing.digest
+    editingReference.value = editing.image
   } else {
     formServerId.value = props.servers[0]?.id ?? ''
     formServerIds.value = props.servers[0]?.id ? [props.servers[0].id] : []
@@ -362,7 +367,7 @@ function handleSave() {
     }
   }
   for (const p of ports.value) {
-    if (p.host < 1 || p.host > 65535 || p.container < 1 || p.container > 65535) {
+    if ((p.expose && (p.host < 1 || p.host > 65535)) || p.container < 1 || p.container > 65535) {
       ElMessage.warning(`端口超出范围 (1-65535)：${p.host}→${p.container}`)
       return
     }
@@ -371,7 +376,7 @@ function handleSave() {
   const image =
     mode.value === 'custom'
       ? customImage.value.trim()
-      : `${selectedTemplate.value!.defaultImage}:${tag.value.trim()}`
+      : withTag(selectedTemplate.value!.defaultImage, tag.value.trim())
 
   const cleanParams: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(params.value)) {
@@ -403,7 +408,7 @@ function handleSave() {
   const digest =
     inspect.value && inspectRef.value === image && inspect.value.digest
       ? inspect.value.digest
-      : editingDigest.value
+      : image === editingReference.value ? editingDigest.value : ''
 
   const instances: MiddlewareInstance[] = finalIds.map((serverId) => ({
     id: props.editingId ?? genId('inst'),

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
 import { backend, toAppError } from '@/api/backend'
@@ -8,17 +8,24 @@ import type { MiddlewareInstance } from '@/types/project'
 import InstanceFormDialog from './InstanceFormDialog.vue'
 
 const store = useProjectStore()
-const catalog = ref<MiddlewareTemplate[]>([])
+const availableCatalog = ref<MiddlewareTemplate[]>([])
+const catalog = computed(() => {
+  const snapshots = store.project?.templateSnapshots ?? []
+  return [...availableCatalog.value.filter(t => !snapshots.some(s => s.id === t.id)), ...snapshots]
+})
 const dialogOpen = ref(false)
 const editingId = ref<string | null>(null) // null = 新增
 
-onMounted(async () => {
+async function refreshCatalog() {
   try {
-    catalog.value = (await backend.listCatalog()).templates
+    availableCatalog.value = (await backend.listCatalog()).templates
   } catch (e) {
     ElMessage.error(`读取中间件目录失败: ${toAppError(e).message}`)
   }
-})
+}
+onMounted(() => { refreshCatalog(); window.addEventListener('catalog-updated', refreshCatalog) })
+onUnmounted(() => window.removeEventListener('catalog-updated', refreshCatalog))
+watch(dialogOpen, open => { if (open) refreshCatalog() })
 
 const servers = computed(() => store.project?.servers ?? [])
 const instances = computed(() => store.project?.instances ?? [])
@@ -69,7 +76,7 @@ async function handleDelete(inst: MiddlewareInstance) {
         (r) =>
           !(
             r.toServerId === inst.serverId &&
-            inst.ports.some((p) => p.host === r.toPort && p.expose)
+            inst.ports.some((p) => p.host === r.toPort && p.protocol === r.protocol && p.expose)
           )
       )
     })
@@ -132,15 +139,15 @@ function validateInstance(inst: MiddlewareInstance): string | null {
     return '实例名仅允许字母数字与 _ -（作为 compose 服务名）'
   if (!inst.image.trim()) return '镜像引用不能为空'
   for (const port of inst.ports) {
-    if (port.host < 1 || port.host > 65535) return `宿主端口 ${port.host} 超出范围 (1-65535)`
+    if (port.expose && (port.host < 1 || port.host > 65535)) return `宿主端口 ${port.host} 超出范围 (1-65535)`
   }
   // R2：同机宿主端口冲突（排除自身）
   const others =
     store.project?.instances.filter((i) => i.serverId === inst.serverId && i.id !== inst.id) ?? []
-  const ownPorts = inst.ports.map((p) => p.host)
+  const ownPorts = inst.ports.filter(p => p.expose).map(p => `${p.host}/${p.protocol}`)
   for (const other of others) {
     for (const op of other.ports) {
-      if (ownPorts.includes(op.host)) {
+      if (op.expose && ownPorts.includes(`${op.host}/${op.protocol}`)) {
         return `服务器「${serverName(inst.serverId)}」端口 ${op.host} 已被「${other.instanceName}」占用`
       }
     }

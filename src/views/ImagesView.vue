@@ -32,14 +32,16 @@ const pullLogs = ref<string[]>([])
 let unlistenPull: UnlistenFn | null = null
 let unlistenProgress: UnlistenFn | null = null
 let disposed = false
+let activePullTask = ''
 
 onMounted(async () => {
   await Promise.all([refreshEngine(), refreshCache()])
   try {
     const fn = await listen<ImagePullEvent>('image-pull', (e) => {
-      pullLogs.value.push(e.payload.detail)
+      if (e.payload.taskId === activePullTask && pulling.value) pullLogs.value.push(e.payload.detail)
     })
     const fnProgress = await listen<{
+      taskId: string
       reference: string
       arch: string
       bytes: number
@@ -47,6 +49,7 @@ onMounted(async () => {
       percent: number
       speedBps: number
     }>('image-pull-progress', (e) => {
+      if (e.payload.taskId !== activePullTask || !pulling.value) return
       pullPercent.value = e.payload.percent
       pullSpeed.value = e.payload.speedBps
       pullBytes.value = e.payload.bytes
@@ -121,6 +124,8 @@ async function handlePull() {
     ElMessage.warning('请输入镜像引用，如 mysql:8.0.42')
     return
   }
+  if (pulling.value) return
+  activePullTask = crypto.randomUUID()
   pulling.value = true
   pullLogs.value = []
   pullPercent.value = null
@@ -128,7 +133,7 @@ async function handlePull() {
   pullBytes.value = 0
   pullTotal.value = 0
   try {
-    const r = await backend.pullImage(image.trim(), arch, projectRegistry)
+    const r = await backend.pullImage(image.trim(), arch, projectRegistry.value ?? undefined, activePullTask)
     if (r.cached) {
       pullLogs.value.push(`缓存命中: ${r.cacheFile}`)
     }

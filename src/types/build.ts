@@ -5,9 +5,15 @@ export interface BuildImageInfo {
   file: string
   sha256: string | null
   sizeBytes: number
+  digest: string
+  configDigest: string
+  contentSha256: string
+  expectedDigest: string
+  packed: boolean
 }
 
 export interface BuildServerResult {
+  serverId: string
   name: string
   arch: string
   dirName: string
@@ -26,6 +32,8 @@ export interface BuildResult {
 }
 
 export interface BuildProgressEvent {
+  taskId: string
+  projectId: string
   step: string
   detail: string
 }

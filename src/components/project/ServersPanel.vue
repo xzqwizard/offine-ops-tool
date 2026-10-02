@@ -10,6 +10,7 @@ import {
   type ServerInfo
 } from '@/types/project'
 import { backend, toAppError } from '@/api/backend'
+import { isIpv4 } from '@/utils/validate'
 import { genId } from '@/utils/id'
 
 const store = useProjectStore()
@@ -59,13 +60,11 @@ function archColor(arch: string): 'primary' | 'success' | 'warning' | 'info' {
   return 'info'
 }
 
-const IP_RE = /^(\d{1,3}\.){3}\d{1,3}$/
-
 function validateForm(): string | null {
   const f = form.value
   if (!f.name.trim()) return '服务器名称不能为空'
   if (!f.ip.trim()) return 'IP 地址不能为空（防火墙规则/端口矩阵依赖 IP 对应）'
-  if (!IP_RE.test(f.ip.trim())) return `IP 格式不正确: ${f.ip}`
+  if (!isIpv4(f.ip.trim())) return `IP 格式不正确: ${f.ip}`
   if (!f.dockerVersion.trim()) return 'Docker 版本不能为空（从官方列表选择或手动输入）'
   if (f.cpuCores <= 0) return 'CPU 核数需大于 0'
   if (f.memoryGb <= 0) return '内存需大于 0'
@@ -110,13 +109,10 @@ watch(
   }
 )
 
-watch(
-  () => form.value.osFamily,
-  (family) => {
-    const list = OS_VERSION_OPTIONS[family]
-    if (list?.length) form.value.osVersion = list[0]
-  }
-)
+function onOsFamilyChange(family: string) {
+  const list = OS_VERSION_OPTIONS[family]
+  if (list?.length) form.value.osVersion = list[0]
+}
 
 function openCreate() {
   editingIndex.value = -1
@@ -273,7 +269,7 @@ async function handleDelete(index: number) {
             </el-select>
           </el-form-item>
           <el-form-item label="操作系统" required>
-            <el-select v-model="form.osFamily">
+            <el-select v-model="form.osFamily" @change="onOsFamilyChange">
               <el-option
                 v-for="o in OS_FAMILY_OPTIONS"
                 :key="o.value"

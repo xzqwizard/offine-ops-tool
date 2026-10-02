@@ -47,27 +47,24 @@ const matrixRows = computed(() => {
   return rows
 })
 
-function hasRule(fromId: string, toServerId: string, port: number): boolean {
+function hasRule(fromId: string, toServerId: string, port: number, protocol: string): boolean {
   return rules.value.some(
-    (r) => r.fromServerId === fromId && r.toServerId === toServerId && r.toPort === port
+    (r) => r.fromServerId === fromId && r.toServerId === toServerId && r.toPort === port && r.protocol === protocol
   )
 }
 
 /** 点击矩阵单元格切换放行（静默自动保存，失败时提示）。
  * 协议取该端口定义的协议（udp 端口的放行规则必须是 udp） */
-function toggleCell(fromId: string, row: { toServerId: string; host: number }) {
+function toggleCell(fromId: string, row: { toServerId: string; host: number; protocol: string }) {
   const existing = rules.value.find(
-    (r) => r.fromServerId === fromId && r.toServerId === row.toServerId && r.toPort === row.host
+    (r) => r.fromServerId === fromId && r.toServerId === row.toServerId && r.toPort === row.host && r.protocol === row.protocol
   )
   if (existing) {
     store.commit((p) => {
       p.networkRules = p.networkRules.filter((r) => r.id !== existing.id)
     }).catch((e) => ElMessage.error(`保存失败: ${toAppError(e).message}`))
   } else {
-    const protocol =
-      store.project?.instances
-        .find((i) => i.serverId === row.toServerId)
-        ?.ports.find((p) => p.host === row.host)?.protocol ?? 'tcp'
+    const protocol = row.protocol
     store.commit((p) => {
       p.networkRules.push({
         id: genId('rule'),
@@ -126,7 +123,7 @@ async function handleSave() {
       r.id !== editingRuleId.value &&
       r.fromServerId === f.fromServerId &&
       r.toServerId === f.toServerId &&
-      r.toPort === f.toPort
+      r.toPort === f.toPort && r.protocol === f.protocol
   )
   if (dup) {
     ElMessage.warning('该访问规则已存在')
@@ -264,15 +261,15 @@ async function handleExportXlsx() {
                   v-if="s.id !== row.toServerId"
                   class="w-8 h-8 rounded-lg inline-flex items-center justify-center transition-all"
                   :class="
-                    hasRule(s.id, row.toServerId, row.host)
+                    hasRule(s.id, row.toServerId, row.host, row.protocol)
                       ? 'bg-success/20 text-success hover:bg-success/30'
                       : 'bg-surface-container text-on-surface-variant/20 hover:bg-surface-container-high'
                   "
-                  :title="hasRule(s.id, row.toServerId, row.host) ? '点击取消放行' : '点击放行'"
+                  :title="hasRule(s.id, row.toServerId, row.host, row.protocol) ? '点击取消放行' : '点击放行'"
                   @click="toggleCell(s.id, row)"
                 >
                   <span class="material-symbols-outlined text-base">{{
-                    hasRule(s.id, row.toServerId, row.host) ? 'check' : 'add'
+                    hasRule(s.id, row.toServerId, row.host, row.protocol) ? 'check' : 'add'
                   }}</span>
                 </button>
                 <span v-else class="text-on-surface-variant/30 text-xs">本机</span>

@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as openDirectory, save as saveFileDialog, open as openFileDialog } from "@tauri-apps/plugin-dialog"
 import { backend, toAppError } from '@/api/backend'
+import { useBuildTaskStore } from '@/stores/buildTask'
 import { useProjectStore } from '@/stores/project'
 import type {
   AppSettings,
@@ -16,6 +17,7 @@ import type {
 const loading = ref(true)
 const loadError = ref('')
 const saving = ref(false)
+let settingsSave: Promise<StorageInfo> | null = null
 const settings = ref<AppSettings | null>(null)
 const storage = ref<StorageInfo | null>(null)
 const newMirror = ref('')
@@ -119,14 +121,18 @@ onUnmounted(() => {
 })
 
 async function handleSave() {
+  if (useBuildTaskStore().busy || backing.value) { ElMessage.warning('请等待构建或备份恢复结束后保存设置'); return }
   if (!settings.value) return
   saving.value = true
   try {
-    storage.value = await backend.saveSettings(settings.value)
+    await useProjectStore().flushPending()
+    settingsSave = backend.saveSettings(settings.value)
+    storage.value = await settingsSave
     ElMessage.success('设置已保存（目录已就绪）')
   } catch (e) {
     ElMessage.error(`保存失败: ${toAppError(e).message}`)
   } finally {
+    settingsSave = null
     saving.value = false
   }
 }
@@ -215,6 +221,7 @@ async function handleFetchCatalog() {
   catalogUpdating.value = true
   try {
     const msg = await backend.fetchRemoteCatalog(catalogUrl.value.trim())
+    window.dispatchEvent(new Event('catalog-updated'))
     ElMessage.success(msg)
   } catch (e) {
     ElMessage.error(`目录更新失败: ${toAppError(e).message}`)
@@ -246,6 +253,7 @@ async function handleBackupData() {
     if (!path) return
     backing.value = true
     try {
+      await settingsSave?.catch(() => undefined)
       await useProjectStore().flushPending()
       const msg = await backend.backupAppData(path)
       ElMessage.success(msg)
@@ -271,7 +279,7 @@ async function handleRestoreData() {
     if (!path) return
     try {
       await ElMessageBox.confirm(
-        '恢复将覆盖当前的方案与设置（镜像缓存不受影响），恢复完成后需重启应用。确定继续？',
+        '恢复将覆盖当前的方案与设置（镜像缓存不受影响），恢复保留本机存储路径，完成后立即重新加载；仓库、代理及中间件密码需重新填写。确定继续？',
         '恢复确认',
         { type: 'warning', confirmButtonText: '恢复', cancelButtonText: '取消' }
       )
@@ -280,10 +288,15 @@ async function handleRestoreData() {
     }
     backing.value = true
     try {
+      if (useBuildTaskStore().busy) { ElMessage.warning('请等待构建结束后恢复'); return }
+      await settingsSave?.catch(() => undefined)
+      await useProjectStore().close()
       const msg = await backend.restoreAppData(path)
       ElMessage.success(msg)
       // 清内存态：旧方案/设置若留在内存，随后的自动保存会反向覆盖恢复的数据
-      useProjectStore().close()
+      settings.value = await backend.getSettings()
+      storage.value = await backend.getStorageInfo()
+      await useProjectStore().refreshSummaries()
     } catch (e) {
       ElMessage.error(`恢复失败: ${toAppError(e).message}`)
     } finally {
@@ -295,7 +308,7 @@ async function handleRestoreData() {
 }
 
 function addMirror() {
-  const v = newMirror.value.trim()
+  const v = newMirror.value.trim().replace(/^https?:\/\//, '').replace(/\/$/, '').toLowerCase()
   if (!v) return
   if (!/^[a-z0-9.-]+(:\d+)?$/i.test(v.replace(/^https?:\/\//, ''))) {
     ElMessage.warning('镜像源格式示例: docker.m.daocloud.io')
@@ -507,7 +520,7 @@ function removeMirror(index: number) {
         </button>
       </div>
       <div class="text-[10px] text-on-surface-variant/50 mt-2">
-        远程目录条目合入本地（同 id 覆盖内置），新增中间件模板无需发版应用；手动输入的镜像也可在实例弹窗"存为我的中间件"
+        远程模板可执行容器启动和健康检查命令，请使用可信发布地址。已导出/构建的方案保留模板快照。
       </div>
     </section>
 
@@ -537,14 +550,14 @@ function removeMirror(index: number) {
       <div class="flex items-center gap-3 flex-wrap">
         <button
           class="px-4 py-1.5 rounded-lg text-xs font-bold border border-primary/50 text-primary hover:bg-primary/10 transition-colors"
-          :disabled="backing"
+          :disabled="backing || saving"
           @click="handleBackupData"
         >
           备份方案与设置（zip）
         </button>
         <button
           class="px-4 py-1.5 rounded-lg text-xs font-bold border border-outline-variant text-on-surface-variant hover:border-primary hover:text-primary transition-colors"
-          :disabled="backing"
+          :disabled="backing || saving"
           @click="handleRestoreData"
         >
           从备份恢复
@@ -573,7 +586,7 @@ function removeMirror(index: number) {
     <div class="flex justify-end">
       <button
         class="px-8 py-2.5 rounded-xl font-headline font-bold text-xs uppercase tracking-wider transition-all bg-gradient-to-br from-primary to-primary-dim text-on-primary hover:opacity-90 active:scale-95 disabled:opacity-30"
-        :disabled="saving"
+        :disabled="saving || backing"
         @click="handleSave"
       >
         {{ saving ? '保存中…' : '保存设置' }}

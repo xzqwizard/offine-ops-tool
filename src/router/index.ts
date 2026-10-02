@@ -1,4 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { useProjectStore } from '@/stores/project'
+import { ElMessage } from 'element-plus'
+import { toAppError } from '@/api/backend'
 import AppLayout from '@/components/layout/AppLayout.vue'
 
 const router = createRouter({
@@ -43,4 +46,9 @@ const router = createRouter({
   ]
 })
 
+router.beforeEach(async (to, from) => {
+  if (to.fullPath === from.fullPath) return true
+  try { await useProjectStore().flushPending(); return true }
+  catch (e) { ElMessage.error(`保存失败，已保留当前页面: ${toAppError(e).message}`); return false }
+})
 export default router

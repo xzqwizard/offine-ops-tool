@@ -7,6 +7,14 @@ export interface BuildHistoryImage {
 }
 
 export interface BuildHistoryServer {
+  serverId: string
+  osFamily: string
+  osVersion: string
+  dockerVersion: string
+  dockerDataRoot: string
+  deployBaseDir: string
+  ip: string
+  changedImageCount: number
   name: string
   arch: string
   dirName: string
@@ -16,6 +24,8 @@ export interface BuildHistoryServer {
 }
 
 export interface BuildHistoryEntry {
+  schemaVersion: number
+  status: string
   buildId: string
   projectId: string
   projectName: string

@@ -1,6 +1,8 @@
 // 与 src-tauri/src/docker_pkgs.rs 对应
 
 export interface DockerPkgEntry {
+  osFamily: string
+  osVersion: string
   id: string
   arch: string
   kind: 'rpm' | 'deb' | 'static' | string

@@ -1,54 +1,31 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { useBuildTaskStore } from '@/stores/buildTask'
+import { formatTime } from '@/utils/time'
 import { useProjectStore } from '@/stores/project'
 import { backend, toAppError } from '@/api/backend'
-import { validateProject, hasBlockingErrors, type ValidationIssue } from '@/utils/validate'
+import { hasBlockingErrors } from '@/utils/validate'
 import type { MiddlewareTemplate } from '@/types/catalog'
-import type { BuildResult, BuildProgressEvent } from '@/types/build'
 import type { BuildHistoryEntry } from '@/types/buildHistory'
 
 const store = useProjectStore()
 const router = useRouter()
 const templates = ref<MiddlewareTemplate[]>([])
 const artifactRoot = ref('')
-const building = ref(false)
-const logs = ref<string[]>([])
-const result = ref<BuildResult | null>(null)
-let unlisten: UnlistenFn | null = null
-let disposed = false
-
+const tasks = useBuildTaskStore()
+const building = computed(() => tasks.busy)
+const logs = computed(() => tasks.records[store.project?.id ?? '']?.logs ?? [])
+const result = computed(() => tasks.records[store.project?.id ?? '']?.result ?? null)
 onMounted(async () => {
-  try {
-    templates.value = (await backend.listCatalog()).templates
-    const storage = await backend.getStorageInfo()
-    artifactRoot.value = storage.artifactRoot
-  } catch (e) {
-    ElMessage.error(`初始化失败: ${toAppError(e).message}`)
-  }
-  await refreshHistory()
-  listen<BuildProgressEvent>('build-progress', (event) => {
-    const { step, detail } = event.payload
-    const icon =
-      step === 'error' ? '✗' : step === 'done' ? '✓' : step === 'image' || step === 'package' ? '  ' : '→'
-    logs.value.push(`${icon} ${detail}`)
-  }).then((fn) => {
-    // 竞态防护：await 期间组件可能已卸载，立即注销
-    if (disposed) fn()
-    else unlisten = fn
-  })
-})
-
-onUnmounted(() => {
-  disposed = true
-  unlisten?.()
+  try { templates.value = (await backend.listCatalog()).templates; artifactRoot.value = (await backend.getStorageInfo()).artifactRoot }
+  catch (e) { ElMessage.error(`初始化失败: ${toAppError(e).message}`) }
 })
 
 const format = computed({
   get: () => store.project?.buildConfig.packageFormat ?? 'tar.gz',
-  set: (v: string) => store.scheduleSave((p) => (p.buildConfig.packageFormat = v))
+  set: (v: 'dir' | 'tar.gz') => store.scheduleSave((p) => (p.buildConfig.packageFormat = v))
 })
 
 const recompress = computed({
@@ -66,13 +43,15 @@ const baselineBuildId = ref<string | null>(null)
 // ---- 构建历史 ----
 const history = ref<BuildHistoryEntry[]>([])
 const historyLoading = ref(false)
+watch(() => store.project?.id, () => { baselineBuildId.value = null; upgradeMode.value = false; refreshHistory() }, { immediate: true })
+
 
 async function refreshHistory() {
+  const projectId = store.project?.id
   historyLoading.value = true
   try {
-    history.value = (await backend.listBuildHistory()).filter(
-      (h) => h.projectId === store.project?.id
-    )
+    const entries = await backend.listBuildHistory()
+    if (projectId === store.project?.id) history.value = entries.filter(h => h.projectId === projectId)
   } catch {
     history.value = []
   } finally {
@@ -85,9 +64,12 @@ const currentProjectServers = computed(() => store.project?.servers ?? [])
 const baselineOptions = computed(() =>
   history.value.filter(
     (h) =>
-      h.kind === 'full' &&
+      h.status === 'complete' && h.schemaVersion === 2 &&
       h.servers.length === currentProjectServers.value.length &&
-      h.servers.every((bs) => currentProjectServers.value.some((s) => s.name === bs.name))
+      h.servers.every((bs) => currentProjectServers.value.some((s) =>
+        s.id === bs.serverId && s.arch === bs.arch && s.osFamily === bs.osFamily &&
+        s.osVersion === bs.osVersion && s.dockerVersion === bs.dockerVersion &&
+        s.dockerDataRoot === bs.dockerDataRoot && s.deployBaseDir === bs.deployBaseDir && s.ip === bs.ip))
   )
 )
 
@@ -150,103 +132,17 @@ async function deleteBuildEntry(entry: BuildHistoryEntry) {
   }
 }
 
-/** R10 预检：每台服务器需有匹配 (arch, dockerVersion) 的安装包组（rpm/deb/static 任一）
- *  且对应架构 compose 插件；否则产物到现场装不了 Docker（设计文档定为阻断级）。
- *  升级包模式跳过（目标机已具备 Docker 环境）。 */
-async function checkDockerPkgs(): Promise<string[]> {
-  if (upgradeMode.value) return []
-  const project = store.project!
-  const problems: string[] = []
-  let pkgs: { id: string }[] = []
-  let compose: { arch: string; installed: boolean }[] = []
-  try {
-    ;[pkgs, compose] = await Promise.all([backend.listDockerPkgs(), backend.listComposePlugins()])
-  } catch {
-    return [] // 库读取失败不阻断（后端构建时仍会告警）
-  }
-  for (const s of project.servers) {
-    const matched = pkgs.some((p) =>
-      p.id === `pkg-${s.arch}-rpm-${s.dockerVersion}` ||
-      p.id === `pkg-${s.arch}-deb-${s.dockerVersion}` ||
-      p.id === `pkg-${s.arch}-static-${s.dockerVersion}`
-    )
-    if (!matched) {
-      problems.push(`服务器「${s.name}」(Docker ${s.dockerVersion}/${s.arch}) 无匹配离线安装包`)
-    }
-    if (!compose.some((c) => c.arch === s.arch && c.installed)) {
-      problems.push(`服务器「${s.name}」缺 ${s.arch} 架构 docker compose 插件`)
-    }
-  }
-  return problems
-}
-
 async function handleBuild() {
-  if (!store.project) return
-  const issues: ValidationIssue[] = validateProject(store.project, templates.value)
-  if (hasBlockingErrors(issues)) {
-    ElMessage.error(`存在 ${issues.filter((i) => i.level === 'error').length} 个校验错误，请先在「校验」页签处理`)
-    return
-  }
-  // 磁盘空间预检：估算（已知镜像来源体积 ×2.5 冗余 + 1GB），不足时二次确认
+  if (!store.project || building.value) return
+  // Snapshot before any asynchronous work. The global store keeps this task alive across navigation.
+  const snapshot = JSON.parse(JSON.stringify(store.project))
+  const baseline = upgradeMode.value ? baselineBuildId.value : null
+  if (upgradeMode.value && !baseline) { ElMessage.error('请选择升级基线'); return }
   try {
-    const space = await backend.getDiskSpace(artifactRoot.value)
-    let estimated = 1024 * 1024 * 1024 // 基础 1GB
-    const cacheList = await backend.listImageCache().catch(() => [])
-    const missingPull = store.project.instances.filter((i) => {
-      if (i.localImageTar) return false
-      const arch = store.project!.servers.find((s) => s.id === i.serverId)?.arch
-      if (!arch) return true // 服务器已删除等异常：按需拉取保守估
-      return !cacheList.some((c) => c.reference === i.image && c.platform === `linux/${arch}`)
-    })
-    // 每个需在线拉取的镜像按 600MB 估算（实际体积前端不可知）
-    estimated += missingPull.length * 600 * 1024 * 1024
-    // 本地 tar 镜像整份拷入产物（体积未知按 500MB/个保守估算）×2（缓存+产物两份）
-    const localTarCount = store.project.instances.filter((i) => i.localImageTar).length
-    estimated += localTarCount * 500 * 1024 * 1024 * 2
-    if (space.freeBytes < estimated) {
-      try {
-        await ElMessageBox.confirm(
-          `产物磁盘空间可能不足：预计需要约 ${(estimated / 1073741824).toFixed(1)} GB（在线拉取镜像大小未知按 600MB/个估算），` +
-            `${artifactRoot.value} 所在盘剩余 ${(space.freeBytes / 1073741824).toFixed(1)} GB。仍要继续构建吗？`,
-          '磁盘空间预检',
-          { type: 'warning', confirmButtonText: '继续构建', cancelButtonText: '取消' }
-        )
-      } catch {
-        return
-      }
-    }
-  } catch {
-    /* 空间查询失败不阻断构建 */
-  }
-  const pkgProblems = await checkDockerPkgs()
-  if (pkgProblems.length) {
-    ElMessage.error(`Docker 离线材料不全，已阻止构建：${pkgProblems.join('；')}。请到「Docker 安装包库」导入/下载`)
-    return
-  }
-  if (store.dirty) {
-    try {
-      await store.save()
-    } catch (e) {
-      ElMessage.error(`构建前保存方案失败: ${toAppError(e).message}`)
-      return
-    }
-  }
-  building.value = true
-  logs.value = []
-  result.value = null
-  try {
-    result.value = await backend.buildOfflinePackage(
-      store.project,
-      autoPull.value,
-      upgradeMode.value ? baselineBuildId.value : null
-    )
-    ElMessage.success(`构建完成: ${result.value.buildId}`)
+    await tasks.run(snapshot, autoPull.value, baseline, () => store.flushPending())
+    ElMessage.success('构建完成')
     await refreshHistory()
-  } catch (e) {
-    ElMessage.error(`构建失败: ${toAppError(e).message}`)
-  } finally {
-    building.value = false
-  }
+  } catch (e) { ElMessage.error(`构建失败: ${toAppError(e).message}`); await refreshHistory() }
 }
 
 function fmtSize(bytes: number): string {
@@ -255,9 +151,7 @@ function fmtSize(bytes: number): string {
   return `${(bytes / 1024).toFixed(0)} KB`
 }
 
-function fmtTime(iso: string): string {
-  return iso ? iso.replace('T', ' ').replace(/([+-]\d{2}:\d{2}|Z)$/, '') : '-'
-}
+const fmtTime = formatTime
 
 async function copyOutputDir() {
   if (!result.value) return
@@ -296,27 +190,17 @@ async function copyOutputDir() {
           <div class="text-xs text-on-surface-variant mb-1.5">镜像参与压缩</div>
           <el-switch v-model="recompress" />
           <div class="text-[10px] text-on-surface-variant/50 mt-1">
-            默认关闭：docker save 层已压缩，二次压缩收益小且耗时长
+            默认使用快速 gzip；开启后使用标准压缩，耗时更长
           </div>
         </div>
         <div>
           <div class="text-xs text-on-surface-variant mb-1.5">缺失镜像自动拉取</div>
           <el-switch v-model="autoPull" />
           <div class="text-[10px] text-on-surface-variant/50 mt-1">
-            本地 tar → 缓存 → 在线拉取（需在「镜像库」安装 crane 引擎）
+            开启时在线解析固定 digest；关闭时仅用验证过的缓存（需在「镜像库」安装 crane 引擎）
           </div>
         </div>
       </div>
-      <div class="flex justify-end mt-4">
-        <button
-          class="px-8 py-2.5 rounded-xl font-headline font-bold text-xs uppercase tracking-wider transition-all bg-gradient-to-br from-primary to-primary-dim text-on-primary hover:opacity-90 active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed"
-          :disabled="building || (upgradeMode && !baselineBuildId)"
-          @click="handleBuild"
-        >
-          {{ building ? '构建中…' : upgradeMode ? '生成升级包' : '开始构建离线包' }}
-        </button>
-      </div>
-
       <!-- 升级包模式 -->
       <div class="mt-4 pt-4 border-t border-outline-variant flex items-center gap-4 flex-wrap">
         <el-switch v-model="upgradeMode" @change="onUpgradeModeChange" />
@@ -340,7 +224,7 @@ async function copyOutputDir() {
           需选择基线构建（与基线比对，仅打包新增/变更的镜像）
         </span>
         <span v-if="upgradeMode && baselineBuildId" class="text-[10px] text-on-surface-variant/50">
-          现场：拷入原部署目录解压 → bash scripts/upgrade.sh（自动备份旧编排，失败可回退）
+          现场：解压到独立目录 → bash scripts/upgrade.sh --target 已部署目录（冷备份数据及旧镜像，失败自动回滚）
         </span>
       </div>
 
@@ -387,7 +271,7 @@ async function copyOutputDir() {
           <template #default="{ row }">{{ row.servers.length }}</template>
         </el-table-column>
         <el-table-column label="镜像变更" width="80" align="center">
-          <template #default="{ row }">{{ row.servers.reduce((s: number, x: any) => s + x.images.length, 0) }}</template>
+          <template #default="{ row }">{{ row.servers.reduce((s: number, x: any) => s + x.changedImageCount, 0) }}</template>
         </el-table-column>
         <el-table-column label="体积" width="90" align="right">
           <template #default="{ row }">
@@ -397,9 +281,9 @@ async function copyOutputDir() {
         <el-table-column label="操作" width="180" align="center">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="openBuildDir(row.dir)">打开目录</el-button>
-            <el-button link type="primary" size="small" @click="restoreFromBuild(row)">恢复方案</el-button>
+            <el-button link type="primary" size="small" :disabled="!row.hasSnapshot" @click="restoreFromBuild(row)">恢复方案</el-button>
             <el-button
-              v-if="row.kind === 'full'"
+              v-if="baselineOptions.some(h => h.buildId === row.buildId)"
               link
               type="primary"
               size="small"
@@ -448,7 +332,7 @@ async function copyOutputDir() {
           <div class="font-mono text-[11px] text-on-surface-variant break-all">
             {{ s.packageFile ?? s.dirName + '/（目录模式）' }}
           </div>
-          <div class="text-xs text-on-surface-variant mt-1">内嵌镜像 {{ s.images.length }} 个</div>
+          <div class="text-xs text-on-surface-variant mt-1">内嵌镜像 {{ s.images.filter(i => i.packed).length }} 个；当前有效镜像 {{ s.images.length }} 个</div>
           <div v-for="w in s.warnings" :key="w" class="text-xs text-warning mt-1">⚠ {{ w }}</div>
         </div>
       </div>

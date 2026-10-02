@@ -140,7 +140,7 @@ async function handleExport(id: string, name: string) {
     })
     if (!path) return
     const msg = await backend.exportProject(id, path)
-    ElMessage.success(msg + '（含私有仓库凭据，注意文件保管）')
+    ElMessage.success(msg + '（已排除仓库及中间件密码，导入后需重新填写）')
   } catch (e) {
     ElMessage.error(`导出失败: ${toAppError(e).message}`)
   }
