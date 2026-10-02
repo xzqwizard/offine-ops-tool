@@ -23,6 +23,10 @@ services:
 {% if inst.data_user %}
     user: "{{ inst.data_user }}"
 {% endif %}
+{% if inst.depends %}
+    depends_on:
+{% for d in inst.depends %}      - "{{ d }}"
+{% endfor %}{% endif %}
 {% if inst.env %}
     environment:
 {% for e in inst.env %}      {{ e.k }}: '{{ e.v }}'

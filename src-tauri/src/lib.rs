@@ -1,3 +1,4 @@
+pub mod app_ops;
 pub mod builder;
 pub mod build_history;
 pub mod catalog;
@@ -30,6 +31,9 @@ pub fn run() {
             commands::backup_app_data,
             commands::restore_app_data,
             catalog::list_catalog,
+            catalog::save_custom_template,
+            catalog::delete_custom_template,
+            catalog::fetch_remote_catalog,
             builder::build_offline_package,
             docker_versions::list_docker_versions,
             net::test_network,
@@ -50,7 +54,49 @@ pub fn run() {
             build_history::list_build_history,
             build_history::delete_build,
             build_history::open_dir_in_explorer,
+            app_ops::list_audit_log,
+            app_ops::restore_project_from_build,
+            app_ops::export_project,
+            app_ops::import_project,
+            app_ops::analyze_cache_usage,
+            app_ops::purge_unref_cache,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ==================== CLI 构建支持 ====================
+
+/// CLI 模式构建（main.rs --build 调用）：初始化最小 Tauri 应用获取路径上下文，
+/// 结果写入 <cwd>/build-cli-result.txt，随后退出进程
+pub fn run_cli_build(project_id: &str) -> String {
+    let code = project_id.to_string();
+    tauri::Builder::default()
+        .setup(move |app| {
+            let handle = app.handle().clone();
+            let code2 = code.clone();
+            let result = std::thread::spawn(move || {
+                let proj = match store::load_project(&handle, &code2) {
+                    Ok(p) => p,
+                    Err(e) => return format!("[cli] 加载方案失败: {e}"),
+                };
+                match builder::build_inner(&handle, &proj, true, None) {
+                    Ok(r) => format!(
+                        "[cli] 构建完成: {}
+[cli] 产物: {}
+[cli] 服务器: {} 台",
+                        r.build_id, r.output_dir, r.servers.len()
+                    ),
+                    Err(e) => format!("[cli] 构建失败: {e}"),
+                }
+            })
+            .join()
+            .unwrap_or_else(|_| "[cli] 构建线程异常".into());
+            let _ = std::fs::write("build-cli-result.txt", &result);
+            println!("{result}");
+            std::process::exit(0);
+        })
+        .run(tauri::generate_context!())
+        .expect("cli build failed");
+    unreachable!()
 }

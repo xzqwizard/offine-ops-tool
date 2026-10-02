@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRouter } from 'vue-router'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useProjectStore } from '@/stores/project'
 import { backend, toAppError } from '@/api/backend'
@@ -10,6 +11,7 @@ import type { BuildResult, BuildProgressEvent } from '@/types/build'
 import type { BuildHistoryEntry } from '@/types/buildHistory'
 
 const store = useProjectStore()
+const router = useRouter()
 const templates = ref<MiddlewareTemplate[]>([])
 const artifactRoot = ref('')
 const building = ref(false)
@@ -103,6 +105,25 @@ async function openBuildDir(dir: string) {
     await backend.openDirInExplorer(dir)
   } catch (e) {
     ElMessage.error(`打开目录失败: ${toAppError(e).message}`)
+  }
+}
+
+async function restoreFromBuild(entry: BuildHistoryEntry) {
+  try {
+    await ElMessageBox.confirm(
+      `从构建 ${entry.buildId} 的快照恢复为的新方案？（当前方案不受影响）`,
+      '恢复方案',
+      { type: 'info', confirmButtonText: '恢复', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  try {
+    const p = await backend.restoreProjectFromBuild(entry.dir)
+    ElMessage.success(`已恢复为「${p.name}」`)
+    router.push({ name: 'project-edit', params: { id: p.id } })
+  } catch (e) {
+    ElMessage.error(`恢复失败: ${toAppError(e).message}`)
   }
 }
 
@@ -376,6 +397,7 @@ async function copyOutputDir() {
         <el-table-column label="操作" width="180" align="center">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="openBuildDir(row.dir)">打开目录</el-button>
+            <el-button link type="primary" size="small" @click="restoreFromBuild(row)">恢复方案</el-button>
             <el-button
               v-if="row.kind === 'full'"
               link

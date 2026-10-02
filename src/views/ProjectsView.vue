@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
@@ -129,6 +130,41 @@ async function handleDelete(id: string, name: string) {
   }
 }
 
+async function handleExport(id: string, name: string) {
+  if (!('__TAURI_INTERNALS__' in window)) return
+  try {
+    const path = await saveFileDialog({
+      title: '导出方案',
+      defaultPath: `${name}.oppjson`,
+      filters: [{ name: '方案文件', extensions: ['oppjson'] }]
+    })
+    if (!path) return
+    const msg = await backend.exportProject(id, path)
+    ElMessage.success(msg + '（含私有仓库凭据，注意文件保管）')
+  } catch (e) {
+    ElMessage.error(`导出失败: ${toAppError(e).message}`)
+  }
+}
+
+async function handleImport() {
+  if (!('__TAURI_INTERNALS__' in window)) return
+  try {
+    const files = await openFileDialog({
+      multiple: false,
+      title: '导入方案文件',
+      filters: [{ name: '方案文件', extensions: ['oppjson'] }]
+    })
+    const path = Array.isArray(files) ? files[0] : files
+    if (!path) return
+    const p = await backend.importProject(path)
+    ElMessage.success(`已导入「${p.name}」（服务器 IP 沿用原值，可再编辑）`)
+    await store.refreshSummaries()
+    router.push({ name: 'project-edit', params: { id: p.id } })
+  } catch (e) {
+    ElMessage.error(`导入失败: ${toAppError(e).message}`)
+  }
+}
+
 function openProject(id: string) {
   router.push({ name: 'project-edit', params: { id } })
 }
@@ -148,6 +184,12 @@ function fmtTime(iso: string) {
         @click="createOpen = true"
       >
         + 新建方案
+      </button>
+      <button
+        class="px-5 py-2 rounded-xl text-xs font-bold border border-outline-variant text-on-surface-variant hover:border-primary hover:text-primary transition-colors"
+        @click="handleImport"
+      >
+        导入方案
       </button>
     </div>
 
@@ -185,10 +227,11 @@ function fmtTime(iso: string) {
             <span class="font-mono text-xs text-on-surface-variant">{{ fmtTime(row.updatedAt) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="170" align="center">
+        <el-table-column label="操作" width="210" align="center">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="openProject(row.id)">打开</el-button>
             <el-button link type="primary" size="small" @click="openClone(row.id, row.name)">复制</el-button>
+            <el-button link type="primary" size="small" @click="handleExport(row.id, row.name)">导出</el-button>
             <el-button link type="danger" size="small" @click="handleDelete(row.id, row.name)">
               删除
             </el-button>

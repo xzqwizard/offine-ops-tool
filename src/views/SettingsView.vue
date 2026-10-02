@@ -200,6 +200,41 @@ async function pickDirectory(field: 'projectsRoot' | 'imageCacheRoot' | 'dockerP
 // ---- 工具数据备份（方案与设置，不含镜像缓存/产物） ----
 const backing = ref(false)
 
+// ---- 目录远程更新 / 审计日志 ----
+const catalogUrl = ref('')
+const catalogUpdating = ref(false)
+const auditOpen = ref(false)
+const auditLines = ref<string[]>([])
+const auditLoading = ref(false)
+
+async function handleFetchCatalog() {
+  if (!catalogUrl.value.trim()) {
+    ElMessage.warning('请输入目录 JSON 的 URL')
+    return
+  }
+  catalogUpdating.value = true
+  try {
+    const msg = await backend.fetchRemoteCatalog(catalogUrl.value.trim())
+    ElMessage.success(msg)
+  } catch (e) {
+    ElMessage.error(`目录更新失败: ${toAppError(e).message}`)
+  } finally {
+    catalogUpdating.value = false
+  }
+}
+
+async function openAudit() {
+  auditOpen.value = true
+  auditLoading.value = true
+  try {
+    auditLines.value = await backend.listAuditLog()
+  } catch (e) {
+    auditLines.value = [`读取失败: ${toAppError(e).message}`]
+  } finally {
+    auditLoading.value = false
+  }
+}
+
 async function handleBackupData() {
   if (!('__TAURI_INTERNALS__' in window)) return
   try {
@@ -448,6 +483,49 @@ function removeMirror(index: number) {
             使用界面当前配置测试（无需先保存）；401 状态即代表源可达
           </span>
         </div>
+      </div>
+    </section>
+
+    <!-- 中间件目录更新 -->
+    <section class="bg-surface-container-low rounded-xl border border-outline-variant p-5 mb-6">
+      <h3 class="text-sm font-headline font-bold text-primary uppercase tracking-widest mb-3">
+        中间件目录
+      </h3>
+      <div class="flex gap-2">
+        <el-input
+          v-model="catalogUrl"
+          placeholder="目录 JSON 地址（如公司 GitLab Pages / 静态文件 URL）"
+          class="font-mono"
+          @keyup.enter="handleFetchCatalog"
+        />
+        <button
+          class="px-4 py-1 rounded-lg text-xs font-bold border border-primary/50 text-primary hover:bg-primary/10 transition-colors shrink-0"
+          :disabled="catalogUpdating"
+          @click="handleFetchCatalog"
+        >
+          {{ catalogUpdating ? '更新中…' : '检查并应用' }}
+        </button>
+      </div>
+      <div class="text-[10px] text-on-surface-variant/50 mt-2">
+        远程目录条目合入本地（同 id 覆盖内置），新增中间件模板无需发版应用；手动输入的镜像也可在实例弹窗"存为我的中间件"
+      </div>
+    </section>
+
+    <!-- 操作审计日志 -->
+    <section class="bg-surface-container-low rounded-xl border border-outline-variant p-5 mb-6">
+      <div class="flex items-center justify-between">
+        <h3 class="text-sm font-headline font-bold text-primary uppercase tracking-widest">
+          操作审计日志
+        </h3>
+        <button
+          class="px-4 py-1 rounded-lg text-xs font-bold border border-outline-variant text-on-surface-variant hover:border-primary hover:text-primary transition-colors"
+          @click="openAudit"
+        >
+          查看最近操作
+        </button>
+      </div>
+      <div class="text-[10px] text-on-surface-variant/50 mt-2">
+        构建/删除/导入导出/恢复等关键操作留痕（本地 audit.log，保留全部）
       </div>
     </section>
 

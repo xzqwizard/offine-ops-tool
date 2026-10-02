@@ -24,4 +24,5 @@ export interface BuildHistoryEntry {
   servers: BuildHistoryServer[]
   dir: string
   totalSizeBytes: number
+  hasSnapshot?: boolean
 }

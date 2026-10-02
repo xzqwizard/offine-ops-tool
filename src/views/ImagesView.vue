@@ -20,6 +20,8 @@ const pullTotal = ref(0)
 const installing = ref(false)
 const installLogs = ref<string[]>([])
 const cache = ref<CachedImage[]>([])
+const cacheUsage = ref<Map<string, string[]>>(new Map())
+const purging = ref(false)
 const cacheLoading = ref(false)
 
 // 手动拉取表单
@@ -79,7 +81,13 @@ async function refreshEngine() {
 async function refreshCache() {
   cacheLoading.value = true
   try {
-    cache.value = await backend.listImageCache()
+    ;[cache.value] = await Promise.all([backend.listImageCache()])
+    backend
+      .analyzeCacheUsage()
+      .then((usage) => {
+        cacheUsage.value = new Map(usage.map((u) => [u.file, u.referencedBy]))
+      })
+      .catch(() => {})
   } catch (e) {
     ElMessage.error(`缓存列表读取失败: ${toAppError(e).message}`)
   } finally {
@@ -140,6 +148,39 @@ function fmtSpeed(bps: number): string {
   if (bps >= 1048576) return `${(bps / 1048576).toFixed(1)} MB/s`
   if (bps >= 1024) return `${(bps / 1024).toFixed(0)} KB/s`
   return `${bps} B/s`
+}
+
+async function handlePurgeUnref() {
+  const unrefCount = cache.value.filter(
+    (c) => !(cacheUsage.value.get(c.file)?.length ?? 0)
+  ).length
+  if (!unrefCount) {
+    ElMessage.info('没有未被引用的缓存镜像')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `清理 ${unrefCount} 个未被任何方案引用的缓存镜像？`,
+      '一键清理',
+      { type: 'warning', confirmButtonText: '清理', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  purging.value = true
+  try {
+    const freed = await backend.purgeUnrefCache()
+    ElMessage.success(`已清理，释放 ${(freed / 1048576).toFixed(1)} MB`)
+    await refreshCache()
+  } catch (e) {
+    ElMessage.error(`清理失败: ${toAppError(e).message}`)
+  } finally {
+    purging.value = false
+  }
+}
+
+function refLabels(c: CachedImage): string {
+  return cacheUsage.value.get(c.file)?.join('、') ?? '—'
 }
 
 async function handleDelete(c: CachedImage) {
@@ -281,12 +322,21 @@ function fmtTime(iso: string): string {
         <h3 class="text-sm font-headline font-bold text-primary uppercase tracking-widest">
           本地缓存（{{ cache.length }} 个 · {{ fmtSize(totalSize) }}）
         </h3>
-        <button
-          class="text-xs text-on-surface-variant hover:text-primary transition-colors"
-          @click="refreshCache"
-        >
-          刷新
-        </button>
+        <div class="flex gap-3">
+          <button
+            class="text-xs text-warning hover:opacity-70 transition-opacity"
+            :disabled="purging"
+            @click="handlePurgeUnref"
+          >
+            {{ purging ? '清理中…' : '一键清理未引用' }}
+          </button>
+          <button
+            class="text-xs text-on-surface-variant hover:text-primary transition-colors"
+            @click="refreshCache"
+          >
+            刷新
+          </button>
+        </div>
       </div>
       <div class="bg-surface-container-low rounded-xl border border-outline-variant">
         <el-table
@@ -308,6 +358,14 @@ function fmtTime(iso: string): string {
           <el-table-column label="大小" width="90" align="right">
             <template #default="{ row }">
               <span class="font-mono text-xs">{{ fmtSize(row.sizeBytes) }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="被方案引用" min-width="140" show-overflow-tooltip>
+            <template #default="{ row }">
+              <span v-if="(cacheUsage.get(row.file)?.length ?? 0)" class="text-xs">{{
+                refLabels(row)
+              }}</span>
+              <span v-else class="text-xs text-warning">未引用</span>
             </template>
           </el-table-column>
           <el-table-column label="拉取时间" width="150">

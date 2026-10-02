@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useProjectStore } from '@/stores/project'
 import { backend, toAppError } from '@/api/backend'
 import type { MiddlewareTemplate } from '@/types/catalog'
@@ -155,6 +155,54 @@ const onlineArchOk = computed<boolean | null>(() => {
     (a) => a === base || a.startsWith(`${base}:`) || a.startsWith(`${base}/`)
   )
 })
+
+const savingTpl = ref(false)
+
+/** 手动输入的镜像存为"我的中间件"（下次目录直接选） */
+async function saveAsCustom() {
+  if (!customImage.value.trim()) {
+    ElMessage.warning('请先填写镜像引用')
+    return
+  }
+  const displayName = instanceName.value.trim() || customImage.value.split('/').pop() || '自定义'
+  try {
+    await ElMessageBox.prompt('保存名称（目录中显示）', '存为我的中间件', {
+      inputValue: displayName,
+      confirmButtonText: '保存',
+      cancelButtonText: '取消'
+    }).then(async ({ value }) => {
+      if (!value.trim()) return
+      savingTpl.value = true
+      const tpl = {
+        id: `custom-${customImage.value.replace(/[^a-zA-Z0-9]/g, '-').slice(0, 40)}`,
+        displayName: value.trim(),
+        category: '我的中间件',
+        defaultImage: customImage.value.trim().replace(/:[^:@/]+$/, ''),
+        recommendedTags: [],
+        supportedArches: [],
+        ports: ports.value.map((p) => ({
+          name: p.name, container: p.container, defaultHost: p.host, protocol: p.protocol
+        })),
+        envHints: Object.keys(params.value).map((k) => ({ key: k, label: k, secret: false, required: false, default: '' })),
+        dataVolume: '/data',
+        dataUser: null,
+        command: [],
+        dependsOn: [],
+        healthCheck: inspect.value && inspectRef.value === currentReference.value ? { type: 'exec', cmd: ['sh', '-c', 'true'] } : null,
+        healthTimeoutSec: 60,
+        minMemoryGb: 0.5,
+        kernelReqs: [],
+        remark: `自定义：${customImage.value.trim()}`
+      }
+      await backend.saveCustomTemplate(tpl, '我的中间件')
+      ElMessage.success(`已保存「${value.trim()}」，下次可从目录直接选择`)
+    })
+  } catch {
+    /* 取消 */
+  } finally {
+    savingTpl.value = false
+  }
+}
 
 /** 切到手动输入时自动带入当前引用，方便在架构不匹配时直接改镜像地址 */
 watch(mode, (m) => {
@@ -610,8 +658,16 @@ function handleSave() {
             placeholder="如：registry.example.cn/gov/app:2.3.1 或 nginx:1.25.3"
             class="font-mono"
           />
-          <div class="text-xs text-on-surface-variant mt-1">
-            支持完整语法 registry/repo:tag（可含 @sha256: 摘要）
+          <div class="flex items-center gap-2 mt-1">
+            <span class="text-xs text-on-surface-variant">支持完整语法 registry/repo:tag（可含 @sha256: 摘要）</span>
+            <button
+              type="button"
+              class="text-xs text-primary hover:underline"
+              :disabled="savingTpl"
+              @click="saveAsCustom"
+            >
+              ★ 存为我的中间件
+            </button>
           </div>
         </el-form-item>
         <el-form-item label="实例名" required>

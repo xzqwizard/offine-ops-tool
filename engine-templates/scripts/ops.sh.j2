@@ -27,8 +27,9 @@ usage() {
   logs     <svc> [-f] [--tail N]   查看日志
   exec     <svc> [cmd...]          进入容器执行命令
   stats             资源占用（CPU/内存/网络）
-  backup            备份数据卷到 backup/ 目录（tar 快照）
+  backup            备份（数据库先逻辑导出，再文件级快照兜底）
   cron-backup       配置每日 02:00 自动备份
+  report            生成部署验收回执（机器/容器/端口状态）
   doctor            全面诊断（容器/端口/磁盘/日志错误关键字）
   config            显示编排关键信息（不含密码）
   version           本包信息
@@ -108,6 +109,12 @@ cmd_backup() {
   DEST="$BACKUP_DIR/$TS"
   mkdir -p "$DEST"
   echo "备份到: $DEST"
+  # 数据库类先做逻辑备份（对运行中的库直接 tar 数据目录有一致性风险，
+  # 恢复出的库可能损坏；逻辑导出才是可信赖的恢复来源）
+{% for lb in logical_backups %}
+  {{ lb }}
+{% endfor %}
+  # 文件级快照兜底（含非数据库服务的数据目录）
   for S in $(svc_all); do
     SRC="$BASE_DIR/stack/data/$S"
     if [ -d "$SRC" ]; then
@@ -115,10 +122,37 @@ cmd_backup() {
       echo "  [✓] $S -> ${S}.tar.gz ($(du -h "$DEST/${S}.tar.gz" | cut -f1))"
     fi
   done
-  # 数据库类中间件建议优先使用逻辑导出（mysqldump 等），此处为文件级快照兜底
-  echo "提示: 数据库建议使用逻辑备份（见 docs/OPS-GUIDE.md 各中间件章节）"
   # 仅保留最近 5 份
   ls -1dt "$BACKUP_DIR"/*/ 2>/dev/null | tail -n +6 | xargs -r rm -rf
+}
+
+cmd_report() {
+  # 部署验收回执：机器信息 + 容器清单 + 健康状态（现场签收存档用）
+  REPORT="$LOG_DIR/acceptance-$(date '+%Y%m%d-%H%M%S').txt"
+  {
+    echo "========== 部署验收回执 =========="
+    echo "方案: {{ project_name }}    服务器: {{ server.name }} ({{ server.arch }})"
+    echo "构建: {{ build_id }}"
+    echo "主机: $(hostname)  $(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "系统: $(uname -sr)  Docker: $(docker --version 2>/dev/null | head -1)"
+    echo "时间: $(date '+%F %T')"
+    echo
+    echo "---------- 容器状态 ----------"
+    c ps
+    echo
+    echo "---------- 端口监听 ----------"
+    PORTS="{{ exposed_ports_csv }}"
+    for P in ${PORTS//,/ }; do
+      if ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":${P}$"; then
+        echo "  [OK] :$P"
+      else
+        echo "  [!!] :$P 未监听"
+      fi
+    done
+    echo
+    echo "经办人: ____________    日期: ____________"
+  } | tee "$REPORT"
+  echo "回执已保存: $REPORT"
 }
 
 cmd_config() {
@@ -140,6 +174,7 @@ case "${1:-menu}" in
   exec)    need_svc "${2:-}"; S="$2"; shift 2; c exec "$S" "${@:-sh}" ;;
   stats)   docker stats --no-stream $(docker compose -f "$COMPOSE_FILE" ps -q) 2>/dev/null || docker stats --no-stream ;;
   backup)  cmd_backup ;;
+  report)  cmd_report ;;
   cron-backup) cmd_cron_backup ;;
   doctor)  cmd_doctor ;;
   config)  cmd_config ;;
@@ -167,6 +202,7 @@ case "${1:-menu}" in
         7) cmd_backup ;;
         8) cmd_doctor ;;
         9) cmd_cron_backup ;;
+        r) cmd_report ;;
         0|*) exit 0 ;;
       esac
     done

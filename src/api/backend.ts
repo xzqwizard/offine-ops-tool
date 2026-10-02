@@ -68,6 +68,44 @@ export const backend = {
     return invoke<CatalogFile>('list_catalog')
   },
 
+  async saveCustomTemplate(template: unknown, category: string): Promise<CatalogFile> {
+    return invoke<CatalogFile>('save_custom_template', { template, category })
+  },
+
+  async deleteCustomTemplate(id: string): Promise<CatalogFile> {
+    return invoke<CatalogFile>('delete_custom_template', { id })
+  },
+
+  async fetchRemoteCatalog(url: string): Promise<string> {
+    return invoke<string>('fetch_remote_catalog', { url })
+  },
+
+  async listAuditLog(): Promise<string[]> {
+    return invoke<string[]>('list_audit_log')
+  },
+
+  async restoreProjectFromBuild(dir: string): Promise<Project> {
+    return invoke<Project>('restore_project_from_build', { dir })
+  },
+
+  async exportProject(id: string, outputPath: string): Promise<string> {
+    return invoke<string>('export_project', { id, outputPath })
+  },
+
+  async importProject(inputPath: string): Promise<Project> {
+    return invoke<Project>('import_project', { inputPath })
+  },
+
+  async analyzeCacheUsage(): Promise<
+    { file: string; reference: string; platform: string; sizeBytes: number; referencedBy: string[] }[]
+  > {
+    return invoke('analyze_cache_usage')
+  },
+
+  async purgeUnrefCache(): Promise<number> {
+    return invoke<number>('purge_unref_cache')
+  },
+
   async listDockerVersions(arch: string): Promise<string[]> {
     return invoke<string[]>('list_docker_versions', { arch })
   },
