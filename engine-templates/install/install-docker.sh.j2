@@ -9,7 +9,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PKG_DIR="$HERE/packages"
-TARGET_VER="{{ server.docker_version }}"
+TARGET_VER={{ server.docker_version | shq }}
 
 step() { echo -e "\033[1;36m==> $1\033[0m"; }
 ok()   { echo -e "    \033[32m✓ $1\033[0m"; }
@@ -48,7 +48,10 @@ if [ "$SKIP_ENGINE" -eq 0 ]; then
   elif ls "$PKG_DIR"/docker-*.tgz >/dev/null 2>&1; then
     # 官方静态二进制
     TMP=$(mktemp -d)
-    tar -xzf "$PKG_DIR"/docker-*.tgz -C "$TMP"
+    trap 'rm -rf -- "$TMP"' EXIT
+    mapfile -t tgz < <(find "$PKG_DIR" -maxdepth 1 -name 'docker-*.tgz')
+    [ {% raw %}"${#tgz[@]}"{% endraw %} -eq 1 ] || bad "静态包必须唯一"
+    tar -xzf "${tgz[0]}" -C "$TMP"
     cp -f "$TMP"/docker/* /usr/bin/
     cat > /etc/systemd/system/docker.service <<'UNIT'
 [Unit]
@@ -70,18 +73,18 @@ UNIT
   # ---------- daemon.json ----------
   mkdir -p /etc/docker
   if [ ! -f /etc/docker/daemon.json ]; then
-    cat > /etc/docker/daemon.json <<JSON
+    cat > /etc/docker/daemon.json <<'JSON'
 {
-  "data-root": "{{ server.docker_data_root }}",
+  "data-root": {{ server.docker_data_root | jsonstr }},
   "log-driver": "json-file",
   "log-opts": { "max-size": "100m", "max-file": "3" }
 }
 JSON
-    ok "已写入 /etc/docker/daemon.json（data-root={{ server.docker_data_root }}，日志轮转 100m×3）"
+    ok "已写入 /etc/docker/daemon.json（日志轮转 100m×3）"
   else
-    echo "    /etc/docker/daemon.json 已存在，未改动（如需 data-root={{ server.docker_data_root }} 请人工确认）"
+    echo "    /etc/docker/daemon.json 已存在，未改动（数据目录请人工确认）"
   fi
-  mkdir -p "{{ server.docker_data_root }}"
+  mkdir -p {{ server.docker_data_root | shq }}
 
   # ---------- 启动与自检 ----------
   systemctl enable docker >/dev/null 2>&1 || true

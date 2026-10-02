@@ -32,6 +32,9 @@ serde_yaml = "0.9.34"
 fs2 = "0.4.3"
 zip = "8.6.0"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

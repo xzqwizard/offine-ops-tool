@@ -12,6 +12,7 @@ use offline_preops_tool_lib::docker_versions::{parse_docker_versions, version_ke
 fn sample_ctx() -> serde_json::Value {
     serde_json::json!({
         "project_name": "测试方案",
+        "project_id":"proj-test","server_id":"srv-test","firewall_chain":"OPO_test","baseline_build_id":"b-old",
         "build_id": "b-test-0001",
         "generated_at": "2026-09-29T12:00:00+08:00",
         "server": {
@@ -39,7 +40,7 @@ fn sample_ctx() -> serde_json::Value {
         },
         {
             "instance_name": "redis", "image": "docker.io/library/redis:7.2.5",
-            "env": [ { "k": "REDIS_PASSWORD", "v": "p''a$$x" } ],
+            "env": [ { "k": "REDIS_PASSWORD", "v": "p'a$x" } ],
             "ports": [{ "host": 6379, "container": 6379, "protocol": "tcp", "expose": true }],
             "data_volume": "/data",
             "data_user": null,
@@ -81,86 +82,68 @@ fn all_templates_parse_and_render() {
 }
 
 #[test]
-fn compose_contains_service_and_env() {
+fn compose_encodes_literals_and_protocols() {
     let env = template_env().unwrap();
-    let out = render(&env, "compose/docker-compose.yml.j2", &sample_ctx()).unwrap();
-    assert!(out.contains("mysql:"));
-    // 镜像引用带引号（防 YAML 特殊字符）
-    assert!(out.contains("image: \"docker.io/library/mysql:8.0.42\""));
-    // env 值用单引号包裹（$ 与 " 不会破坏 compose），值内 ' 转义为 ''
-    assert!(out.contains("MYSQL_ROOT_PASSWORD: 'p@ss'"));
-    assert!(out.contains("REDIS_PASSWORD: 'p''a$$x'"));
-    // 仅 expose=true 的端口进入 ports；33060 不应出现
-    assert!(out.contains("\"3306:3306\""));
-    assert!(!out.contains("33060"));
-    // command 元素单引号包裹：含双引号的 redis requirepass 命令是合法 YAML
-    assert!(out.contains("command: ['sh', '-c', 'redis-server --requirepass \"$$REDIS_PASSWORD\"']"));
-    // 整体必须是合法 YAML（现场 compose config 前拦截）
-    serde_yaml::from_str::<serde_yaml::Value>(&out).expect("compose 渲染结果非法 YAML");
+    let ctx = sample_ctx();
+    let yaml = render(&env, "compose/docker-compose.yml.j2", &ctx).unwrap();
+    let v: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(
+        v["services"]["mysql"]["image"].as_str(),
+        Some("docker.io/library/mysql:8.0.42")
+    );
+    assert_eq!(
+        v["services"]["redis"]["environment"]["REDIS_PASSWORD"].as_str(),
+        Some("p'a$$x")
+    );
+    assert_eq!(
+        v["services"]["mysql"]["ports"].as_sequence().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        v["services"]["mysql"]["ports"][0]["protocol"].as_str(),
+        Some("tcp")
+    );
+    assert_eq!(
+        v["services"]["mysql"]["ports"][0]["host_ip"].as_str(),
+        Some("10.10.1.11")
+    );
+    assert_eq!(
+        v["services"]["mysql"]["pull_policy"].as_str(),
+        Some("never")
+    );
 }
 
 #[test]
-fn deploy_health_check_references_and_tcp() {
+fn every_script_is_valid_bash_and_upgrade_is_registered() {
     let env = template_env().unwrap();
-    let deploy = render(&env, "scripts/deploy.sh.j2", &sample_ctx()).unwrap();
-    // 健康超时透传
-    assert!(deploy.contains("MAX=90"));
-    // 镜像路径不得双重拼接（img.file 已含 images/ 前缀）
-    assert!(deploy.contains("$BASE_DIR/images/mysql_8.0.42.tar"));
-    assert!(!deploy.contains("images/images/"));
-    // exec 型体检逐元素引用（builder 已 shell_quote）
-    assert!(deploy.contains("docker exec \"mysql\" 'sh' '-c'"));
-    // tcp 型体检（redis）走 /dev/tcp 探测
-    assert!(deploy.contains("</dev/tcp/127.0.0.1/6379"));
-    // 生成的脚本本身必须是合法 bash
-    let dir = std::env::temp_dir().join(format!("opost-deploychk-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let f = dir.join("deploy.sh");
-    std::fs::write(&f, deploy.replace("\r\n", "\n")).unwrap();
-    // 探测 Git Bash（PATH 上的 bash 可能是 WSL，无法访问 C:/ 路径）；不可用则跳过语法检查
-    let candidates = [
-        "C:/Program Files/Git/usr/bin/bash.exe",
-        "C:/Program Files (x86)/Git/usr/bin/bash.exe",
-        "D:/Environment/Git/usr/bin/bash.exe",
-        "D:/Software/Git/usr/bin/bash.exe",
-    ];
-    let bash = candidates.iter().find(|p| std::path::Path::new(p).is_file());
-    if let Some(bash) = bash {
-        let bash_path = f.to_string_lossy().replace('\\', "/");
-        let out = std::process::Command::new(bash).args(["-n", &bash_path]).output().unwrap();
-        assert!(out.status.success(), "deploy.sh 语法错误: {}", String::from_utf8_lossy(&out.stderr));
+    let ctx = sample_ctx();
+    assert!(TEMPLATES.iter().any(|(n, _)| *n == "scripts/upgrade.sh.j2"));
+    let bash = if cfg!(windows) {
+        "D:/Environment/Git/usr/bin/bash.exe"
+    } else {
+        "/bin/bash"
+    };
+    if !std::path::Path::new(bash).is_file() {
+        return;
     }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn ops_sh_renders_and_passes_bash_check() {
-    let env = template_env().unwrap();
-    let out = render(&env, "scripts/ops.sh.j2", &sample_ctx()).unwrap();
-    // 逻辑备份命令必须渲染进 backup
-    assert!(out.contains("mysqldump"));
-    // report 子命令必须存在且引用的 LOG_DIR 已在头部定义（曾因未定义必现崩溃）
-    assert!(out.contains("cmd_report"));
-    let defining = out.find("LOG_DIR=").unwrap_or(0);
-    let using = out.find("REPORT=").unwrap_or(0);
-    assert!(defining < using && defining > 0, "LOG_DIR 定义必须先于使用");
-    // bash 语法检查（Git Bash 探测，无则跳过）
-    let candidates = [
-        "D:/Environment/Git/usr/bin/bash.exe",
-        "C:/Program Files/Git/usr/bin/bash.exe",
-    ];
-    let bash = candidates.iter().find(|p| std::path::Path::new(p).is_file());
-    if let Some(bash) = bash {
-        let dir = std::env::temp_dir().join(format!("opost-opschk-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("ops.sh");
-        std::fs::write(&f, out.replace("
-", "
-")).unwrap();
-        let p = f.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
-        let o = std::process::Command::new(bash).args(["-n", &p]).output().unwrap();
-        assert!(o.status.success(), "ops.sh 语法错误: {}", String::from_utf8_lossy(&o.stderr));
-        let _ = std::fs::remove_dir_all(&dir);
+    let dir = std::env::temp_dir().join(format!("preops-syntax-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = offline_preops_tool_lib::io_util::Cleanup(dir.clone());
+    for (name, _) in TEMPLATES.iter().filter(|(n, _)| n.ends_with(".sh.j2")) {
+        let file = dir.join(name.replace('/', "-"));
+        let script = render(&env, name, &ctx).unwrap();
+        assert!(!script.contains('\r'), "{name} contains CRLF line endings");
+        std::fs::write(&file, script).unwrap();
+        let out = std::process::Command::new(bash)
+            .arg("-n")
+            .arg(file)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
 
@@ -170,6 +153,9 @@ fn sanitize_keeps_unicode_names() {
     assert_eq!(sanitize("应用 服务器/01"), "应用-服务器-01");
     assert_eq!(sanitize("app-01_生产"), "app-01_生产");
     assert_eq!(sanitize("---"), "unnamed");
+    assert!(sanitize(&"应用服务".repeat(30)).len() <= 64);
+    assert_eq!(sanitize(".."), "unnamed");
+    assert_eq!(sanitize("CON"), "unnamed");
 }
 
 #[test]

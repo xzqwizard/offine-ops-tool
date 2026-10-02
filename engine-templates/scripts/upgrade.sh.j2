@@ -1,141 +1,54 @@
 #!/usr/bin/env bash
-# ============================================================
-# 离线升级脚本 - 由离线部署运维工具生成（勿手改）
-# 方案: {{ project_name }} | 服务器: {{ server.name }} ({{ server.arch }})
-# 基线: {{ baseline_build_id }} → 本次: {{ build_id }}
-# 用法: bash upgrade.sh [--dry-run] [原部署目录]
-#       原部署目录缺省时向上级探测（含 stack/docker-compose.yml 的目录）
-# 内容: 装载变更镜像 → 备份原编排 → 应用新编排 → 同步脚本 → 健康检查
-# 注意: 必须在"原部署目录"或其子孙目录执行，数据卷挂在原部署目录的 stack/data
-# ============================================================
 set -euo pipefail
-
-DRY_RUN=0
-ARGS=()
-for arg in "$@"; do
-  case "$arg" in
-    --dry-run) DRY_RUN=1 ;;
-    *) ARGS+=("$arg") ;;
-  esac
+PKG_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+BASE_DIR="$PKG_DIR"
+source "$PKG_DIR/scripts/runtime.sh"
+root_required
+TARGET=''; DRY=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in --target) [ "$#" -ge 2 ] || die '--target 缺少路径'; TARGET=$2; shift 2;; --dry-run) DRY=1; shift;; *) die '用法: upgrade.sh --target 已部署目录 [--dry-run]';; esac
 done
-
-PKG_DIR="$(cd "$(dirname "$0")/.." && pwd)"   # 升级包根（含 images/ stack/ scripts/）
-
-step()  { echo -e "\n\033[1;36m==> $1\033[0m"; }
-info()  { echo "    $1"; }
-ok()    { echo -e "    \033[32m✓ $1\033[0m"; }
-warn()  { echo -e "    \033[33m! $1\033[0m"; }
-fail()  { echo -e "    \033[31m✗ $1\033[0m"; }
-
-run() {
-  if [ "$DRY_RUN" -eq 1 ]; then echo "    [dry-run] $*"; else "$@"; fi
-}
-
-# ---------- 0. 定位原部署目录（数据卷所在处，绝不能用升级包内的 stack/） ----------
-DEPLOY_DIR="${ARGS[0]:-}"
-if [ -z "$DEPLOY_DIR" ]; then
-  # 从当前目录向上探测含 stack/docker-compose.yml 的目录
-  D="$PWD"
-  for _ in 1 2 3 4 5; do
-    if [ -f "$D/stack/docker-compose.yml" ]; then DEPLOY_DIR="$D"; break; fi
-    D="$(dirname "$D")"
-  done
-fi
-if [ -z "$DEPLOY_DIR" ] || [ ! -f "$DEPLOY_DIR/stack/docker-compose.yml" ]; then
-  fail "[错误码 U1] 未找到原部署目录（需含 stack/docker-compose.yml）"
-  fail "请把本升级包解压到原部署目录内，或执行: bash upgrade.sh /path/to/<部署目录>"
-  exit 1
-fi
-DEPLOY_DIR="$(cd "$DEPLOY_DIR" && pwd)"
-DEPLOY_COMPOSE="$DEPLOY_DIR/stack/docker-compose.yml"
-BACKUP_COMPOSE="$DEPLOY_DIR/stack/docker-compose.yml.prev-{{ build_id }}"
-LOG_DIR="$DEPLOY_DIR/logs"
-mkdir -p "$LOG_DIR"
-
-exec > >(tee -a "$LOG_DIR/upgrade-$(date '+%Y%m%d-%H%M%S').log") 2>&1
-
-echo "============================================================"
-echo " 离线升级 · {{ project_name }} / {{ server.name }}"
-echo " 基线 {{ baseline_build_id }} → {{ build_id }}"
-echo " 原部署目录: $DEPLOY_DIR"
-echo "============================================================"
-
-if ! docker compose version >/dev/null 2>&1; then
-  fail "[错误码 U2] 缺少 docker compose v2 插件，无法升级"
-  exit 1
-fi
-
-# ---------- 1. 装载变更镜像 ----------
-step "1/5 装载变更镜像（{{ images | length }} 个）"
-{% if images | length == 0 %}
-info "本次无镜像变更（仅配置变更）"
-{% endif %}
-{% for img in images %}
-if [ -f "$PKG_DIR/{{ img.file }}" ]; then
-  info "docker load: {{ img.file }}（{{ img.reference }}）"
-  run docker load -i "$PKG_DIR/{{ img.file }}"
-else
-  warn "缺少镜像文件 {{ img.file }}，对应服务可能无法升级"
-fi
-{% endfor %}
-
-# ---------- 2. 备份原编排 ----------
-step "2/5 备份原编排"
-run cp "$DEPLOY_COMPOSE" "$BACKUP_COMPOSE"
-ok "已备份为 $(basename "$BACKUP_COMPOSE")"
-
-# ---------- 3. 应用新编排并重建 ----------
-step "3/5 应用新编排（仅镜像变更的服务会被重建）"
-# 新编排拷入原部署目录（相对卷路径 ./data 以 compose 文件所在目录解析，
-# 数据卷继续挂原部署目录 stack/data，不会指向升级包内空目录）
-run cp "$PKG_DIR/stack/docker-compose.yml" "$DEPLOY_COMPOSE"
-cd "$DEPLOY_DIR"
-run docker compose -f "$DEPLOY_COMPOSE" config --quiet
-run docker compose -f "$DEPLOY_COMPOSE" up -d
-
-# ---------- 4. 同步运维脚本（保持原目录脚本是最新版） ----------
-step "4/5 同步运维脚本"
-run cp "$PKG_DIR/scripts/ops.sh" "$DEPLOY_DIR/scripts/ops.sh"
-
-# ---------- 5. 健康检查 ----------
-step "5/5 健康检查"
-HEALTH_FAIL=0
-{% for inst in instances %}
-printf "    %-20s " "{{ inst.instance_name }}"
-TRY=0; MAX={{ inst.health_timeout | default(60) }}; READY=0
-while [ $TRY -lt $MAX ]; do
-  STATE=$(docker inspect -f '{{'{{'}}.State.Running{{'}}'}}' "{{ inst.instance_name }}" 2>/dev/null || echo false)
-  if [ "$STATE" = "true" ]; then
-{% if inst.health_cmd %}
-    if docker exec "{{ inst.instance_name }}" {{ inst.health_cmd }} >/dev/null 2>&1; then
-      READY=1; break
-    fi
-{% elif inst.health_tcp %}
-    if timeout 3 bash -c "</dev/tcp/127.0.0.1/{{ inst.health_tcp }}" 2>/dev/null; then
-      READY=1; break
-    fi
-{% else %}
-    READY=1; break
-{% endif %}
+[ -n "$TARGET" ] && [ -d "$TARGET" ] || die '必须指定已部署目录'
+TARGET=$(cd "$TARGET" && pwd)
+[ "$TARGET" != "$PKG_DIR" ] || die '升级包目录不能作为部署目标'
+verify_package
+check_identity "$TARGET"
+BASELINE={{ baseline_build_id | shq }}
+[ "$(identity_value "$TARGET" BUILD_ID)" = "$BASELINE" ] || die '目标已部署版本与基线不一致'
+# Candidate validation uses target's relative data paths and performs no mutation in dry run.
+docker compose --project-directory "$TARGET/stack" -p "$STACK_NAME" -f "$PKG_DIR/stack/docker-compose.yml" config -q
+bash "$PKG_DIR/scripts/precheck.sh"
+if [ "$DRY" -eq 1 ]; then printf '演练通过：身份、基线、校验和及编排有效；未运行健康检查或修改服务\n'; exit 0; fi
+BASE_DIR="$TARGET"; STACK_DIR="$TARGET/stack"; LOG_DIR="$TARGET/logs"
+lock_ops
+snapshot 0
+rollback_dir="$LAST_BACKUP"
+rollback_on_failure() {
+  rc=$?; trap - EXIT INT TERM
+  if [ "$rc" -ne 0 ]; then
+    audit "upgrade failed; rollback $rollback_dir"
+    if ! restore_snapshot "$rollback_dir"; then printf '自动回滚失败，保留快照 %s；请人工恢复\n' "$rollback_dir" >&2; exit 2; fi
+    if ! bash "$TARGET/scripts/ops.sh" status; then printf '回滚后健康检查失败\n' >&2; exit 2; fi
   fi
-  printf "."; TRY=$((TRY+3)); sleep 3
-done
-if [ $READY -eq 1 ]; then
-  echo -e " \033[32m✓ 运行中/健康\033[0m"
-else
-  echo -e " \033[31m✗ 超时未就绪\033[0m"; HEALTH_FAIL=$((HEALTH_FAIL+1))
-  docker logs --tail 50 "{{ inst.instance_name }}" 2>/dev/null | sed 's/^/        /' || true
-fi
+  exit "$rc"
+}
+trap rollback_on_failure EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+{% for img in images %}
+docker load -i "$PKG_DIR/{{ img.file }}"
 {% endfor %}
-
-echo
-echo "------------------------------------------------------------"
-if [ "$HEALTH_FAIL" -gt 0 ]; then
-  warn "[错误码 U3] 有 $HEALTH_FAIL 个服务未通过健康检查，执行回退："
-  warn "  cp '$BACKUP_COMPOSE' '$DEPLOY_COMPOSE' && docker compose -f '$DEPLOY_COMPOSE' up -d"
-  exit 3
-else
-  ok "升级完成：{{ baseline_build_id }} → {{ build_id }}（编排/脚本已同步到 $DEPLOY_DIR）"
-  ok "旧编排备份: $(basename "$BACKUP_COMPOSE")；确认稳定后可删除升级包目录"
-fi
-echo "------------------------------------------------------------"
+cp "$PKG_DIR/stack/docker-compose.yml" "$STACK_DIR/docker-compose.yml"
+prepare_data
+compose up -d --remove-orphans
+health
+# Publish scripts and identity only after successful candidate health checks.
+cp "$PKG_DIR/scripts/ops.sh" "$PKG_DIR/scripts/runtime.sh" "$PKG_DIR/scripts/precheck.sh" "$PKG_DIR/scripts/apply-firewall.sh" "$TARGET/scripts/"
+cp -R "$PKG_DIR/docs" "$TARGET/"
+cp "$PKG_DIR/README.md" "$TARGET/"
+if [ -f /etc/offline-preops/{{ firewall_chain }}.sh ]; then bash "$TARGET/scripts/apply-firewall.sh" --apply; fi
+cp "$PKG_DIR/manifest.json" "$PKG_DIR/deployment.env" "$TARGET/"
+printf '%s\n' "$EXPECTED_BUILD" > "$TARGET/.installed"
+audit "upgrade complete $EXPECTED_BUILD rollback=$rollback_dir"
+trap - EXIT INT TERM
+printf '升级完成；回滚命令: bash %q/scripts/ops.sh rollback %q --yes\n' "$TARGET" "$rollback_dir"

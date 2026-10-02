@@ -28,6 +28,7 @@ pub fn create_project(app: AppHandle, name: String, customer: String) -> AppResu
         instances: Vec::new(),
         network_rules: Vec::new(),
         registry: None,
+        template_snapshots: vec![],
     };
     store::save_project(&app, &project)?;
     Ok(project)
@@ -128,9 +129,13 @@ pub struct DiskSpaceInfo {
 pub fn get_disk_space(_app: AppHandle, path: String) -> AppResult<DiskSpaceInfo> {
     use fs2::{available_space, total_space};
     let p = std::path::PathBuf::from(path.trim());
-    let target = if p.exists() { p } else {
+    let target = if p.exists() {
+        p
+    } else {
         // 目标不存在时向上找存在的祖先（盘符根一定存在）
-        p.ancestors().skip(1).find(|a| a.exists())
+        p.ancestors()
+            .skip(1)
+            .find(|a| a.exists())
             .ok_or_else(|| crate::error::AppError::Invalid(format!("路径无效: {path}")))?
             .to_path_buf()
     };
@@ -144,97 +149,30 @@ pub fn get_disk_space(_app: AppHandle, path: String) -> AppResult<DiskSpaceInfo>
     })
 }
 
-// ==================== 工具数据备份（方案/设置随包迁移，不含镜像缓存与产物） ====================
-
-/// 备份工具数据（全部方案 + 设置；cache/dist 体积大且可再生，排除）。
-/// 尊重存储设置：projects 用 effective_storage 的实际根（用户可能改到其他盘）。
+// ==================== Portable backup ====================
 #[tauri::command]
 pub fn backup_app_data(app: AppHandle, output_path: String) -> AppResult<String> {
-    let storage = store::effective_storage(&app)?;
-    let projects_root = std::path::PathBuf::from(&storage.projects_root);
-    let settings_file = std::path::PathBuf::from(&storage.config_dir).join("settings.json");
-    let file = std::fs::File::create(&output_path)
-        .map_err(|e| crate::error::AppError::Io(format!("创建备份文件失败: {e}")))?;
-    let mut zip = zip::ZipWriter::new(file);
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    let mut count = 0u32;
-    if settings_file.is_file() {
-        zip.start_file("settings.json", options)
-            .map_err(|e| crate::error::AppError::Io(e.to_string()))?;
-        std::io::copy(&mut std::fs::File::open(&settings_file)?, &mut zip)?;
-        count += 1;
-    }
-    if projects_root.is_dir() {
-        add_dir_to_zip(&mut zip, &projects_root, "projects", options)?;
-        count += 1;
-    }
-    zip.finish().map_err(|e| crate::error::AppError::Io(e.to_string()))?;
-    Ok(format!("已备份 {count} 项 → {output_path}"))
+    let _storage_lock = store::storage_lock(&app)?;
+    let s = store::effective_storage(&app)?;
+    let _lock = store::data_lock(&app)?;
+    let r = crate::backup::backup(&s, std::path::Path::new(&output_path))?;
+    crate::app_ops::__audit(&app, "backup_app_data", &output_path);
+    Ok(r)
 }
-
-fn add_dir_to_zip(
-    zip: &mut zip::ZipWriter<std::fs::File>,
-    dir: &std::path::Path,
-    prefix: &str,
-    options: zip::write::SimpleFileOptions,
-) -> AppResult<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = format!("{prefix}/{}", entry.file_name().to_string_lossy());
-        if path.is_dir() {
-            add_dir_to_zip(zip, &path, &name, options)?;
-        } else {
-            zip.start_file(&name, options)
-                .map_err(|e| crate::error::AppError::Io(e.to_string()))?;
-            std::io::copy(&mut std::fs::File::open(&path)?, zip)?;
-        }
-    }
-    Ok(())
-}
-
-/// 从备份恢复（覆盖式；恢复后需重启应用生效）。
-/// 恢复目标同样按 effective_storage 解析（与备份对称）。
 #[tauri::command]
 pub fn restore_app_data(app: AppHandle, backup_path: String) -> AppResult<String> {
-    let storage = store::effective_storage(&app)?;
-    let settings_file = std::path::PathBuf::from(&storage.config_dir).join("settings.json");
-    let projects_root = std::path::PathBuf::from(&storage.projects_root);
-    let file = std::fs::File::open(&backup_path)
-        .map_err(|e| crate::error::AppError::Io(format!("打开备份失败: {e}")))?;
-    let mut zip = zip::ZipArchive::new(file)
-        .map_err(|e| crate::error::AppError::Io(format!("备份文件格式错误: {e}")))?;
-    let mut count = 0u32;
-    for i in 0..zip.len() {
-        let mut entry = zip
-            .by_index(i)
-            .map_err(|e| crate::error::AppError::Io(e.to_string()))?;
-        if entry.is_dir() {
-            continue;
-        }
-        // 路径穿越防护：条目必须是纯相对路径——
-        // 拒绝 ..、反斜杠、绝对路径（join 绝对路径会整体替换 base）
-        let name = entry.name().to_string();
-        if name.contains("..") || name.contains('\\') || std::path::Path::new(&name).is_absolute() {
-            continue;
-        }
-        let (out_path, parent): (std::path::PathBuf, Option<std::path::PathBuf>) =
-            match name.strip_prefix("projects/") {
-                Some(rest) => {
-                    (projects_root.join(rest), Some(projects_root.clone()))
-                }
-                None if name == "settings.json" => {
-                    (settings_file.clone(), settings_file.parent().map(|p| p.to_path_buf()))
-                }
-                None => continue, // 未知条目跳过
-            };
-        if let Some(parent) = parent {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut out = std::fs::File::create(&out_path)?;
-        std::io::copy(&mut entry, &mut out)?;
-        count += 1;
-    }
-    Ok(format!("已恢复 {count} 个文件（重启应用后生效）"))
+    let _storage_lock = store::storage_lock(&app)?;
+    let s = store::effective_storage(&app)?;
+    let _lock = store::data_lock(&app)?;
+    let r = crate::backup::restore(&s, std::path::Path::new(&backup_path))?;
+    crate::app_ops::__audit(&app, "restore_app_data", &backup_path);
+    Ok(r)
+}
+#[tauri::command]
+pub fn validate_project(
+    app: AppHandle,
+    project: Project,
+) -> AppResult<Vec<crate::validation::ValidationIssue>> {
+    let cat = crate::catalog::for_project(&app, &project)?;
+    Ok(crate::validation::issues(&project, &cat, true))
 }

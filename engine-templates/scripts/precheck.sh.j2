@@ -1,143 +1,36 @@
 #!/usr/bin/env bash
-# ============================================================
-# 环境预检脚本 - 由离线部署运维工具生成（勿手改）
-# 方案: {{ project_name }} | 服务器: {{ server.name }} ({{ server.arch }})
-# 构建: {{ build_id }}
-# 用法: bash precheck.sh [--strict]
-# ============================================================
-set -uo pipefail
-
-STRICT=0
-[ "${1:-}" = "--strict" ] && STRICT=1
-
-PASS=0; WARN=0; FAIL=0
-ok()   { echo "  [✓] $1"; PASS=$((PASS+1)); }
-warn() { echo "  [!] $1"; WARN=$((WARN+1)); }
-bad()  { echo "  [✗] $1"; FAIL=$((FAIL+1)); }
-info() { echo "  [i] $1"; }
-
-echo "================ 环境预检 开始 ================"
-echo "时间: $(date '+%F %T')  主机: $(hostname)"
-
-# --- 1. root ---
-if [ "$(id -u)" -eq 0 ]; then ok "root 权限"; else bad "需要 root 权限执行（sudo / su）"; fi
-
-# --- 2. CPU 架构匹配（拿错包最常见的坑） ---
-MACHINE=$(uname -m)
-EXPECT="{{ server.arch }}"
-case "$EXPECT" in
-  amd64)        UNAME_EXPECT="x86_64" ;;
-  arm64)        UNAME_EXPECT="aarch64" ;;
-  loongarch64)  UNAME_EXPECT="loongarch64" ;;
-  *)            UNAME_EXPECT="$EXPECT" ;;
-esac
-if [ "$MACHINE" = "$UNAME_EXPECT" ]; then
-  ok "CPU 架构匹配: $MACHINE (期望 $EXPECT)"
-else
-  bad "CPU 架构不匹配: 当前 $MACHINE，本包期望 $EXPECT —— 请确认拿对了对应服务器的离线包！"
-fi
-
-# --- 3. 操作系统 ---
-if [ -f /etc/os-release ]; then
-  . /etc/os-release
-  info "操作系统: ${PRETTY_NAME:-unknown}（期望 {{ server.os_family }} {{ server.os_version }}）"
-else
-  warn "未找到 /etc/os-release，无法识别操作系统"
-fi
-
-# --- 4. 内存 ---
-MEM_MB=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
-if [ -n "$MEM_MB" ]; then
-  MEM_GB=$(( MEM_MB / 1024 ))
-  NEED_GB={{ mem_need_gb }}
-  if [ "$MEM_GB" -ge "$NEED_GB" ]; then
-    ok "内存: ${MEM_GB}GB（中间件最低需求合计 ${NEED_GB}GB）"
-  else
-    bad "内存不足: ${MEM_GB}GB < 需求 ${NEED_GB}GB"
-  fi
-else
-  warn "无法读取内存信息"
-fi
-
-# --- 5. 磁盘空间（部署目录所在盘）---
-CHECK_DIR="{{ server.deploy_base_dir }}"
-[ -d "$CHECK_DIR" ] || CHECK_DIR="/opt"
-AVAIL_MB=$(df -Pm "$CHECK_DIR" 2>/dev/null | awk 'NR==2{print $4}')
-NEED_DISK_MB={{ disk_need_mb }}
-if [ -n "$AVAIL_MB" ]; then
-  if [ "$AVAIL_MB" -ge "$NEED_DISK_MB" ]; then
-    ok "磁盘空间: ${CHECK_DIR} 所在盘可用 $(( AVAIL_MB / 1024 ))GB（预估需要 $(( NEED_DISK_MB / 1024 ))GB）"
-  else
-    bad "磁盘空间不足: 可用 $(( AVAIL_MB / 1024 ))GB < 需要约 $(( NEED_DISK_MB / 1024 ))GB"
-  fi
-else
-  warn "无法读取磁盘信息（$CHECK_DIR）"
-fi
-
-# --- 6. 端口占用 ---
-PORTS="{{ exposed_ports_csv }}"
-if command -v ss >/dev/null 2>&1; then
-  for P in ${PORTS//,/ }; do
-    if ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":${P}$"; then
-      bad "端口 ${P} 已被占用"
-    else
-      ok "端口 ${P} 空闲"
-    fi
-  done
-else
-  warn "无 ss 命令，跳过端口占用检查（端口清单: ${PORTS}）"
-fi
-
-# --- 7. 内核参数要求 ---
+set -euo pipefail
+BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+source "$BASE_DIR/scripts/runtime.sh"
+root_required
+[ "$(uname -m)" = {{ uname_arch | shq }} ] || die 'CPU 架构与交付包不匹配'
+command -v timeout >/dev/null && command -v sha256sum >/dev/null && command -v tar >/dev/null && command -v ss >/dev/null || die '缺少 coreutils/tar/iproute2'
+docker info >/dev/null
+docker compose version >/dev/null
+actual_docker=$(docker --version | awk '{print $3}' | tr -d ',')
+[ "$actual_docker" = {{ server.docker_version | shq }} ] || die 'Docker 版本与交付包不一致，需重新全量构建'
+available_mem=$(awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo)
+[ "$available_mem" -ge {{ mem_need_gb * 1024 }} ] || die '内存不足'
+parent=$(docker info --format {% raw %}'{{.DockerRootDir}}'{% endraw %})
+[ "$parent" = {{ server.docker_data_root | shq }} ] || die '实际 Docker 数据目录与方案不一致，请调整方案后全量构建'
+while [ ! -d "$parent" ]; do parent=$(dirname "$parent"); done
+available=$(df -Pm "$parent" | awk 'END {print $4}')
+[ "$available" -ge {{ disk_need_mb }} ] || die 'Docker 数据盘剩余空间不足'
 {% for req in kernel_reqs %}
-# {{ req }}
+req={{ req | shq }}
+key=${req%%>=*}; required=${req##*>=}
+actual=$(sysctl -n "$key")
+[ "$actual" -ge "$required" ] || die "内核参数 $req 未满足；请由管理员配置"
 {% endfor %}
-{% if kernel_reqs_raw %}
-KREQ="{{ kernel_reqs_raw }}"
-if [ -n "$KREQ" ]; then
-  IFS=' ' read -ra ITEMS <<< "${KREQ//,/ }"
-  for ITEM in "${ITEMS[@]}"; do
-    KEY="${ITEM%%>=*}"; VAL="${ITEM##*>=}"
-    CUR=$(sysctl -n "$KEY" 2>/dev/null || echo 0)
-    if [ "${CUR:-0}" -ge "${VAL:-0}" ] 2>/dev/null; then
-      ok "内核参数 $KEY = $CUR"
-    else
-      warn "内核参数 $KEY = $CUR（需要 >= $VAL），修正: sysctl -w $KEY=$VAL 并写入 /etc/sysctl.conf"
-    fi
-  done
+{% for p in local_ports %}
+# TCP and UDP are separate. Only this project/server's containers may own a published port.
+mapfile -t ids < <(docker ps --filter {{ ("publish=" ~ p.host ~ "/" ~ p.protocol) | shq }} --format {% raw %}'{{.ID}}'{% endraw %})
+for id in "${ids[@]}"; do
+  owner=$(docker inspect --format {% raw %}'{{index .Config.Labels "offlinepreops.project"}}/{{index .Config.Labels "offlinepreops.server"}}'{% endraw %} "$id")
+  [ "$owner" = "$PROJECT_ID/$SERVER_ID" ] || die '端口 {{ p.host }}/{{ p.protocol }} 被其他容器占用'
+done
+if ss -Hln{% if p.protocol == 'udp' %}u{% else %}t{% endif %} | awk '$4 ~ /:{{ p.host }}$/ {found=1} END {exit !found}'; then
+  [ {% raw %}"${#ids[@]}"{% endraw %} -gt 0 ] || die '端口 {{ p.host }}/{{ p.protocol }} 被宿主进程占用'
 fi
-{% endif %}
-
-# --- 8. 已装 Docker ---
-if command -v docker >/dev/null 2>&1; then
-  DV=$(docker version --format '{{'{{'}}.Server.Version{{'}}'}}' 2>/dev/null || echo "未知")
-  if [ "$DV" = "{{ server.docker_version }}" ]; then
-    ok "Docker 已安装且版本一致: $DV"
-  else
-    warn "Docker 已安装但版本为 ${DV}（本包按 {{ server.docker_version }} 准备），deploy 将跳过安装"
-  fi
-else
-  info "未检测到 Docker，deploy.sh 将从 docker-offline/ 安装（若包内含安装材料）"
-fi
-
-# --- 9. 防火墙状态 ---
-if systemctl is-active firewalld >/dev/null 2>&1; then
-  info "firewalld 运行中：部署后请按 docs/PORT-MATRIX.md 开通端口（可执行 scripts/apply-firewall.sh）"
-else
-  info "firewalld 未运行（如由上级网络统一管控，请提交端口开通申请表）"
-fi
-
-echo "================ 预检结果: ✓${PASS}  !${WARN}  ✗${FAIL} ================"
-REPORT="$PASS pass / $WARN warn / $FAIL fail"
-echo "$REPORT" > "$(dirname "$0")/../precheck-report.txt" 2>/dev/null || true
-
-if [ "$FAIL" -gt 0 ]; then
-  if [ "$STRICT" -eq 1 ]; then
-    echo "存在阻断项（strict 模式），预检不通过。"
-    exit 1
-  else
-    echo "存在阻断项，建议处理后再部署。"
-    exit 2
-  fi
-fi
-exit 0
+{% endfor %}
+printf '预检通过\n'

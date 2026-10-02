@@ -22,10 +22,13 @@ fn parse_reference_explicit_registry() {
     assert_eq!(r.repo, "prometheus/prometheus");
     assert_eq!(r.tag, "v2.53.0");
 
-    let r = parse_reference("registry.example.cn:5000/gov/app@sha256:abcd").unwrap();
+    let r = parse_reference("registry.example.cn:5000/gov/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
     assert_eq!(r.registry, "registry.example.cn:5000");
     assert_eq!(r.repo, "gov/app");
-    assert_eq!(r.digest.as_deref(), Some("sha256:abcd"));
+    assert_eq!(
+        r.digest.as_deref(),
+        Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
 }
 
 #[test]

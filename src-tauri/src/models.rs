@@ -12,7 +12,7 @@ pub struct RegistryConfig {
     pub url: String,
     #[serde(default)]
     pub username: String,
-    /// TODO(M3)：迁 OS 凭据库；当前随方案文件存储于本机
+    /// Windows DPAPI encrypted at rest; exposed only in memory.
     #[serde(default)]
     pub password: String,
 }
@@ -38,6 +38,9 @@ pub struct Project {
     /// 项目级私有镜像仓库（拉取/查询时优先于镜像源列表）
     #[serde(default)]
     pub registry: Option<RegistryConfig>,
+    /// Used template definitions frozen with the project for reproducible exports/builds.
+    #[serde(default)]
+    pub template_snapshots: Vec<crate::catalog::MiddlewareTemplate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +48,7 @@ pub struct Project {
 pub struct BuildConfig {
     /// tar.gz | dir（当前实现仅支持这两种）
     pub package_format: String,
-    /// 镜像 tar 是否参与二次压缩（默认否，docker save 层已压缩）
+    /// 镜像 tar 是否参与二次压缩（默认使用快速压缩；开启后使用标准 gzip 压缩）
     pub recompress_images: bool,
     /// 是否 GPG 签名
     pub sign: bool,
@@ -193,7 +196,7 @@ pub struct ProxyConfig {
     pub port: u16,
     #[serde(default)]
     pub username: Option<String>,
-    /// TODO(M2)：迁移到 OS 凭据库；当前随设置文件存储于本机
+    /// Windows DPAPI encrypted at rest.
     #[serde(default)]
     pub password: Option<String>,
     /// 不走代理的地址（逗号分隔），如 localhost,127.0.0.1,10.*,192.168.*

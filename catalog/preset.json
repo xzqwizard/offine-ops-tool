@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "updatedAt": "2026-09-29",
+  "version": 2,
+  "updatedAt": "2026-10-02",
   "templates": [
     {
       "id": "mysql-8.0",
@@ -17,7 +17,7 @@
         { "key": "MYSQL_PASSWORD", "label": "业务账号密码", "secret": true }
       ],
       "dataVolume": "/var/lib/mysql",
-      "healthCheck": { "type": "exec", "cmd": ["mysqladmin", "ping", "-h", "127.0.0.1"] },
+      "healthCheck": {"type": "exec", "cmd": ["sh", "-c", "MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql -uroot -h127.0.0.1 -e \"SELECT 1\" >/dev/null"]},
       "minMemoryGb": 1
     },
     {
@@ -33,7 +33,7 @@
       ],
       "dataVolume": "/data",
       "command": ["sh", "-c", "redis-server --requirepass \"$$REDIS_PASSWORD\""],
-      "healthCheck": { "type": "exec", "cmd": ["sh", "-c", "redis-cli ping"] },
+      "healthCheck": {"type": "exec", "cmd": ["sh", "-c", "if [ -n \"$REDIS_PASSWORD\" ]; then export REDISCLI_AUTH=\"$REDIS_PASSWORD\"; fi; [ \"$(redis-cli --raw ping)\" = PONG ]"]},
       "minMemoryGb": 0.5
     },
     {
@@ -50,7 +50,7 @@
         { "key": "POSTGRES_USER", "label": "超级用户名" }
       ],
       "dataVolume": "/var/lib/postgresql/data",
-      "healthCheck": { "type": "exec", "cmd": ["pg_isready", "-U", "postgres"] },
+      "healthCheck": {"type": "exec", "cmd": ["sh", "-c", "PGPASSWORD=\"$POSTGRES_PASSWORD\" psql -h127.0.0.1 -U \"${POSTGRES_USER:-postgres}\" -d \"${POSTGRES_DB:-${POSTGRES_USER:-postgres}}\" -tAc \"SELECT 1\" | grep -qx 1"]},
       "minMemoryGb": 1
     },
     {
@@ -62,11 +62,11 @@
       "supportedArches": ["amd64", "arm64"],
       "ports": [{ "name": "mongo", "container": 27017, "defaultHost": 27017, "protocol": "tcp" }],
       "envHints": [
-        { "key": "MONGO_INITDB_ROOT_USERNAME", "label": "root 账号" },
+        { "key": "MONGO_INITDB_ROOT_USERNAME", "label": "root 账号", "required": true, "default": "root" },
         { "key": "MONGO_INITDB_ROOT_PASSWORD", "label": "root 密码", "secret": true, "required": true }
       ],
       "dataVolume": "/data/db",
-      "healthCheck": { "type": "exec", "cmd": ["mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"] },
+      "healthCheck": {"type": "exec", "cmd": ["sh", "-c", "mongosh --quiet --username \"$MONGO_INITDB_ROOT_USERNAME\" --password \"$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --eval \"if (db.adminCommand({ping:1}).ok!==1) quit(1)\""]},
       "minMemoryGb": 1
     },
     {
@@ -77,14 +77,13 @@
       "recommendedTags": ["1.27.2", "1.25.3", "1.24.0"],
       "supportedArches": ["amd64", "arm64"],
       "ports": [
-        { "name": "http", "container": 80, "defaultHost": 80, "protocol": "tcp" },
-        { "name": "https", "container": 443, "defaultHost": 443, "protocol": "tcp" }
+        { "name": "http", "container": 80, "defaultHost": 80, "protocol": "tcp" }
       ],
       "envHints": [],
       "dataVolume": "/usr/share/nginx/html",
-      "healthCheck": { "type": "exec", "cmd": ["sh", "-c", "curl -s -o /dev/null http://127.0.0.1/ || wget -q -O /dev/null http://127.0.0.1/"] },
+      "healthCheck": {"type": "exec", "cmd": ["sh", "-c", "curl -fsS -o /dev/null http://127.0.0.1/ || wget -q -O /dev/null http://127.0.0.1/"]},
       "minMemoryGb": 0.25,
-      "remark": "默认监听镜像自带 server（80/443）；静态页面放 data/nginx/。如需自定义配置，编辑 stack/docker-compose.yml 增加配置卷挂载"
+      "remark": "默认提供 HTTP 80，自动初始化空首页；TLS 需显式增加证书和配置，不能仅发布 443。静态文件位于 stack/data/<实例名>。"
     },
     {
       "id": "minio",
@@ -102,6 +101,7 @@
         { "key": "MINIO_ROOT_PASSWORD", "label": "管理员密码", "secret": true, "required": true }
       ],
       "dataVolume": "/data",
+      "command": ["server", "/data", "--console-address", ":9001"],
       "healthCheck": { "type": "exec", "cmd": ["curl", "-sf", "http://127.0.0.1:9000/minio/health/live"] },
       "minMemoryGb": 1
     },
@@ -117,7 +117,7 @@
         { "name": "mgmt", "container": 15672, "defaultHost": 15672, "protocol": "tcp" }
       ],
       "envHints": [
-        { "key": "RABBITMQ_DEFAULT_USER", "label": "默认账号" },
+        { "key": "RABBITMQ_DEFAULT_USER", "label": "默认账号", "required": true, "default": "app" },
         { "key": "RABBITMQ_DEFAULT_PASS", "label": "默认密码", "secret": true, "required": true }
       ],
       "dataVolume": "/var/lib/rabbitmq",
@@ -126,24 +126,105 @@
     },
     {
       "id": "kafka-3.7",
-      "displayName": "Kafka 3.7 (KRaft)",
+      "displayName": "Apache Kafka 3.7 (KRaft)",
       "category": "消息队列",
-      "defaultImage": "docker.io/bitnami/kafka",
-      "recommendedTags": ["3.7", "3.6.2"],
-      "supportedArches": ["amd64", "arm64"],
-      "ports": [{ "name": "kafka", "container": 9092, "defaultHost": 9092, "protocol": "tcp" }],
-      "envHints": [
-        { "key": "KAFKA_CFG_NODE_ID", "label": "节点 ID", "default": "0" },
-        { "key": "KAFKA_CFG_PROCESS_ROLES", "label": "节点角色", "default": "controller,broker" },
-        { "key": "KAFKA_CFG_LISTENERS", "label": "监听器", "default": "PLAINTEXT://:9092,CONTROLLER://:9093" },
-        { "key": "KAFKA_CFG_ADVERTISED_LISTENERS", "label": "对外地址（必填：PLAINTEXT://<本机IP>:9092）", "required": true },
-        { "key": "KAFKA_CFG_CONTROLLER_QUORUM_VOTERS", "label": "仲裁投票者", "default": "0@127.0.0.1:9093" }
+      "defaultImage": "docker.io/apache/kafka",
+      "recommendedTags": [
+        "3.7.2",
+        "3.7.1"
       ],
-      "dataVolume": "/bitnami/kafka",
-      "dataUser": "1001:1001",
-      "healthCheck": { "type": "tcp", "cmd": [] },
+      "supportedArches": [
+        "amd64",
+        "arm64"
+      ],
+      "ports": [
+        {
+          "name": "kafka",
+          "container": 9092,
+          "defaultHost": 9092,
+          "protocol": "tcp"
+        }
+      ],
+      "envHints": [
+        {
+          "key": "KAFKA_NODE_ID",
+          "label": "KAFKA_NODE_ID",
+          "default": "1"
+        },
+        {
+          "key": "KAFKA_PROCESS_ROLES",
+          "label": "KAFKA_PROCESS_ROLES",
+          "default": "broker,controller"
+        },
+        {
+          "key": "KAFKA_LISTENERS",
+          "label": "KAFKA_LISTENERS",
+          "default": "PLAINTEXT://:9092,CONTROLLER://:9093"
+        },
+        {
+          "key": "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
+          "label": "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
+          "default": "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+        },
+        {
+          "key": "KAFKA_CONTROLLER_LISTENER_NAMES",
+          "label": "KAFKA_CONTROLLER_LISTENER_NAMES",
+          "default": "CONTROLLER"
+        },
+        {
+          "key": "KAFKA_INTER_BROKER_LISTENER_NAME",
+          "label": "KAFKA_INTER_BROKER_LISTENER_NAME",
+          "default": "PLAINTEXT"
+        },
+        {
+          "key": "KAFKA_CONTROLLER_QUORUM_VOTERS",
+          "label": "KAFKA_CONTROLLER_QUORUM_VOTERS",
+          "default": "1@localhost:9093"
+        },
+        {
+          "key": "KAFKA_LOG_DIRS",
+          "label": "KAFKA_LOG_DIRS",
+          "default": "/var/lib/kafka/data"
+        },
+        {
+          "key": "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR",
+          "label": "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR",
+          "default": "1"
+        },
+        {
+          "key": "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR",
+          "label": "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR",
+          "default": "1"
+        },
+        {
+          "key": "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR",
+          "label": "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR",
+          "default": "1"
+        },
+        {
+          "key": "CLUSTER_ID",
+          "label": "CLUSTER_ID",
+          "default": "MkU3OEVBNTcwNTJENDM2Qk"
+        },
+        {
+          "key": "KAFKA_ADVERTISED_LISTENERS",
+          "label": "对外地址 PLAINTEXT://<本机IP>:<宿主端口>",
+          "required": true
+        }
+      ],
+      "dataVolume": "/var/lib/kafka/data",
+      "dataUser": "1000:1000",
+      "healthCheck": {
+        "type": "exec",
+        "cmd": [
+          "sh",
+          "-c",
+          "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null"
+        ]
+      },
+      "healthTimeoutSec": 120,
       "minMemoryGb": 2,
-      "remark": "对外地址必须填本机真实 IP（如 PLAINTEXT://10.10.1.11:9092），否则跨服务器客户端拿到 127.0.0.1 元数据必然断连"
+      "remark": "默认采用 Apache 官方镜像。旧 Bitnami 方案需重新选择镜像/参数；数据迁移必须单独验收，不能直接替换原数据目录。advertised 地址必须为客户端可访问的本机 IP/宿主端口。"
     },
     {
       "id": "elasticsearch-8",
@@ -164,7 +245,7 @@
       ],
       "dataVolume": "/usr/share/elasticsearch/data",
       "dataUser": "1000:1000",
-      "healthCheck": { "type": "exec", "cmd": ["sh", "-c", "curl -s -o /dev/null http://127.0.0.1:9200/_cluster/health"] },
+      "healthCheck": {"type": "exec", "cmd": ["sh", "-c", "curl -fsS \"http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=3s\" | grep -Eq '\"timed_out\"[[:space:]]*:[[:space:]]*false'"]},
       "healthTimeoutSec": 180,
       "minMemoryGb": 4,
       "kernelReqs": ["vm.max_map_count>=262144"],

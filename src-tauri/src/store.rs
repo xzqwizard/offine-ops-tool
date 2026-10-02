@@ -13,8 +13,8 @@ const PROJECT_FILE: &str = "project.json";
 /// 软件所在目录（便携式布局）：数据跟随程序目录而非用户目录，
 /// 整个目录拷走即迁移。开发模式下位于 target/<profile>/。
 fn app_base_dir() -> AppResult<PathBuf> {
-    let exe = std::env::current_exe()
-        .map_err(|e| AppError::Io(format!("无法定位程序位置: {e}")))?;
+    let exe =
+        std::env::current_exe().map_err(|e| AppError::Io(format!("无法定位程序位置: {e}")))?;
     exe.parent()
         .map(|p| p.to_path_buf())
         .ok_or_else(|| AppError::Io("无法取得程序所在目录".into()))
@@ -61,7 +61,7 @@ static MIGRATED: OnceLock<()> = OnceLock::new();
 /// 旧位置：Windows %APPDATA%/<identifier>/（settings.json、projects/、cache/）
 pub fn ensure_migrated(app: &AppHandle) {
     MIGRATED.get_or_init(|| {
-        if let Err(e) = migrate_legacy_data(app) {
+        if let Err(e) = migrate_legacy_data(app).and_then(|_| migrate_credentials_at_rest(app)) {
             eprintln!("[迁移] 旧版数据迁移失败（不影响使用，可手动复制）: {e}");
         }
     });
@@ -110,6 +110,9 @@ pub fn merge_dir_recursive(src: &Path, dst: &Path) -> AppResult<(usize, u64)> {
             continue;
         }
         let d = dst.join(&name);
+        if entry.file_type()?.is_symlink() {
+            continue;
+        }
         if s.is_dir() {
             let (f, b) = merge_dir_recursive(&s, &d)?;
             files += f;
@@ -144,15 +147,13 @@ pub fn effective_storage(app: &AppHandle) -> AppResult<StorageInfo> {
         log_root: override_or(&settings.log_root, d.log_root)
             .to_string_lossy()
             .into_owned(),
-        config_dir: config_dir(app)?
-            .to_string_lossy()
-            .into_owned(),
+        config_dir: config_dir(app)?.to_string_lossy().into_owned(),
     })
 }
 
 // ==================== 应用设置 ====================
 
-fn settings_path(app: &AppHandle) -> AppResult<PathBuf> {
+pub fn settings_path(app: &AppHandle) -> AppResult<PathBuf> {
     Ok(config_dir(app)?.join(SETTINGS_FILE))
 }
 
@@ -163,10 +164,17 @@ pub fn load_settings(app: &AppHandle) -> AppResult<AppSettings> {
         return Ok(AppSettings::default());
     }
     let raw = fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&raw)?)
+    let mut value: AppSettings = serde_json::from_str(&raw)?;
+    if let Some(p) = &mut value.proxy {
+        if let Some(pw) = &mut p.password {
+            *pw = crate::credentials::reveal(pw)?;
+        }
+    }
+    Ok(value)
 }
 
 pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> AppResult<()> {
+    let _storage_lock = storage_lock(app)?;
     let path = settings_path(app)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -178,18 +186,33 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> AppResult<()> {
         &settings.docker_pkg_root,
         &settings.artifact_root,
         &settings.log_root,
-    ] {
-        if let Some(p) = p {
-            if !p.trim().is_empty() {
-                fs::create_dir_all(p)?;
-            }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !p.trim().is_empty() {
+            fs::create_dir_all(p)?;
         }
     }
-    let raw = serde_json::to_string_pretty(settings)?;
-    // 原子写：settings.json 损坏会导致几乎所有命令失效，不能接受写一半
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &raw)?;
-    fs::rename(&tmp, &path)?;
+    let _lock = data_lock(app)?;
+    let mut persisted = settings.clone();
+    for m in &mut persisted.registry_mirrors {
+        *m = crate::validation::normalize_host(m)?;
+    }
+    if let Some(p) = &mut persisted.proxy {
+        if p.enabled
+            && (p.port == 0
+                || p.host.is_empty()
+                || !["http", "socks5"].contains(&p.scheme.as_str()))
+        {
+            return Err(AppError::Invalid("代理配置无效".into()));
+        }
+        if let Some(pw) = &mut p.password {
+            *pw = crate::credentials::protect(pw)?;
+        }
+    }
+    crate::io_util::atomic_write(&path, serde_json::to_string_pretty(&persisted)?.as_bytes())?;
+    crate::app_ops::__audit(app, "save_settings", "settings");
     Ok(())
 }
 
@@ -216,7 +239,13 @@ pub fn validate_id(id: &str) -> AppResult<()> {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if ok {
+    if ok
+        && ![
+            "con", "prn", "nul", "aux", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+            "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+        ]
+        .contains(&id.to_ascii_lowercase().as_str())
+    {
         Ok(())
     } else {
         Err(AppError::Invalid(format!("非法的方案 id: {id}")))
@@ -228,15 +257,18 @@ pub fn list_projects(app: &AppHandle) -> AppResult<Vec<ProjectSummary>> {
     let mut out = Vec::new();
     let entries = match fs::read_dir(&root) {
         Ok(e) => e,
-        Err(_) => return Ok(out), // 目录不存在视为空
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e.into()),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry?;
         let p = entry.path().join(PROJECT_FILE);
         if !p.is_file() {
             continue;
         }
-        let Ok(raw) = fs::read_to_string(&p) else { continue };
-        let Ok(proj) = serde_json::from_str::<Project>(&raw) else { continue };
+        let raw = fs::read_to_string(&p)?;
+        let proj: Project = serde_json::from_str(&raw)
+            .map_err(|e| AppError::Invalid(format!("方案文件 {} 损坏: {e}", p.display())))?;
         out.push(ProjectSummary {
             id: proj.id,
             name: proj.name,
@@ -252,30 +284,46 @@ pub fn list_projects(app: &AppHandle) -> AppResult<Vec<ProjectSummary>> {
 
 pub fn load_project(app: &AppHandle, id: &str) -> AppResult<Project> {
     let path = project_path(app, id)?;
-    if !path.exists() {
-        return Err(AppError::NotFound(format!("方案 {id} 不存在")));
-    }
-    let raw = fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&raw)?)
+    let mut p: Project = serde_json::from_str(&fs::read_to_string(path)?)?;
+    crate::credentials::reveal_project(&mut p)?;
+    Ok(p)
+}
+
+pub fn data_lock(app: &AppHandle) -> AppResult<std::fs::File> {
+    crate::io_util::lock(&config_dir(app)?.join(".data.lock"))
+}
+pub fn storage_lock(app: &AppHandle) -> AppResult<std::fs::File> {
+    crate::io_util::lock(&config_dir(app)?.join(".storage.lock"))
 }
 
 pub fn save_project(app: &AppHandle, project: &Project) -> AppResult<()> {
-    let dir = project_dir(app, &project.id)?;
-    fs::create_dir_all(&dir)?;
-    let raw = serde_json::to_string_pretty(project)?;
-    // 先写临时文件再原子重命名，避免写一半损坏
-    let tmp = dir.join(format!("{PROJECT_FILE}.tmp"));
-    fs::write(&tmp, raw)?;
-    fs::rename(&tmp, dir.join(PROJECT_FILE))?;
+    let cat = crate::catalog::for_project(app, project)?;
+    crate::validation::require(project, &cat, false)?;
+    let mut frozen = crate::catalog::freeze(app, project)?;
+    frozen.instances = project.instances.clone();
+    frozen.registry = project.registry.clone();
+    let _lock = data_lock(app)?;
+    let path = project_path(app, &project.id)?;
+    let mut p = frozen;
+    if let Some(r) = &mut p.registry {
+        if !r.url.is_empty() {
+            r.url = crate::validation::normalize_host(&r.url)?;
+        }
+    }
+    crate::credentials::protect_project(&mut p, &cat)?;
+    crate::io_util::atomic_write(&path, serde_json::to_string_pretty(&p)?.as_bytes())?;
+    crate::app_ops::__audit(app, "save_project", &project.id);
     Ok(())
 }
 
 pub fn delete_project(app: &AppHandle, id: &str) -> AppResult<()> {
+    let _lock = data_lock(app)?;
     let dir = project_dir(app, id)?;
     if !dir.exists() {
         return Err(AppError::NotFound(format!("方案 {id} 不存在")));
     }
     fs::remove_dir_all(dir)?;
+    crate::app_ops::__audit(app, "delete_project", id);
     Ok(())
 }
 
@@ -287,4 +335,65 @@ pub fn now_rfc3339() -> String {
 /// 供创建时生成 id（proj-<uuid>）
 pub fn new_project_id() -> String {
     format!("proj-{}", uuid::Uuid::new_v4().simple())
+}
+
+fn migrate_credentials_at_rest(app: &AppHandle) -> AppResult<()> {
+    let data = config_dir(app)?;
+    let _lock = crate::io_util::lock(&data.join(".data.lock"))?;
+    let mut settings = AppSettings::default();
+    let path = data.join(SETTINGS_FILE);
+    if path.exists() {
+        settings = serde_json::from_slice(&fs::read(&path)?)?;
+        if let Some(p) = &mut settings.proxy {
+            if let Some(pw) = &mut p.password {
+                if !pw.is_empty() && !pw.starts_with("dpapi:") {
+                    *pw = crate::credentials::protect(pw)?;
+                    crate::io_util::atomic_write(
+                        &path,
+                        serde_json::to_string_pretty(&settings)?.as_bytes(),
+                    )?;
+                }
+            }
+        }
+    }
+    let mut catalog = crate::catalog::preset()?;
+    let custom_path = data.join("custom-catalog.json");
+    if custom_path.exists() {
+        let mut custom: crate::catalog::CatalogFile =
+            serde_json::from_slice(&fs::read(&custom_path)?)?;
+        crate::catalog::validate_catalog(&custom)?;
+        let before = serde_json::to_vec(&custom)?;
+        crate::catalog::scrub_catalog_defaults(&mut custom);
+        if serde_json::to_vec(&custom)? != before {
+            crate::io_util::atomic_write(
+                &custom_path,
+                serde_json::to_string_pretty(&custom)?.as_bytes(),
+            )?;
+        }
+        for t in custom.templates {
+            catalog.templates.retain(|x| x.id != t.id);
+            catalog.templates.push(t);
+        }
+    }
+    let root = override_or(&settings.projects_root, data.join("projects"));
+    if root.is_dir() {
+        for e in fs::read_dir(root)? {
+            let e = e?;
+            if !e.file_type()?.is_dir() {
+                continue;
+            }
+            let path = e.path().join(PROJECT_FILE);
+            if !path.exists() {
+                continue;
+            }
+            let mut p: Project = serde_json::from_slice(&fs::read(&path)?)?;
+            let before = serde_json::to_vec(&p)?;
+            let cat = crate::catalog::overlay(catalog.clone(), &p);
+            crate::credentials::protect_project(&mut p, &cat)?;
+            if serde_json::to_vec(&p)? != before {
+                crate::io_util::atomic_write(&path, serde_json::to_string_pretty(&p)?.as_bytes())?;
+            }
+        }
+    }
+    Ok(())
 }

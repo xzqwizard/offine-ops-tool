@@ -107,32 +107,46 @@ fn custom_catalog_path(app: &AppHandle) -> AppResult<PathBuf> {
     Ok(PathBuf::from(s.config_dir).join("custom-catalog.json"))
 }
 
-fn load_custom(app: &AppHandle) -> CatalogFile {
-    match custom_catalog_path(app) {
-        Ok(p) if p.is_file() => match fs::read_to_string(&p) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-                // 损坏时隔离而非静默清空（否则下次保存会以空表覆掉全部自定义条目）
-                let backup = p.with_extension(format!("corrupt-{}", chrono::Utc::now().timestamp()));
-                let _ = fs::rename(&p, &backup);
-                eprintln!("[目录] custom-catalog.json 损坏已隔离为 {}（{e}）", backup.display());
-                CatalogFile::default()
-            }),
-            Err(_) => CatalogFile::default(),
-        },
-        _ => CatalogFile::default(),
+fn load_custom(app: &AppHandle) -> AppResult<CatalogFile> {
+    let p = custom_catalog_path(app)?;
+    if !p.exists() {
+        return Ok(CatalogFile::default());
     }
+    let cat: CatalogFile = serde_json::from_slice(&fs::read(&p)?)
+        .map_err(|e| AppError::Invalid(format!("自定义目录损坏，请恢复备份；原文件未改动: {e}")))?;
+    validate_catalog(&cat)?;
+    Ok(cat)
+}
+pub fn validate_catalog(cat: &CatalogFile) -> AppResult<()> {
+    let mut ids = std::collections::HashSet::new();
+    for t in &cat.templates {
+        crate::validation::validate_template(t)?;
+        if !ids.insert(&t.id) {
+            return Err(AppError::Invalid("目录模板 ID 重复".into()));
+        }
+    }
+    Ok(())
 }
 
 fn save_custom(app: &AppHandle, cat: &CatalogFile) -> AppResult<()> {
+    let mut cat = cat.clone();
+    scrub_catalog_defaults(&mut cat);
     let p = custom_catalog_path(app)?;
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
     }
-    // 原子写：损坏的自定义目录会让"我的中间件"整体消失
-    let tmp = p.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(cat)?)?;
-    fs::rename(&tmp, &p)?;
+    crate::io_util::atomic_write(&p, serde_json::to_string_pretty(&cat)?.as_bytes())?;
     Ok(())
+}
+
+pub fn scrub_catalog_defaults(cat: &mut CatalogFile) {
+    for t in &mut cat.templates {
+        for hint in &mut t.env_hints {
+            if hint.secret || crate::credentials::secret_key(&hint.key) {
+                hint.default.clear();
+            }
+        }
+    }
 }
 
 use std::fs;
@@ -142,7 +156,7 @@ use std::fs;
 /// 自定义/远程条目的卷挂载、健康检查、depends_on 等会全部静默丢失。
 pub fn merged_catalog(app: &AppHandle) -> AppResult<CatalogFile> {
     let mut merged = preset()?;
-    let custom = load_custom(app);
+    let custom = load_custom(app)?;
     for t in custom.templates {
         if let Some(builtin) = merged.templates.iter_mut().find(|b| b.id == t.id) {
             *builtin = t.clone(); // 覆盖
@@ -175,8 +189,10 @@ pub fn save_custom_template(
     if !category.trim().is_empty() {
         t.category = category.trim().to_string();
     }
+    crate::validation::validate_template(&t)?;
+    let _lock = store::data_lock(&app)?;
     let tid = t.id.clone();
-    let mut custom = load_custom(&app);
+    let mut custom = load_custom(&app)?;
     if let Some(existing) = custom.templates.iter_mut().find(|x| x.id == t.id) {
         *existing = t.clone();
     } else {
@@ -191,13 +207,17 @@ pub fn save_custom_template(
 /// 删除自定义条目（仅自定义目录内存在的 id 可删）
 #[tauri::command]
 pub fn delete_custom_template(app: AppHandle, id: String) -> AppResult<CatalogFile> {
-    let mut custom = load_custom(&app);
+    let _lock = store::data_lock(&app)?;
+    let mut custom = load_custom(&app)?;
     let before = custom.templates.len();
     custom.templates.retain(|t| t.id != id);
     if custom.templates.len() == before {
-        return Err(AppError::Invalid(format!("「{id}」不是自定义条目（内置条目不可删除）")));
+        return Err(AppError::Invalid(format!(
+            "「{id}」不是自定义条目（内置条目不可删除）"
+        )));
     }
     save_custom(&app, &custom)?;
+    crate::app_ops::__audit(&app, "delete_custom_template", &id);
     list_catalog(app)
 }
 
@@ -206,10 +226,15 @@ pub fn delete_custom_template(app: AppHandle, id: String) -> AppResult<CatalogFi
 pub async fn fetch_remote_catalog(app: AppHandle, url: String) -> AppResult<String> {
     tauri::async_runtime::spawn_blocking(move || {
         let settings = store::load_settings(&app)?;
+        if !url.trim().starts_with("https://") {
+            return Err(AppError::Invalid("远程目录必须使用 HTTPS".into()));
+        }
         let raw = crate::net::http_get_with_settings(&settings, url.trim(), 30)?;
         let remote: CatalogFile = serde_json::from_str(&raw)
             .map_err(|e| AppError::Serialize(format!("远程目录格式无效: {e}")))?;
-        let mut custom = load_custom(&app);
+        validate_catalog(&remote)?;
+        let _lock = store::data_lock(&app)?;
+        let mut custom = load_custom(&app)?;
         let mut added = 0u32;
         let mut updated = 0u32;
         for t in remote.templates {
@@ -231,4 +256,29 @@ pub async fn fetch_remote_catalog(app: AppHandle, url: String) -> AppResult<Stri
     })
     .await
     .map_err(|e| AppError::Io(format!("任务异常: {e}")))?
+}
+
+/// Frozen project templates take precedence; missing definitions are validated, never guessed.
+pub fn overlay(mut cat: CatalogFile, p: &crate::models::Project) -> CatalogFile {
+    for t in &p.template_snapshots {
+        cat.templates.retain(|x| x.id != t.id);
+        cat.templates.push(t.clone());
+    }
+    cat
+}
+pub fn for_project(app: &AppHandle, p: &crate::models::Project) -> AppResult<CatalogFile> {
+    Ok(overlay(merged_catalog(app)?, p))
+}
+pub fn freeze(app: &AppHandle, p: &crate::models::Project) -> AppResult<crate::models::Project> {
+    let cat = for_project(app, p)?;
+    crate::validation::require(p, &cat, false)?;
+    let mut out = p.clone();
+    out.template_snapshots = cat
+        .templates
+        .iter()
+        .filter(|&t| p.instances.iter().any(|i| i.template_id == t.id))
+        .cloned()
+        .collect();
+    crate::credentials::strip_project(&mut out, &cat);
+    Ok(out)
 }

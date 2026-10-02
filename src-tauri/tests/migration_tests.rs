@@ -7,10 +7,7 @@ fn temp_root(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "opost-migrate-{tag}-{}-{n}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("opost-migrate-{tag}-{}-{n}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -32,9 +29,18 @@ fn merge_copies_missing_and_keeps_existing() {
     let (files, _bytes) = merge_dir_recursive(&src, &dst).unwrap();
 
     assert_eq!(files, 2); // keep.txt + new.txt
-    assert_eq!(fs::read_to_string(dst.join("a/old.txt")).unwrap(), "existing-dst");
-    assert_eq!(fs::read_to_string(dst.join("a/keep.txt")).unwrap(), "new-src");
-    assert_eq!(fs::read_to_string(dst.join("b/new.txt")).unwrap(), "new-file");
+    assert_eq!(
+        fs::read_to_string(dst.join("a/old.txt")).unwrap(),
+        "existing-dst"
+    );
+    assert_eq!(
+        fs::read_to_string(dst.join("a/keep.txt")).unwrap(),
+        "new-src"
+    );
+    assert_eq!(
+        fs::read_to_string(dst.join("b/new.txt")).unwrap(),
+        "new-file"
+    );
     // 源目录保持不变（非破坏性）
     assert!(src.join("a/old.txt").is_file());
     let _ = fs::remove_dir_all(&root);

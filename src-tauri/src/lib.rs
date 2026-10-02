@@ -1,16 +1,24 @@
 pub mod app_ops;
-pub mod builder;
+pub mod backup;
+pub mod baseline;
 pub mod build_history;
+pub mod builder;
 pub mod catalog;
 mod commands;
+pub mod compose;
+pub mod credentials;
 pub mod docker_pkgs;
 pub mod docker_versions;
 mod engine;
 mod error;
+pub mod image_archive;
 pub mod images;
+pub mod io_util;
 pub mod models;
 mod net;
+pub mod render_context;
 pub mod store;
+pub mod validation;
 pub mod xlsx_export;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -24,6 +32,7 @@ pub fn run() {
             commands::load_project,
             commands::clone_project,
             commands::delete_project,
+            commands::validate_project,
             commands::get_settings,
             commands::save_settings,
             commands::get_storage_info,
@@ -86,7 +95,9 @@ pub fn run_cli_build(project_id: &str, out_log: Option<String>) -> i32 {
                             "[cli] 构建完成: {}
 [cli] 产物: {}
 [cli] 服务器: {} 台",
-                            r.build_id, r.output_dir, r.servers.len()
+                            r.build_id,
+                            r.output_dir,
+                            r.servers.len()
                         ),
                         0,
                     ),

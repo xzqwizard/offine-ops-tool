@@ -1,106 +1,43 @@
-# 运维手册 - {{ project_name }} / {{ server.name }}
+# 运维手册：{{ project_name }} / {{ server.name }}
 
-> 由离线部署运维工具于 {{ generated_at }} 自动生成（构建 {{ build_id }}）。
-> 密码等敏感信息在 compose 文件中，`ops.sh config` 不回显。
+部署身份 `{{ project_id }}/{{ server_id }}`，构建号 `{{ build_id }}`。以下命令均在已部署目录执行，需 root 权限。服务名以本机清单为准：
 
-## 1. 本机部署架构
-
-| 服务 | 镜像 | 宿主端口 | 数据目录 |
+| 服务 | 镜像 | 发布端口 | 数据目录 |
 |---|---|---|---|
-{% for inst in instances %}| {{ inst.instance_name }} | {{ inst.image }} | {{ inst.ports_csv }} | stack/data/{{ inst.instance_name }} |
+{% for inst in instances %}| `{{ inst.instance_name }}` | `{{ inst.image }}` | {{ inst.ports_csv }} | `stack/data/{{ inst.instance_name }}/` |
 {% endfor %}
 
-目录布局：
-
-- 部署根目录：`{{ server.deploy_base_dir }}/{{ dir_name }}`
-- 编排文件：`stack/docker-compose.yml`
-- 数据卷：`stack/data/<服务名>/`（**备份重点**）
-- 日志：`logs/`（部署与运维操作均留痕）
-
-## 2. 日常巡检（建议每日）
+## 巡检与操作
 
 ```bash
-bash scripts/ops.sh status          # 全部容器状态
-bash scripts/ops.sh doctor          # 端口/磁盘/内存/日志错误关键字
-docker stats --no-stream            # 资源占用
-df -h {{ server.docker_data_root }} # Docker 数据盘
+sudo bash scripts/ops.sh status
+sudo bash scripts/ops.sh logs all
+sudo bash scripts/ops.sh report
+sudo bash scripts/ops.sh start all
+sudo bash scripts/ops.sh stop all
+sudo bash scripts/ops.sh restart all
 ```
 
-## 3. 通用操作速查
+单服务操作使用清单中的真实服务名：`sudo bash scripts/ops.sh restart <服务名>`、`logs <服务名>`、`exec <服务名> <命令> [参数]`。读写操作和执行命令会进入 `logs/operations.log`。`ops.sh status` 执行全部服务健康探测，失败返回非零。`logs all` 展示全部服务日志。
+
+## 一致性备份与恢复
 
 ```bash
-# 全部服务
-bash scripts/ops.sh start all / stop all / restart all
-
-# 单个服务（可用: {{ services_csv }}）
-bash scripts/ops.sh restart mysql
-bash scripts/ops.sh logs mysql -f --tail 200
-bash scripts/ops.sh exec mysql sh
-
-# 原生 docker（等价入口）
-cd stack && docker compose ps
-docker logs -f --tail 100 mysql
-docker exec -it mysql sh
+sudo bash scripts/ops.sh backup
+sudo bash scripts/ops.sh restore /备份目录 --yes
+sudo bash scripts/ops.sh prune-backups 7
 ```
 
-## 4. 备份与恢复
+备份根目录：`{{ server.deploy_base_dir }}/backups/{{ project_id }}/{{ server_id }}/`。每份含冷停机后的数据/编排/脚本、镜像 tar、镜像标签映射、身份和 SHA256 校验。备份会暂停本方案服务；备份成功才标记 `COMPLETE`，失败不会当作可恢复版本。只能删减已完成备份；保留数量由 `prune-backups` 参数指定。
 
-```bash
-# 文件级快照（全部数据卷 → backup/目录，保留最近5份）
-bash scripts/ops.sh backup
-```
+恢复先校验完整性、身份和归档路径，再加载镜像、停服务、切换数据与配置、启动并检查健康。失败会尝试恢复原配置、镜像标签和服务；若回退本身失败，退出码为 2，控制台会指出保留的恢复前目录。恢复成功仍保留恢复前数据于 `.before-restore.*`，核对无误后由管理员清理。恢复会覆盖备份后写入的数据，因此先确认业务停写和恢复点。不要把运行中的数据库目录直接复制为备份。
 
-{% for inst in instances %}
-### 4.{{ loop.index }} {{ inst.instance_name }}（{{ inst.image }}）
-{% if inst.backup_hint %}
-{{ inst.backup_hint }}
-{% else %}
-逻辑备份请参照官方工具（数据库类优先逻辑导出），文件级兜底：`ops.sh backup`。
-{% endif %}
-{% endfor %}
+## 升级与回滚
 
-恢复：停止对应服务 → 解压 `backup/<时间戳>/<服务名>.tar.gz` 覆盖 `stack/data/<服务名>/` → 重启服务。
+升级包在单独目录执行 `sudo bash scripts/upgrade.sh --target <已部署目录> --dry-run`，确认后去掉 `--dry-run`。升级前会完整冷备份；候选版本启动或健康检查失败会自动恢复。升级成功打印对应的冷备份路径；人工回滚用 `sudo bash scripts/ops.sh rollback <该备份目录> --yes`。`--dry-run` 不检验实际容器能否启动。每次升级必须引用当前已部署构建号，不能跨版本直接跳到旧基线。
 
-## 5. 故障排查对照表
+## 防火墙与错误处理
 
-### 5.0 部署错误码（deploy.sh 输出）
+本机来源白名单需单独执行 `sudo bash scripts/apply-firewall.sh --apply`；只支持 Docker IPv4 iptables `DOCKER-USER` 后端。部署和恢复脚本不会暗中首次开启防火墙。持久化后升级与恢复会重新应用相应版本的规则。拒绝来源的已建立连接可能持续到连接关闭；现场应测试允许与拒绝来源。
 
-| 错误码 | 含义 | 处置 |
-|---|---|---|
-| D1 | 环境预检未通过 | 看预检 ✗ 项：架构不匹配=拿错包；端口占用=ss -lntp 查占用进程；磁盘不足=清理数据盘 |
-| D2 | 无 Docker 且包内无安装材料 | 联系工具端补齐 Docker 离线安装包后重新构建；或人工安装与方案一致的 Docker 版本 |
-| D3 | 缺 docker compose v2 插件 | 联系工具端补对应架构 compose 插件；或人工安装 docker-compose-plugin |
-| D4 | 健康检查超时 | 看 5.1 对照表逐项排查；确认 `docker logs` 无异常后可重跑 `bash scripts/deploy.sh` |
-
-### 5.1 运行期症状
-
-| 症状 | 排查 | 常见原因 |
-|---|---|---|
-| 容器反复重启 | `docker logs --tail 100 <服务>` | 配置/密码错误、端口冲突、数据目录权限 |
-| 服务起但访问不通 | `ss -lnt | grep <端口>`；`docs/PORT-MATRIX.md` 核对来源 | 防火墙未放行、监听 127.0.0.1 |
-| 磁盘占满 | `df -h`；`docker system df` | 日志未轮转、镜像堆积（`docker system prune` 谨慎） |
-| 健康检查失败 | `bash scripts/ops.sh doctor` | 依赖服务未就绪、内存不足 |
-| 部署脚本报架构不匹配 | `uname -m` | 拿错了别的服务器的离线包 |
-
-## 6. 升级与回滚（预置流程）
-
-```bash
-# 升级：新镜像 tar 放入 images/ 后
-docker load -i images/<新镜像>.tar
-cd stack && docker compose up -d     # 仅重建镜像变化的服务
-
-# 回滚：改回旧镜像 tag 后 up -d；升级前先 ops.sh backup
-```
-
-## 7. 安全红线
-
-- 禁止直接 `rm -rf stack/data/*`
-- 首次部署后立即修改各中间件默认密码（compose 文件中的初始密码仅用于首次初始化）
-- `docker system prune` 会删除未使用镜像，执行前确认可回滚
-- 变更操作请记录到下方变更表并同步项目组
-
-## 8. 变更记录（现场填写）
-
-| 日期 | 操作人 | 变更内容 | 结果 |
-|---|---|---|---|
-|  |  |  |  |
+脚本普通失败退出非零；收到 INT/TERM 分别返回 130/143，自动回退失败返回 2。查看命令错误及 `logs/operations.log`；不要把失败返回当作服务已恢复的证明，应运行 `ops.sh status` 并验证实际业务数据。`docker compose config -q` 只验证编排，不验证数据库行为。

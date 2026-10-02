@@ -3,11 +3,21 @@ fn main() {
     // 改为下方全局注入统一清单：否则仅 bin 有 manifest，而 lib 单元测试/
     // 集成测试/示例产物缺失清单时，加载器绑定 comctl32 5.82，缺少
     // TaskDialogIndirect 等入口 → 进程以 STATUS_ENTRYPOINT_NOT_FOUND 静默失败。
-    let attrs = tauri_build::Attributes::default()
-        .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
-    if let Err(e) = tauri_build::try_build(attrs) {
-        // 与 tauri_build::build() 行为一致：构建失败直接 panic
-        panic!("tauri_build failed: {e}");
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let gnu = target.contains("windows-gnu");
+    let attrs = if gnu {
+        tauri_build::Attributes::default()
+            .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest())
+    } else {
+        tauri_build::Attributes::default()
+    };
+    tauri_build::try_build(attrs).expect("tauri_build failed");
+    if target.contains("windows-msvc") {
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'");
+    }
+    if !gnu {
+        return;
     }
 
     // windows-gnu + rust-lld 链接方案：lld 不允许重复资源，而 gcc specs 默认
@@ -42,9 +52,12 @@ fn main() {
         if std::fs::write(&manifest, xml).is_ok() {
             let _ = std::fs::write(&rc, "1 24 \"app-manifest.xml\"\n");
             let wr = std::process::Command::new("x86_64-w64-mingw32-windres")
-                .arg("-i").arg(&rc)
-                .arg("-O").arg("coff")
-                .arg("-o").arg(&obj)
+                .arg("-i")
+                .arg(&rc)
+                .arg("-O")
+                .arg("coff")
+                .arg("-o")
+                .arg(&obj)
                 .current_dir(out)
                 .status();
             if matches!(wr, Ok(s) if s.success()) {

@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# Shared runtime. Source from the generated scripts; values are shell-quoted by the builder.
+set -euo pipefail
+umask 077
+BASE_DIR="${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+STACK_DIR="${STACK_DIR:-$BASE_DIR/stack}"
+PROJECT_ID={{ project_id | shq }}
+SERVER_ID={{ server_id | shq }}
+EXPECTED_BUILD={{ build_id | shq }}
+BASELINE_BUILD={{ baseline_build_id | shq }}
+STACK_NAME={{ stack_name | shq }}
+DEPLOY_BASE={{ server.deploy_base_dir | shq }}
+BACKUP_DIR="$DEPLOY_BASE/backups/$PROJECT_ID/$SERVER_ID"
+LOG_DIR="$BASE_DIR/logs"
+mkdir -p "$LOG_DIR"
+compose() { docker compose --project-directory "$STACK_DIR" -p "$STACK_NAME" -f "$STACK_DIR/docker-compose.yml" "$@"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+audit() { printf '%s\t%s\n' "$(date -Is)" "$*" >> "$LOG_DIR/operations.log"; }
+root_required() { [ "$(id -u)" -eq 0 ] || die '需要 root 权限'; }
+lock_ops() { command -v flock >/dev/null || die '需要 util-linux flock'; exec 9>"$BASE_DIR/.ops.lock"; flock -n 9 || die '已有部署/运维任务运行'; }
+identity_value() { sed -n "s/^$2='\([A-Za-z0-9_-]*\)'$/\1/p" "$1/deployment.env"; }
+check_identity() {
+  [ -f "$1/deployment.env" ] || die '目标缺少部署身份文件，请先全量部署';
+  [ "$(identity_value "$1" PROJECT_ID)" = "$PROJECT_ID" ] || die '方案身份不匹配';
+  [ "$(identity_value "$1" SERVER_ID)" = "$SERVER_ID" ] || die '服务器身份不匹配';
+}
+verify_package() { (cd "$BASE_DIR" && sha256sum -c SHA256SUMS) || die '包校验失败'; }
+prepare_data() {
+{% for inst in instances %}
+  mkdir -p "$STACK_DIR/data/{{ inst.instance_name }}"
+{% if inst.initialize_html %}
+  chmod 755 "$STACK_DIR/data/{{ inst.instance_name }}"
+  if [ ! -e "$STACK_DIR/data/{{ inst.instance_name }}/index.html" ]; then printf '<!doctype html><title>Ready</title><p>Offline deployment ready</p>\n' > "$STACK_DIR/data/{{ inst.instance_name }}/index.html"; chmod 644 "$STACK_DIR/data/{{ inst.instance_name }}/index.html"; fi
+{% endif %}
+{% if inst.data_user %}
+  chown -R {{ inst.data_user | shq }} "$STACK_DIR/data/{{ inst.instance_name }}"
+{% endif %}
+{% endfor %}
+  chmod 600 "$STACK_DIR/docker-compose.yml"
+}
+health() {
+{% for inst in instances %}
+  local deadline=$((SECONDS + {{ inst.health_timeout }})) ready=0
+  while [ "$SECONDS" -lt "$deadline" ]; do
+{% if inst.health_cmd %}
+    if compose exec -T {{ inst.instance_name | shq }} {{ inst.health_cmd }} >/dev/null 2>&1; then ready=1; break; fi
+{% elif inst.health_tcp %}
+    if timeout 3 bash -c {{ ("</dev/tcp/" ~ server.ip ~ "/" ~ inst.health_tcp) | shq }} 2>/dev/null; then ready=1; break; fi
+{% else %}
+    # Custom services without a probe must at least remain running through a stability window.
+    if [ -n "$(compose ps --status running -q {{ inst.instance_name | shq }})" ]; then
+      sleep 5
+      if [ -n "$(compose ps --status running -q {{ inst.instance_name | shq }})" ]; then ready=1; break; fi
+    fi
+{% endif %}
+    sleep 2
+  done
+  [ "$ready" -eq 1 ] || { audit 'health failed: {{ inst.instance_name }}'; return 1; }
+{% endfor %}
+}
+validate_snapshot() {
+  local dir=$1 name
+  [ -f "$dir/COMPLETE" ] && [ -f "$dir/snapshot.tar.gz" ] && [ -f "$dir/images.tar" ] || die '备份未完成';
+  [ "$(cat "$dir/PROJECT_ID")" = "$PROJECT_ID" ] && [ "$(cat "$dir/SERVER_ID")" = "$SERVER_ID" ] || die '备份身份不匹配';
+  (cd "$dir" && sha256sum -c SHA256SUMS) || die '备份校验失败';
+  tar -tzf "$dir/snapshot.tar.gz" > "$dir/.entries"
+  while IFS= read -r name; do
+    case "$name" in stack|stack/*|scripts|scripts/*|docs|docs/*|README.md|manifest.json|deployment.env) ;; *) die "备份条目越界: $name";; esac
+    case "/$name/" in */../*|*/./*|*\\*) die '备份包含不安全路径';; esac
+  done < "$dir/.entries"
+  LC_ALL=C tar -tvzf "$dir/snapshot.tar.gz" | awk 'substr($0,1,1)!="d" && substr($0,1,1)!="-" {bad=1} END {exit bad}' || die '备份含符号/硬链接；需人工处理特殊数据卷';
+  rm -f "$dir/.entries"
+}
+snapshot() {
+  local restart_after=${1:-1} ts running ref image dir need available image_bytes=0 image_size
+  check_identity "$BASE_DIR"
+  mkdir -p "$BACKUP_DIR"
+  ts="$(date +%Y%m%d-%H%M%S)-$$-$(od -An -N4 -tx1 /dev/urandom | tr -d ' ')"
+  dir="$BACKUP_DIR/$ts.pending"
+  mkdir "$dir"
+  SNAPSHOT_PENDING=$dir; SNAPSHOT_RUNNING=''
+  trap 'rc=$?; trap - EXIT; if [ -n "${SNAPSHOT_RUNNING:-}" ]; then mapfile -t rs <<< "$SNAPSHOT_RUNNING"; compose start "${rs[@]}" || rc=1; fi; if [ -n "${SNAPSHOT_PENDING:-}" ]; then rm -rf -- "$SNAPSHOT_PENDING"; fi; exit "$rc"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  running=$(compose ps --status running --services)
+  compose config --images | sort -u > "$dir/references"
+  : > "$dir/image-map.tsv"
+  while IFS= read -r ref; do
+    image=$(docker image inspect --format {% raw %}'{{.Id}}'{% endraw %} "$ref") || return 1
+    printf '%s\t%s\n' "$image" "$ref" >> "$dir/image-map.tsv"
+  done < "$dir/references"
+  mapfile -t image_ids < <(cut -f1 "$dir/image-map.tsv" | sort -u)
+  for image in "${image_ids[@]}"; do
+    image_size=$(docker image inspect --format {% raw %}'{{.Size}}'{% endraw %} "$image") || return 1
+    [[ "$image_size" =~ ^[0-9]+$ ]] || return 1
+    image_bytes=$((image_bytes+image_size))
+  done
+  need=$(du -sk "$BASE_DIR/stack" "$BASE_DIR/scripts" "$BASE_DIR/docs" | awk '{total+=$1} END {print total}')
+  available=$(df -Pk "$BACKUP_DIR" | awk 'END {print $4}')
+  [ "$available" -gt "$((need*2+image_bytes/1024*2+102400))" ] || { printf '备份空间不足\n' >&2; return 1; }
+  docker image save -o "$dir/images.tar" "${image_ids[@]}" || return 1
+  # An EXIT trap restores the original running set even on tar/stop failure or signals.
+  printf '%s\n' "$running" > "$dir/running-services"
+  SNAPSHOT_RUNNING=$running
+  compose stop --timeout 300 || return 1
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    image=$(compose ps -a -q "$ref") || return 1
+    [ -n "$image" ] || return 1
+    [ "$(docker inspect --format {% raw %}'{{.State.ExitCode}}'{% endraw %} "$image")" != 137 ] || { printf '服务 %s 被强制终止；未创建可信冷备份\n' "$ref" >&2; return 1; }
+  done <<< "$running"
+  tar --numeric-owner -czf "$dir/snapshot.tar.gz" -C "$BASE_DIR" stack scripts docs README.md manifest.json deployment.env || return 1
+  printf '%s\n' "$PROJECT_ID" > "$dir/PROJECT_ID"; printf '%s\n' "$SERVER_ID" > "$dir/SERVER_ID"
+  (cd "$dir" && sha256sum snapshot.tar.gz images.tar image-map.tsv running-services PROJECT_ID SERVER_ID > SHA256SUMS) || return 1
+  touch "$dir/COMPLETE"
+  LAST_BACKUP="$BACKUP_DIR/$ts"
+  mv "$dir" "$LAST_BACKUP" || return 1
+  SNAPSHOT_PENDING=''
+  if [ "$restart_after" -eq 1 ] && [ -n "$running" ]; then mapfile -t rs <<< "$running"; compose start "${rs[@]}" || return 1; health || return 1; fi
+  trap - EXIT INT TERM; SNAPSHOT_RUNNING=''
+  audit "backup complete $LAST_BACKUP"
+  printf '一致性冷备份完成: %s\n' "$LAST_BACKUP"
+}
+restore_snapshot() (
+  # Subshell traps cannot replace the caller's upgrade rollback trap.
+  set -euo pipefail
+  local dir=$1 work current='' item ref image stopped=0 success=0 rollback_failed=0
+  validate_snapshot "$dir"
+  local available need
+  available=$(df -Pk "$BASE_DIR" | awk 'END {print $4}')
+  need=$(du -sk "$dir" | awk '{print $1}')
+  [ "$available" -gt "$((need*3+102400))" ] || die '恢复盘空间不足'
+  work=$(mktemp -d "$BASE_DIR/.restore.XXXXXX")
+  restore_exit() {
+    local rc=$? item image ref
+    trap - EXIT INT TERM
+    if [ "$success" -eq 0 ] && [ "$stopped" -eq 1 ]; then
+      compose down --timeout 60 --remove-orphans || rollback_failed=1
+      if [ -n "$current" ]; then
+        for item in stack scripts docs README.md manifest.json deployment.env; do
+          if [ -e "$current/$item" ]; then
+            rm -rf -- "$BASE_DIR/$item"
+            mv "$current/$item" "$BASE_DIR/$item" || rollback_failed=1
+          fi
+        done
+      fi
+      while IFS=$'\t' read -r image ref; do docker tag "$image" "$ref" || rollback_failed=1; done < "$work/current-images.tsv"
+      compose up -d --remove-orphans || rollback_failed=1
+      bash "$BASE_DIR/scripts/ops.sh" status || rollback_failed=1
+      if [ -f /etc/offline-preops/{{ firewall_chain }}.sh ]; then bash "$BASE_DIR/scripts/apply-firewall.sh" --apply || rollback_failed=1; fi
+      audit "restore failed; returned to previous configuration rc=$rc"
+    fi
+    rm -rf -- "$work"
+    if [ "$rollback_failed" -ne 0 ]; then printf '恢复失败且自动回退未完成；原数据位于 %s\n' "$current" >&2; exit 2; fi
+    exit "$rc"
+  }
+  trap restore_exit EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  tar --numeric-owner -xzf "$dir/snapshot.tar.gz" -C "$work"
+  check_identity "$work"
+  for item in stack scripts docs README.md manifest.json deployment.env; do [ -e "$work/$item" ] || die "备份缺少 $item"; done
+  while IFS=$'\t' read -r image ref; do
+    [[ "$image" =~ ^sha256:[a-f0-9]{64}$ ]] && [[ "$ref" =~ ^[A-Za-z0-9._:/@-]+$ ]] || die '备份镜像映射无效'
+  done < "$dir/image-map.tsv"
+  docker compose --project-directory "$work/stack" -p "$STACK_NAME" -f "$work/stack/docker-compose.yml" config -q
+  # A failed candidate may reference an image that never loaded. Preserve any
+  # available tags, but never block recovery of the verified snapshot on it.
+  compose config --images | sort -u > "$work/current-references" || :
+  : > "$work/current-images.tsv"
+  while IFS= read -r ref; do
+    image=$(docker image inspect --format {% raw %}'{{.Id}}'{% endraw %} "$ref") || continue
+    printf '%s\t%s\n' "$image" "$ref" >> "$work/current-images.tsv"
+  done < "$work/current-references"
+  docker load -i "$dir/images.tar"
+  current=$(mktemp -d "$BASE_DIR/.before-restore.XXXXXX")
+  stopped=1
+  compose down --timeout 60 --remove-orphans
+  while IFS=$'\t' read -r image ref; do docker tag "$image" "$ref"; done < "$dir/image-map.tsv"
+  for item in stack scripts docs README.md manifest.json deployment.env; do
+    mv "$BASE_DIR/$item" "$current/$item"
+    mv "$work/$item" "$BASE_DIR/$item"
+  done
+  compose up -d --remove-orphans
+  # Use the restored version's health probes before accepting the restore.
+  bash "$BASE_DIR/scripts/ops.sh" status
+  if [ -f /etc/offline-preops/{{ firewall_chain }}.sh ]; then bash "$BASE_DIR/scripts/apply-firewall.sh" --apply; fi
+  printf '%s\n' "$(identity_value "$BASE_DIR" BUILD_ID)" > "$BASE_DIR/.installed"
+  success=1
+  audit "restore complete $dir; previous state $current"
+  printf '恢复完成；恢复前数据保留于 %s\n' "$current"
+)

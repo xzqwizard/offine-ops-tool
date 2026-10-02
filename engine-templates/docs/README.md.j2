@@ -1,69 +1,36 @@
-# 部署指引 - {{ project_name }} / {{ server.name }}
+# {{ project_name }} / {{ server.name }}
 
-> 本文档由离线部署运维工具于 {{ generated_at }} 自动生成（构建 {{ build_id }}），
-> 与包内配置强一致；手工修改编排后请同步更新。
+构建号 `{{ build_id }}`；服务器身份 `{{ server_id }}`；架构 `{{ server.arch }}`；目标 Docker `{{ server.docker_version }}`。
+包内 `SHA256SUMS` 必须先通过。运行脚本需要 root、Docker Compose v2、GNU tar/coreutils 和足够磁盘空间；Docker 安装材料只在全量包中提供。
 
-## 1. 本机部署内容
+{% if baseline_build_id %}
+## 增量升级
 
-| 项 | 值 |
-|---|---|
-| CPU 架构 | {{ server.arch }}（`uname -m` 应为 {{ uname_arch }}） |
-| 操作系统 | {{ server.os_family }} {{ server.os_version }} |
-| Docker 目标版本 | {{ server.docker_version }} |
-| Docker 数据目录 | {{ server.docker_data_root }} |
-| 部署目录 | {{ server.deploy_base_dir }}（建议将本包解压至该目录） |
-| 服务清单 | {{ services_csv }} |
-
-## 2. 部署步骤
+基线构建号 `{{ baseline_build_id }}`。将新包解压到**与已部署目录不同的路径**，确认目标是同一方案、同一服务器：
 
 ```bash
-# 0) 摆渡校验：确认包完整（可选，防介质损坏/篡改）
+cd {{ (server.deploy_base_dir ~ '/' ~ dir_name) | shq }}
 sha256sum -c SHA256SUMS
-
-# 1) 解压到部署目录（示例）
-sudo mkdir -p {{ server.deploy_base_dir }}
-sudo tar -xzf {{ dir_name }}.tar.gz -C {{ server.deploy_base_dir }}
-cd {{ server.deploy_base_dir }}/{{ dir_name }}
-
-# 2) 环境预检（可独立先跑，输出 ✅/⚠️/❌ 报告）
-bash scripts/precheck.sh
-
-# 3) 一键部署（预检 → 装 Docker → 导镜像 → 起服务 → 健康检查）
-bash scripts/deploy.sh
-
-# 4) 验证
-bash scripts/ops.sh status
-docker compose -f stack/docker-compose.yml ps
+sudo bash scripts/upgrade.sh --target /已部署目录 --dry-run
+sudo bash scripts/upgrade.sh --target /已部署目录
 ```
 
-> U 盘提示：镜像 tar 常超过 4GB，请使用 exFAT/NTFS 格式介质，勿用 FAT32。
+`--dry-run` 校验身份、基线、包和编排，不停服务。正式升级会做一致性冷备份、加载变更镜像、更新编排并执行健康检查；失败时自动回滚。成功后输出备份位置与回滚命令。目标机 OS、架构、IP、Docker 版本或数据路径变化时必须重新全量构建。
+{% else %}
+## 首次部署与重跑
 
-## 3. 日常运维
+将 `{{ dir_name }}.tar.gz` 解压至目标目录后进入包目录。目录模式交付时直接将同名目录放在目标路径。
 
 ```bash
-bash scripts/ops.sh            # 交互菜单
-bash scripts/ops.sh status     # 服务总览
-bash scripts/ops.sh logs mysql --tail 200 -f
-bash scripts/ops.sh restart redis
-bash scripts/ops.sh doctor     # 全面诊断
-bash scripts/ops.sh backup     # 数据卷备份
+sudo mkdir -p {{ server.deploy_base_dir | shq }}
+sudo tar -xzf {{ (dir_name ~ '.tar.gz') | shq }} -C {{ server.deploy_base_dir | shq }}
+cd {{ (server.deploy_base_dir ~ '/' ~ dir_name) | shq }}
+sha256sum -c SHA256SUMS
+sudo bash scripts/deploy.sh
+sudo bash scripts/ops.sh status
 ```
 
-详见 `docs/OPS-GUIDE.md`（常用指令与故障排查）与 `docs/PORT-MATRIX.md`（端口开通）。
+`deploy.sh` 会安装或核对 Docker 和 Compose，预检 CPU/内存/磁盘/端口，导入镜像，启动并检查服务。失败时没有成功标记；同一构建可重跑。已有其他构建号时请使用升级包。导入的镜像 tar、Compose 文件和密码包含敏感内容，请保护整个部署目录；Compose 会被设为仅属主可读写。
+{% endif %}
 
-## 4. 目录结构
-
-```text
-{{ dir_name }}/
-├── manifest.json        # 本包清单（镜像/端口/实例摘要）
-├── SHA256SUMS           # 完整性校验
-├── README.md            # 本文档
-├── docker-offline/      # Docker 离线安装材料（如已配置）
-├── images/              # 镜像 tar（docker save 格式）
-├── stack/
-│   ├── docker-compose.yml
-│   └── data/<服务名>/   # 运行后产生的数据（备份重点）
-├── scripts/             # deploy.sh / ops.sh / precheck.sh / apply-firewall.sh
-├── firewall/
-└── docs/                # OPS-GUIDE.md / PORT-MATRIX.md
-```
+运维命令、备份路径和恢复步骤见 `docs/OPS-GUIDE.md`，端口与来源规则见 `docs/PORT-MATRIX.md`。U 盘摆渡应使用支持超过 4 GB 单文件的格式，并复核外层交付校验和。

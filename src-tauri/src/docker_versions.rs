@@ -70,7 +70,7 @@ pub fn parse_docker_versions(html: &str) -> Vec<String> {
             out.push(candidate.to_string());
         }
     }
-    out.sort_by(|a, b| version_key(b).cmp(&version_key(a)));
+    out.sort_by_key(|b| std::cmp::Reverse(version_key(b)));
     out.dedup();
     out
 }
@@ -82,4 +82,3 @@ pub fn version_key(v: &str) -> (u64, u64, u64) {
     }
     (parts[0], parts[1], parts[2])
 }
-

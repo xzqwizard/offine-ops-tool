@@ -24,11 +24,16 @@ pub struct BuildImageInfo {
     pub size_bytes: u64,
     /// 镜像 digest（来自方案锁定或拉取元数据，产物审计用）
     pub digest: String,
+    pub config_digest: String,
+    pub content_sha256: String,
+    pub expected_digest: String,
+    pub packed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildServerResult {
+    pub server_id: String,
     pub name: String,
     pub arch: String,
     pub dir_name: String,
@@ -51,6 +56,14 @@ pub struct BuildResult {
 // ==================== 模板注册 ====================
 
 pub const TEMPLATES: &[(&str, &str)] = &[
+    (
+        "scripts/upgrade.sh.j2",
+        include_str!("../../engine-templates/scripts/upgrade.sh.j2"),
+    ),
+    (
+        "scripts/runtime.sh.j2",
+        include_str!("../../engine-templates/scripts/runtime.sh.j2"),
+    ),
     (
         "scripts/precheck.sh.j2",
         include_str!("../../engine-templates/scripts/precheck.sh.j2"),
@@ -91,6 +104,10 @@ pub const TEMPLATES: &[(&str, &str)] = &[
 
 pub fn template_env() -> AppResult<Environment<'static>> {
     let mut env = Environment::new();
+    env.add_filter("shq", |v: String| shell_quote(&v));
+    env.add_filter("jsonstr", |v: String| {
+        serde_json::to_string(&v).unwrap_or_default()
+    });
     for (name, src) in TEMPLATES {
         env.add_template(name, src)
             .map_err(|e| AppError::Serialize(format!("模板 {name} 解析失败: {e}")))?;
@@ -99,6 +116,9 @@ pub fn template_env() -> AppResult<Environment<'static>> {
 }
 
 pub fn render(env: &Environment<'_>, name: &str, ctx: &serde_json::Value) -> AppResult<String> {
+    if name == "compose/docker-compose.yml.j2" {
+        return crate::compose::from_context(ctx);
+    }
     let tpl = env
         .get_template(name)
         .map_err(|e| AppError::Serialize(format!("模板 {name} 缺失: {e}")))?;
@@ -109,74 +129,8 @@ pub fn render(env: &Environment<'_>, name: &str, ctx: &serde_json::Value) -> App
 // ==================== 工具函数 ====================
 
 /// shell 单引号包裹（元素内 ' 转义为 '\''）
-fn shell_quote(s: &str) -> String {
+pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// 读取 docker-archive tar 内 manifest.json 的 RepoTags 列表
-fn read_tar_repo_tags(path: &Path) -> AppResult<Vec<String>> {
-    let f = File::open(path)?;
-    let mut archive = tar::Archive::new(BufReader::new(f));
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let name = entry.path()?.to_string_lossy().replace('\\', "/");
-        if name == "manifest.json" {
-            let mut body = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut body)?;
-            let v: serde_json::Value = serde_json::from_str(&body)?;
-            let mut out = Vec::new();
-            if let Some(arr) = v.as_array() {
-                for item in arr {
-                    if let Some(tags) = item.get("RepoTags").and_then(|t| t.as_array()) {
-                        for t in tags {
-                            if let Some(s) = t.as_str() {
-                                out.push(s.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            return Ok(out);
-        }
-    }
-    Ok(vec![])
-}
-
-/// 实例镜像的 digest：方案锁定值优先，其次缓存 meta 里的拉取 digest
-fn image_digest(app: &AppHandle, inst: &crate::models::MiddlewareInstance, src: &Path) -> String {
-    if !inst.digest.is_empty() {
-        return inst.digest.clone();
-    }
-    let meta = src.with_extension("tar.meta.json");
-    if let Ok(raw) = fs::read_to_string(&meta) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let Some(d) = v.get("digest").and_then(|x| x.as_str()) {
-                return d.to_string();
-            }
-        }
-    }
-    let _ = app;
-    String::new()
-}
-
-/// compose 项目名：仅 [a-z0-9_-] 且字母数字开头（compose 强制规则，
-/// 中文/大写/点号会导致现场 `docker compose config` 报错）
-fn compose_name(s: &str) -> String {
-    let mut out = String::new();
-    for c in s.trim().chars() {
-        if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' {
-            out.push(c)
-        } else if c.is_ascii_uppercase() {
-            out.push(c.to_ascii_lowercase())
-        }
-        // 中文与其它字符丢弃
-    }
-    let t = out.trim_matches('-').to_string();
-    if t.is_empty() || !t.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false) {
-        "stack".into()
-    } else {
-        t
-    }
 }
 
 /// 名称转文件/目录安全的片段：保留 Unicode 字母数字（含中文）与 - _ .，
@@ -193,9 +147,17 @@ pub fn sanitize(s: &str) -> String {
             }
         })
         .collect();
-    out.truncate(64);
-    let t = out.trim_matches('-').to_string();
-    if t.is_empty() {
+    while out.len() > 64 {
+        out.pop();
+    }
+    let t = out.trim_matches(['-', '.']).to_string();
+    if t.is_empty()
+        || [
+            "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+            "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+        ]
+        .contains(&t.to_ascii_lowercase().split('.').next().unwrap_or(""))
+    {
         "unnamed".into()
     } else {
         t
@@ -265,92 +227,6 @@ fn collect_sums(root: &Path, dir: &Path, lines: &mut Vec<String>) -> AppResult<(
     Ok(())
 }
 
-fn uname_of(arch: &str) -> &'static str {
-    match arch {
-        "amd64" => "x86_64",
-        "arm64" => "aarch64",
-        other => match other {
-            "loongarch64" => "loongarch64",
-            "mips64el" => "mips64el",
-            _ => "unknown",
-        },
-    }
-}
-
-/// 各中间件的逻辑备份提示（写入手册第 4 章）。
-/// 输出路径统一用绝对备份目录 <deploy_base_dir>/backup（ops.sh backup 的同一路径）；
-/// 密码类一律在容器内引用环境变量（宿主 shell 无这些变量）。
-fn backup_hint(template_id: &str, deploy_base_dir: &str) -> String {
-    let b = format!("{deploy_base_dir}/backup");
-    match template_id {
-        "mysql-8.0" => format!(
-            "```bash\nmkdir -p {b}\ndocker exec mysql sh -c 'mysqldump -uroot -p\"$MYSQL_ROOT_PASSWORD\" --single-transaction --all-databases' | gzip > {b}/mysql-$(date +%F).sql.gz\n```"
-        ),
-        "postgresql-16" => format!(
-            "```bash\nmkdir -p {b}\ndocker exec pgsql sh -c 'pg_dumpall -U postgres' | gzip > {b}/pgsql-$(date +%F).sql.gz\n```"
-        ),
-        "redis-7" => format!(
-            "```bash\nmkdir -p {b}\ndocker exec redis sh -c 'redis-cli -a \"$REDIS_PASSWORD\" BGSAVE'\ncp stack/data/redis/dump.rdb {b}/redis-$(date +%F).rdb\n```"
-        ),
-        "mongodb-7" => format!(
-            "```bash\nmkdir -p {b}\ndocker exec mongo sh -c 'mongodump --archive --gzip' > {b}/mongo-$(date +%F).archive.gz\n```"
-        ),
-        _ => String::new(),
-    }
-}
-
-/// 渲染前字段白名单校验（阻止脚本/compose 注入与损坏）：
-/// - 实例名：字母数字开头 + [A-Za-z0-9_-]（进入 bash 与 compose 服务名，严格）
-/// - 镜像引用：[A-Za-z0-9._:/@-]
-/// - 服务器名/IP/主机名/目录/参数值：禁止控制字符（换行/回车）与反引号
-fn validate_render_fields(project: &Project) -> AppResult<()> {
-    let mut errors: Vec<String> = Vec::new();
-    for inst in &project.instances {
-        let name_ok = !inst.instance_name.is_empty()
-            && inst.instance_name.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false)
-            && inst.instance_name[1..].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-        if !name_ok {
-            errors.push(format!("实例名「{}」不合法（仅允许字母数字开头，含 _ -）", inst.instance_name));
-        }
-        if !inst.image.chars().all(|c| c.is_ascii_alphanumeric() || "._:/@-".contains(c)) {
-            errors.push(format!("实例「{}」的镜像引用含非法字符: {}", inst.instance_name, inst.image));
-        }
-        for (k, v) in &inst.params {
-            let s = match v {
-                serde_json::Value::String(s) => s.as_str(),
-                _ => continue, // 非字符串值序列化无换行风险
-            };
-            if s.contains('\n') || s.contains('\r') || s.contains('`') {
-                errors.push(format!(
-                    "实例「{}」参数 {k} 含换行/反引号（会破坏生成的编排文件）",
-                    inst.instance_name
-                ));
-            }
-        }
-    }
-    for s in &project.servers {
-        for (label, v) in [
-            ("服务器名", s.name.as_str()),
-            ("主机名", s.hostname.as_str()),
-            ("IP", s.ip.as_str()),
-            ("部署目录", s.deploy_base_dir.as_str()),
-            ("Docker 数据目录", s.docker_data_root.as_str()),
-        ] {
-            if v.contains('\n') || v.contains('\r') || v.contains('`') || v.contains('"') {
-                errors.push(format!("服务器「{}」的{label}含换行/引号/反引号: {v}", s.name));
-            }
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(AppError::Invalid(format!(
-            "方案内容含不安全字符，已阻止构建：\n- {}",
-            errors.join("\n- ")
-        )))
-    }
-}
-
 // ==================== 主流程 ====================
 
 #[tauri::command]
@@ -359,8 +235,15 @@ pub async fn build_offline_package(
     project: Project,
     auto_pull: Option<bool>,
     baseline_build_id: Option<String>,
+    task_id: Option<String>,
 ) -> AppResult<BuildResult> {
     tauri::async_runtime::spawn_blocking(move || {
+        EVENT_SCOPE.with(|v| {
+            *v.borrow_mut() = Some((
+                project.id.clone(),
+                task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            ))
+        });
         let auto_pull = auto_pull.unwrap_or(true);
         let r = match &baseline_build_id {
             Some(b) if !b.is_empty() => build_upgrade(&app, &project, auto_pull, b),
@@ -376,8 +259,14 @@ pub async fn build_offline_package(
     .map_err(|e| AppError::Io(format!("构建任务异常: {e}")))?
 }
 
+thread_local! { static EVENT_SCOPE: std::cell::RefCell<Option<(String,String)>> = const {std::cell::RefCell::new(None)}; }
+
 fn emit(app: &AppHandle, step: &str, detail: &str) {
-    let _ = app.emit("build-progress", json!({ "step": step, "detail": detail }));
+    let scope = EVENT_SCOPE.with(|v| v.borrow().clone()).unwrap_or_default();
+    let _ = app.emit(
+        "build-progress",
+        json!({ "step": step, "detail": detail,"projectId":scope.0,"taskId":scope.1 }),
+    );
 }
 
 fn build(app: &AppHandle, project: &Project, auto_pull: bool) -> AppResult<BuildResult> {
@@ -405,51 +294,113 @@ fn build_upgrade(
         "baseline",
         &format!("以构建 {baseline_build_id} 为基线生成升级包"),
     );
-    build_inner(app, project, auto_pull, Some((&baseline, baseline_build_id)))
+    build_inner(
+        app,
+        project,
+        auto_pull,
+        Some((&baseline, baseline_build_id)),
+    )
 }
 
-/// 基线镜像集合：每服务器一个 HashSet<"image@digest-or-tag">
-fn baseline_image_set(
-    baseline: &serde_json::Value,
-    server_name: &str,
-) -> std::collections::HashSet<String> {
-    let mut set = std::collections::HashSet::new();
-    if let Some(servers) = baseline["servers"].as_array() {
-        for s in servers {
-            if s["name"].as_str() != Some(server_name) {
-                continue;
-            }
-            if let Some(imgs) = s["images"].as_array() {
-                for i in imgs {
-                    let reference = i["reference"].as_str().unwrap_or_default();
-                    let digest = i["digest"].as_str().unwrap_or_default();
-                    set.insert(if digest.is_empty() {
-                        reference.to_string()
-                    } else {
-                        format!("{reference}@{digest}")
-                    });
-                }
-            }
-        }
-    }
-    set
-}
+pub use crate::baseline::{baseline_image_set, validate_baseline};
 
+/// Isolated staging directory is only published after all materials and checksums succeed.
 pub fn build_inner(
     app: &AppHandle,
     project: &Project,
     auto_pull: bool,
     upgrade: Option<(&serde_json::Value, &str)>,
 ) -> AppResult<BuildResult> {
-    let now = store::now_rfc3339();
-    let build_id = format!("b-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
-    let catalog = catalog::merged_catalog(app)?; // 合并层：自定义/远程目录条目参与构建
-
+    let _storage_lock = store::storage_lock(app)?;
+    let mut project_frozen = catalog::freeze(app, project)?;
+    project_frozen.registry = project.registry.clone();
+    project_frozen.instances = project.instances.clone();
+    crate::validation::require(
+        &project_frozen,
+        &catalog::for_project(app, &project_frozen)?,
+        true,
+    )?;
+    if let Some((b, _)) = upgrade {
+        validate_baseline(b, project)?;
+    }
     let storage = store::effective_storage(app)?;
-    let out_root = PathBuf::from(&storage.artifact_root)
-        .join(sanitize(&project.name))
-        .join(&build_id);
-    fs::create_dir_all(&out_root)?;
+    let project_root = PathBuf::from(storage.artifact_root).join(format!(
+        "{}-{}",
+        sanitize(&project.name),
+        &crate::io_util::hash(&project.id)[..12]
+    ));
+    fs::create_dir_all(&project_root)?;
+    let _lock = crate::io_util::lock(&project_root.join(".build.lock"))?;
+    let build_id = format!(
+        "b-{}-{}",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let staging = project_root.join(format!(".{build_id}.staging"));
+    fs::create_dir_all(&staging)?;
+    let _cleanup = crate::io_util::Cleanup(staging.clone());
+    match build_staged(
+        app,
+        &project_frozen,
+        auto_pull,
+        upgrade,
+        &staging,
+        &build_id,
+    ) {
+        Ok(mut r) => {
+            let final_dir = project_root.join(&build_id);
+            r.output_dir = final_dir.to_string_lossy().into_owned();
+            for s in &mut r.servers {
+                if let Some(file) = &s.package_file {
+                    s.package_file = Some(
+                        final_dir
+                            .join(Path::new(file).file_name().unwrap_or_default())
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+            let path = staging.join("build-manifest.json");
+            let mut index: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+            for (n, s) in r.servers.iter().enumerate() {
+                index["servers"][n]["packageFile"] = json!(s.package_file);
+            }
+            crate::io_util::atomic_write(&path, serde_json::to_string_pretty(&index)?.as_bytes())?;
+            fs::rename(&staging, &final_dir)?;
+            crate::app_ops::__audit(app, "build_complete", &format!("{} {build_id}", project.id));
+            Ok(r)
+        }
+        Err(e) => {
+            let failure = project_root.join(format!("{build_id}-failed"));
+            fs::create_dir_all(&failure)?;
+            fs::write(
+                failure.join("build-manifest.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"schemaVersion":2,"status":"failed","buildId":build_id,"projectId":project.id,"projectName":project.name,"generatedAt":store::now_rfc3339(),"kind":"failed","error":e.to_string(),"servers":[]}),
+                )?,
+            )?;
+            crate::app_ops::__audit(
+                app,
+                "build_failed",
+                &format!("{} {build_id}: {e}", project.id),
+            );
+            Err(e)
+        }
+    }
+}
+
+fn build_staged(
+    app: &AppHandle,
+    project: &Project,
+    auto_pull: bool,
+    upgrade: Option<(&serde_json::Value, &str)>,
+    staging: &Path,
+    build_id: &str,
+) -> AppResult<BuildResult> {
+    let now = store::now_rfc3339();
+    let build_id = build_id.to_string();
+    let catalog = catalog::for_project(app, project)?;
+    let out_root = staging.to_path_buf();
 
     let env = template_env()?;
     let mut result = BuildResult {
@@ -460,19 +411,31 @@ pub fn build_inner(
         warnings: Vec::new(),
     };
 
-    emit(app, "start", &format!("开始构建 {}（{} 台服务器）", project.name, project.servers.len()));
+    emit(
+        app,
+        "start",
+        &format!(
+            "开始构建 {}（{} 台服务器）",
+            project.name,
+            project.servers.len()
+        ),
+    );
 
     if project.servers.is_empty() {
         return Err(AppError::Invalid("方案中没有服务器，无法构建".into()));
     }
     // 渲染前字段白名单校验：这些字段会进入 bash 脚本 / compose YAML，
     // 拒绝引号/换行/$()/反引号等可破坏或注入生成物的字符。
-    validate_render_fields(project)?;
+    crate::validation::require(project, &catalog, true)?;
 
     for server in &project.servers {
-        emit(app, "server", &format!("处理服务器: {} ({})", server.name, server.arch));
+        emit(
+            app,
+            "server",
+            &format!("处理服务器: {} ({})", server.name, server.arch),
+        );
         let baseline_set = upgrade
-            .map(|(b, _)| baseline_image_set(b, &server.name))
+            .map(|(b, _)| baseline_image_set(b, &server.id, &server.arch))
             .unwrap_or_default();
         let sr = build_server(
             app,
@@ -497,7 +460,10 @@ pub fn build_inner(
 
     // ---- 全局端口矩阵 ----
     let mut matrix = String::from("# 全网端口矩阵\n\n");
-    matrix.push_str(&format!("> 方案: {} | 构建: {} | 生成: {}\n\n", project.name, build_id, now));
+    matrix.push_str(&format!(
+        "> 方案: {} | 构建: {} | 生成: {}\n\n",
+        project.name, build_id, now
+    ));
     for rule in &project.network_rules {
         let from = project.servers.iter().find(|s| s.id == rule.from_server_id);
         let to = project.servers.iter().find(|s| s.id == rule.to_server_id);
@@ -521,10 +487,16 @@ pub fn build_inner(
                 "{}. **{}**{}\n",
                 i + 1,
                 name,
-                if reason.is_empty() { String::new() } else { format!("（{reason}）") }
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{reason}）")
+                }
             ));
         }
-        s.push_str("\n每台部署完成后，等待其暴露端口就绪（bash scripts/ops.sh status）再部署下一台。\n");
+        s.push_str(
+            "\n每台部署完成后，等待其暴露端口就绪（bash scripts/ops.sh status）再部署下一台。\n",
+        );
         s
     };
     matrix.push_str(&order_section);
@@ -532,9 +504,15 @@ pub fn build_inner(
 
     // ---- 构建报告 ----
     let mut report = String::from("# 构建报告\n\n");
-    report.push_str(&format!("- 方案: {}（{}）\n", project.name, project.customer));
+    report.push_str(&format!(
+        "- 方案: {}（{}）\n",
+        project.name, project.customer
+    ));
     report.push_str(&format!("- 构建: {}\n- 时间: {}\n", build_id, now));
-    report.push_str(&format!("- 输出目录: {}\n\n## 服务器产物\n\n", result.output_dir));
+    report.push_str(&format!(
+        "- 输出目录: {}\n\n## 服务器产物\n\n",
+        result.output_dir
+    ));
     for s in &result.servers {
         report.push_str(&format!(
             "### {} ({})\n- 包: {}\n- 体积: {:.2} MB\n- 镜像: {} 个\n",
@@ -560,43 +538,9 @@ pub fn build_inner(
     // ---- 构建索引（机器可读：升级包对比基线 / 构建历史列表） ----
     // 升级包只含变更镜像，但 manifest 合并基线镜像集（含未变更项），
     // 保证该构建可作为下一轮增量对比的基线
-    let servers_index: Vec<serde_json::Value> = result
-        .servers
-        .iter()
-        .map(|s| {
-            let mut all: Vec<serde_json::Value> = s
-                .images
-                .iter()
-                .map(|i| json!({ "reference": i.reference, "digest": i.digest, "file": i.file }))
-                .collect();
-            if let Some((b, _)) = upgrade {
-                let baseline_imgs = b["servers"].as_array().and_then(|arr| {
-                    arr.iter()
-                        .find(|bs| bs["name"].as_str() == Some(s.name.as_str()))
-                        .and_then(|bs| bs["images"].as_array().cloned())
-                });
-                if let Some(bimgs) = baseline_imgs {
-                    let changed_refs: std::collections::HashSet<String> = all
-                        .iter()
-                        .filter_map(|i| i["reference"].as_str().map(String::from))
-                        .collect();
-                    for bi in bimgs {
-                        if let Some(r) = bi["reference"].as_str() {
-                            if !changed_refs.contains(r) {
-                                all.push(bi.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            json!({
-                "name": s.name, "arch": s.arch, "dirName": s.dir_name,
-                "packageFile": s.package_file, "sizeBytes": s.size_bytes,
-                "images": all,
-            })
-        })
-        .collect();
+    let servers_index:Vec<serde_json::Value>=result.servers.iter().map(|s|json!({"serverId":s.server_id,"name":s.name,"arch":s.arch,"osFamily":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.os_family),"osVersion":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.os_version),"dockerVersion":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.docker_version),"dockerDataRoot":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.docker_data_root),"deployBaseDir":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.deploy_base_dir),"ip":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.ip),"dirName":s.dir_name,"packageFile":s.package_file,"sizeBytes":s.size_bytes,"images":s.images,"changedImageCount":s.images.iter().filter(|i|i.packed).count()})).collect();
     let index = json!({
+        "schemaVersion":2,"status":"complete",
         "buildId": result.build_id,
         "projectId": project.id,
         "projectName": project.name,
@@ -613,7 +557,7 @@ pub fn build_inner(
     // ---- 方案快照（构建即存档：审计回溯 / 从历史构建恢复方案） ----
     fs::write(
         out_root.join("project-snapshot.json"),
-        serde_json::to_string_pretty(project)?,
+        serde_json::to_string_pretty(&catalog::freeze(app, project)?)?,
     )?;
 
     // ---- 摆渡校验材料：SHA256SUMS.all（各服务器包）+ Windows 侧 verify.bat ----
@@ -694,7 +638,8 @@ fn deploy_order(project: &Project) -> Vec<(String, String)> {
         .map(|s| (s.id.as_str(), s.name.as_str()))
         .collect();
     // 边：from 依赖 to（to 必须先就绪）
-    let mut indegree: HashMap<&str, usize> = project.servers.iter().map(|s| (s.id.as_str(), 0)).collect();
+    let mut indegree: HashMap<&str, usize> =
+        project.servers.iter().map(|s| (s.id.as_str(), 0)).collect();
     let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new(); // to -> [from...]
     for r in &project.network_rules {
         if r.from_server_id == r.to_server_id {
@@ -737,7 +682,11 @@ fn deploy_order(project: &Project) -> Vec<(String, String)> {
             let name = id_name.get(id).copied().unwrap_or(*id);
             let depended_by: Vec<&str> = dependents
                 .get(id)
-                .map(|v| v.iter().map(|d| id_name.get(d).copied().unwrap_or(d)).collect())
+                .map(|v| {
+                    v.iter()
+                        .map(|d| id_name.get(d).copied().unwrap_or(d))
+                        .collect()
+                })
                 .unwrap_or_default();
             let depends_on: Vec<&str> = project
                 .network_rules
@@ -781,18 +730,35 @@ fn build_server(
     baseline_build_id: Option<&str>,
 ) -> AppResult<BuildServerResult> {
     let is_upgrade = baseline_set.is_some();
-    let tpl_of = |id: &str| catalog.templates.iter().find(|t| t.id == id);
     let dir_name = if is_upgrade {
-        format!("upgrade-{}_{}", sanitize(&server.name), server.arch)
+        format!(
+            "upgrade-{}-{}_{}",
+            sanitize(&server.name),
+            &crate::io_util::hash(&server.id)[..12],
+            server.arch
+        )
     } else {
-        format!("{}_{}", sanitize(&server.name), server.arch)
+        format!(
+            "{}-{}_{}",
+            sanitize(&server.name),
+            &crate::io_util::hash(&server.id)[..12],
+            server.arch
+        )
     };
     let sdir = out_root.join(&dir_name);
     // 升级包不需要 docker-offline/docs/firewall（目标机已具备 Docker 环境，避免空目录误导现场）
     let dirs: &[&str] = if is_upgrade {
-        &["stack", "images", "scripts", "logs"]
+        &["stack", "images", "scripts", "logs", "docs"]
     } else {
-        &["stack", "images", "scripts", "docker-offline/packages", "docs", "firewall", "logs"]
+        &[
+            "stack",
+            "images",
+            "scripts",
+            "docker-offline/packages",
+            "docs",
+            "firewall",
+            "logs",
+        ]
     };
     for d in dirs {
         fs::create_dir_all(sdir.join(d))?;
@@ -804,368 +770,252 @@ fn build_server(
         .filter(|i| i.server_id == server.id)
         .collect();
 
-    // ---- 实例渲染上下文 ----
-    let inst_ctx: Vec<serde_json::Value> = instances
-        .iter()
-        .map(|inst| {
-            let tpl = tpl_of(&inst.template_id);
-            // env 值做 compose 安全转义：' → ''（YAML 单引号），$ → $$（禁止 compose 插值）
-            let env_pairs: Vec<serde_json::Value> = inst
-                .params
-                .iter()
-                .map(|(k, v)| {
-                    let val = value_to_plain_string(v).replace('\'', "''").replace('$', "$$");
-                    json!({ "k": k, "v": val })
-                })
-                .collect();
-            let ports_csv = inst
-                .ports
-                .iter()
-                .map(|p| format!("{}→{}", p.host, p.container))
-                .collect::<Vec<_>>()
-                .join(",");
-            let data_volume = tpl
-                .and_then(|t| {
-                    if t.data_volume.is_empty() {
-                        None
-                    } else {
-                        Some(t.data_volume.clone())
-                    }
-                })
-                .unwrap_or_else(|| "/data".into());
-            let data_user = tpl.and_then(|t| t.data_user.clone());
-            let command = tpl.map(|t| t.command.clone()).unwrap_or_default();
-            let health_cmd: Option<String> = tpl
-                .and_then(|t| t.health_check.as_ref())
-                .and_then(|h| {
-                    if h.r#type == "exec" && !h.cmd.is_empty() {
-                        // 逐元素 shell 单引号化：含空格/||/()/$ 的元素（如 sh -c "curl a || wget b"）
-                        // 裸拼接会被 deploy.sh 的 bash 解释成自己的运算符，体检必坏
-                        Some(
-                            h.cmd
-                                .iter()
-                                .map(|c| shell_quote(c))
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                        )
-                    } else {
-                        None
-                    }
-                });
-            let health_tcp: Option<u32> = tpl
-                .and_then(|t| t.health_check.as_ref())
-                .and_then(|h| {
-                    if h.r#type == "tcp" {
-                        inst.ports.iter().find(|p| p.expose).map(|p| p.container)
-                    } else {
-                        None
-                    }
-                });
-            let health_timeout = tpl.and_then(|t| t.health_timeout_sec).unwrap_or(60);
-            // 同机依赖：模板 depends_on 命中的同服务器其它实例（compose depends_on）
-            let depends: Vec<String> = tpl
-                .map(|t| {
-                    t.depends_on
-                        .iter()
-                        .filter_map(|dep| instances.iter().find(|o| o.template_id == *dep))
-                        .map(|o| o.instance_name.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            json!({
-                "instance_name": inst.instance_name,
-                "image": inst.image,
-                "env": env_pairs,
-                "ports": inst.ports.iter().map(|p| json!({
-                    "host": p.host, "container": p.container,
-                    "protocol": p.protocol, "expose": p.expose
-                })).collect::<Vec<_>>(),
-                "data_volume": data_volume,
-                "data_user": data_user,
-                "depends": depends,
-                "command": command,
-                "health_cmd": health_cmd,
-                "health_tcp": health_tcp,
-                "health_timeout": health_timeout,
-                "ports_csv": ports_csv,
-                "backup_hint": backup_hint(&inst.template_id, &server.deploy_base_dir),
-                "min_memory_gb": tpl.map(|t| t.min_memory_gb).unwrap_or(0.5),
-            })
-        })
-        .collect();
+    let base_ctx = crate::render_context::server_context(
+        project,
+        server,
+        catalog,
+        build_id,
+        now,
+        &dir_name,
+        baseline_build_id,
+    );
 
-    let services_csv = instances
-        .iter()
-        .map(|i| i.instance_name.clone())
-        .collect::<Vec<_>>()
-        .join(",");
-    let exposed: Vec<_> = instances
-        .iter()
-        .flat_map(|i| i.ports.iter().filter(|p| p.expose).map(|p| p.host).collect::<Vec<_>>())
-        .collect();
-    let exposed_ports_csv = exposed
-        .iter()
-        .map(|p| p.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-
-    // 访问规则（指向本机）
-    let allowed_rules: Vec<serde_json::Value> = project
-        .network_rules
-        .iter()
-        .filter(|r| r.to_server_id == server.id)
-        // 过滤来源 IP 为空的规则：空 address= 会生成非法防火墙命令
-        .filter(|r| {
-            project
-                .servers
-                .iter()
-                .find(|s| s.id == r.from_server_id)
-                .map(|s| !s.ip.trim().is_empty())
-                .unwrap_or(false)
-        })
-        .map(|r| {
-            let from = project.servers.iter().find(|s| s.id == r.from_server_id);
-            json!({
-                "from_name": from.map(|s| s.name.clone()).unwrap_or_default(),
-                "from_ip": from.map(|s| s.ip.clone()).unwrap_or_default(),
-                "to_port": r.to_port,
-                "protocol": r.protocol,
-                "description": r.description,
-            })
-        })
-        .collect();
-
-    // 本机端口表（含放行来源）
-    let local_ports: Vec<serde_json::Value> = instances
-        .iter()
-        .flat_map(|i| {
-            i.ports
-                .iter()
-                .filter(|p| p.expose)
-                .map(|p| {
-                    let sources = project
-                        .network_rules
-                        .iter()
-                        .filter(|r| r.to_server_id == server.id && r.to_port == p.host)
-                        .map(|r| {
-                            project
-                                .servers
-                                .iter()
-                                .find(|s| s.id == r.from_server_id)
-                                .map(|s| s.ip.clone())
-                                .unwrap_or_default()
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    json!({
-                        "host": p.host, "container": p.container,
-                        "protocol": p.protocol, "instance_name": i.instance_name,
-                        "sources": if sources.is_empty() { "（本机/按需）".to_string() } else { sources },
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    let mem_need_gb: u32 = inst_ctx
-        .iter()
-        .map(|v| {
-            let g = v.get("min_memory_gb").and_then(|x| x.as_f64()).unwrap_or(0.5);
-            g.ceil() as u32
-        })
-        .sum();
-    let kernel_reqs: Vec<String> = instances
-        .iter()
-        .filter_map(|i| tpl_of(&i.template_id).map(|t| t.kernel_reqs.clone()))
-        .flatten()
-        .collect();
-    let kernel_reqs_raw = kernel_reqs.join(",");
-
-    // 数据库类实例的逻辑备份命令（ops.sh backup 先逻辑备份再文件级兜底：
-    // 对运行中的库直接 tar 数据目录有一致性风险，恢复出的库可能是坏的）
-    let logical_backups: Vec<String> = instances
-        .iter()
-        .filter_map(|inst| {
-            let n = &inst.instance_name;
-            match inst.template_id.as_str() {
-                id if id.starts_with("mysql-") => Some(format!(
-                    "{{ docker exec {n} sh -c 'mysqldump -uroot -p\"$MYSQL_ROOT_PASSWORD\" --single-transaction --all-databases' | gzip > \"$BACKUP_DIR/$TS/{n}.sql.gz\"; }} || {{ rm -f \"$BACKUP_DIR/$TS/{n}.sql.gz\"; echo \"  [!] {n} 逻辑备份失败，将依赖文件级快照\"; }}"
-                )),
-                id if id.starts_with("postgresql-") => Some(format!(
-                    "{{ docker exec {n} sh -c 'pg_dumpall -U postgres' | gzip > \"$BACKUP_DIR/$TS/{n}.sql.gz\"; }} || {{ rm -f \"$BACKUP_DIR/$TS/{n}.sql.gz\"; echo \"  [!] {n} 逻辑备份失败，将依赖文件级快照\"; }}"
-                )),
-                id if id.starts_with("mongodb-") => Some(format!(
-                    "{{ docker exec {n} sh -c 'mongodump --archive --gzip' > \"$BACKUP_DIR/$TS/{n}.archive.gz\"; }} || {{ rm -f \"$BACKUP_DIR/$TS/{n}.archive.gz\"; echo \"  [!] {n} 逻辑备份失败，将依赖文件级快照\"; }}"
-                )),
-                id if id.starts_with("redis-") => Some(format!(
-                    "docker exec {n} sh -c 'redis-cli -a \"$REDIS_PASSWORD\" BGSAVE' >/dev/null 2>&1 || true; sleep 2; cp \"$BASE_DIR/stack/data/{n}/dump.rdb\" \"$BACKUP_DIR/$TS/{n}.rdb\" 2>/dev/null || echo \"  [!] {n} RDB 快照失败，将依赖文件级快照\""
-                )),
-                _ => None,
-            }
-        })
-        .collect();
-
-    let server_ctx = json!({
-        "name": server.name, "arch": server.arch,
-        "os_family": server.os_family, "os_version": server.os_version,
-        "ip": server.ip, "docker_version": server.docker_version,
-        "docker_data_root": server.docker_data_root,
-        "deploy_base_dir": server.deploy_base_dir,
-    });
-    let base_ctx = json!({
-        "project_name": project.name,
-        "build_id": build_id,
-        "generated_at": now,
-        "server": server_ctx,
-        "instances": inst_ctx,
-        "services_csv": services_csv,
-        "logical_backups": logical_backups,
-        "exposed_ports_csv": exposed_ports_csv,
-        "allowed_rules": allowed_rules,
-        "local_ports": local_ports,
-        "uname_arch": uname_of(&server.arch),
-        "dir_name": dir_name,
-        "stack_name": compose_name(&project.name),
-        "baseline_build_id": baseline_build_id.unwrap_or(""),
-        "mem_need_gb": std::cmp::max(mem_need_gb, 1),
-        "disk_need_mb": 15360u32, // M0 预估：系统 10G + 镜像余量
-        "kernel_reqs": kernel_reqs,
-        "kernel_reqs_raw": kernel_reqs_raw,
-    });
-
-    // ---- 镜像解析与复制：本地 tar > 缓存 > 在线拉取（auto_pull） ----
-    // 升级模式：与基线集合比对，未变更的镜像跳过（不装入升级包）
-    // 比对键与基线侧对称：digest 优先，否则回退缓存 meta 的拉取 digest，最后裸引用兜底
-    let mut images_info: Vec<BuildImageInfo> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
+    // Resolve and verify every required image before comparing its actual content to the baseline.
+    let mut images_info = Vec::new();
+    let warnings = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut pulled = std::collections::HashSet::new();
     for inst in &instances {
-        if let Some(base) = baseline_set {
-            let cache_probe = crate::images::cache_file_for(app, &inst.image, "linux", &server.arch)
-                .unwrap_or_else(|_| PathBuf::from("N/A"));
-            let meta_digest = image_digest(app, inst, &cache_probe);
-            let key = if meta_digest.is_empty() {
-                inst.image.clone()
-            } else {
-                format!("{}@{}", inst.image, meta_digest)
-            };
-            // 裸引用兜底：基线时代码未记录 digest（本地 tar 场景）也能匹配
-            if base.contains(&key) || base.contains(&inst.image) {
-                emit(
-                    app,
-                    "image",
-                    &format!("「{}」与基线一致，跳过（{}）", inst.instance_name, inst.image),
-                );
-                continue;
-            }
-        }
-        let resolved: Option<std::path::PathBuf> = if !inst.local_image_tar.trim().is_empty() {
-            let p = PathBuf::from(inst.local_image_tar.trim());
-            if p.is_file() {
-                Some(p)
-            } else {
-                warnings.push(format!(
-                    "「{}」本地镜像 tar 不存在: {}",
-                    inst.instance_name,
-                    p.display()
-                ));
-                None
-            }
+        let locked_ref = crate::images::locked_reference(&inst.image, &inst.digest)?;
+        let cache = crate::images::cache_file_for_registry(
+            app,
+            &locked_ref,
+            "linux",
+            &server.arch,
+            project.registry.as_ref(),
+        )?;
+        let local = !inst.local_image_tar.trim().is_empty();
+        let src = if local {
+            PathBuf::from(&inst.local_image_tar)
         } else {
-            let cache = crate::images::cache_file_for(app, &inst.image, "linux", &server.arch)?;
-            if cache.is_file() {
-                Some(cache)
-            } else if auto_pull {
-                emit(
+            if auto_pull && pulled.insert(cache.clone()) {
+                crate::images::pull_image_inner(
                     app,
-                    "image",
-                    &format!("缓存未命中，在线拉取 {} (linux/{})", inst.image, server.arch),
-                );
-                match crate::images::pull_image_inner(app, &inst.image, "linux", &server.arch, &cache, project.registry.as_ref())
-                {
-                    Ok(_) => Some(cache),
-                    Err(e) => {
-                        warnings.push(format!(
-                            "「{}」在线拉取失败（产物不含该镜像，现场需自行 docker load）: {}",
-                            inst.instance_name, e
-                        ));
-                        None
-                    }
-                }
-            } else {
-                warnings.push(format!(
-                    "「{}」无本地 tar 且缓存未命中（未启用自动拉取），产物不含该镜像",
-                    inst.instance_name
-                ));
-                None
+                    &locked_ref,
+                    "linux",
+                    &server.arch,
+                    &cache,
+                    project.registry.as_ref(),
+                )?;
             }
+            cache.clone()
         };
-        let Some(src) = resolved else { continue };
-        let file_name = format!(
-            "{}_{}.tar",
-            sanitize(&inst.instance_name),
-            sanitize(&image_tag_of(&inst.image))
-        );
-        let dst = sdir.join("images").join(&file_name);
-        copy_file_with_progress(app, &src, &dst, &inst.instance_name)?;
-        // 本地导入的 tar 校验 RepoTags 与实例引用一致：不一致时现场 docker load 后
-        // compose 按引用找不到镜像（离线无法拉取），提前在构建期暴露
-        if !inst.local_image_tar.trim().is_empty() {
-            match read_tar_repo_tags(&dst) {
-                Ok(tags) if !tags.is_empty() => {
-                    if !tags.iter().any(|t| t == &inst.image) {
-                        warnings.push(format!(
-                            "「{}」本地 tar 的镜像标签 {:?} 与实例引用 {} 不一致：现场 docker load 后 compose 将找不到该镜像，请确认 tar 来源",
-                            inst.instance_name, tags, inst.image
-                        ));
-                    }
-                }
-                Ok(_) => warnings.push(format!(
-                    "「{}」本地 tar 内未解析到 RepoTags，无法校验与引用 {} 的一致性",
-                    inst.instance_name, inst.image
-                )),
-                Err(e) => warnings.push(format!(
-                    "「{}」本地 tar 读取失败（{}）：可能不是 docker save 格式",
-                    inst.instance_name, e
-                )),
-            }
+        let _image_lock = if !local {
+            Some(crate::io_util::lock(&src.with_extension("lock"))?)
+        } else {
+            None
+        };
+        if !src.is_file() {
+            return Err(AppError::NotFound(format!(
+                "{} 缺少必需镜像 tar：{}",
+                inst.instance_name,
+                src.display()
+            )));
         }
-        let sha = sha256_file(&dst).ok();
-        let size = dst.metadata().map(|m| m.len()).unwrap_or(0);
+        let verify_ref = if local {
+            inst.image.as_str()
+        } else {
+            locked_ref.as_str()
+        };
+        let verified = crate::image_archive::verify(&src, verify_ref, "linux", &server.arch)?;
+        let digest = if local {
+            if !inst.digest.is_empty()
+                || crate::images::parse_reference(&inst.image)?
+                    .digest
+                    .is_some()
+            {
+                return Err(AppError::Invalid("本地 docker-save tar 无法证明仓库 manifest digest，请清除 digest 锁定并以 tar SHA256 审计".into()));
+            }
+            String::new()
+        } else {
+            let m: serde_json::Value =
+                serde_json::from_slice(&fs::read(src.with_extension("tar.meta.json"))?)?;
+            if m["version"] != 2
+                || m["sha256"].as_str() != Some(&verified.sha256)
+                || !m["reference"]
+                    .as_str()
+                    .is_some_and(|r| crate::images::same_reference(r, &locked_ref))
+                || m["platform"].as_str() != Some(&format!("linux/{}", server.arch))
+            {
+                return Err(AppError::Invalid(
+                    "缓存元数据缺失、不匹配或损坏，请重新拉取".into(),
+                ));
+            }
+            m["digest"]
+                .as_str()
+                .filter(|d| crate::images::valid_digest(d))
+                .ok_or_else(|| AppError::Invalid("缓存缺少实际 digest".into()))?
+                .to_string()
+        };
+        if !seen.insert((inst.image.clone(), verified.sha256.clone())) {
+            continue;
+        }
+        let packed = baseline_set
+            .is_none_or(|b| !b.contains(&format!("{}@{}", inst.image, verified.sha256)));
+        let file = format!(
+            "images/image-{}.tar",
+            crate::io_util::hash(&format!("{}/{}", inst.image, verified.sha256))
+        );
+        if packed {
+            crate::io_util::require_space(
+                &sdir,
+                verified.size.saturating_mul(2) + 128 * 1024 * 1024,
+            )?;
+            let dst = sdir.join(&file);
+            // Rewrite locked digest references to a valid local tag. Compose uses the same tag.
+            if !local && locked_ref != inst.image {
+                crate::images::rewrite_archive(
+                    &src,
+                    &dst,
+                    &crate::images::load_reference(&inst.image)?,
+                )?;
+            } else {
+                copy_file_with_progress(app, &src, &dst, &inst.instance_name)?;
+            }
+            crate::image_archive::verify(&dst, &inst.image, "linux", &server.arch)?;
+        }
+        let delivered_sha = if packed {
+            crate::io_util::sha256_file(&sdir.join(&file))?
+        } else {
+            verified.sha256.clone()
+        };
         images_info.push(BuildImageInfo {
             reference: inst.image.clone(),
-            file: format!("images/{file_name}"),
-            sha256: sha,
-            size_bytes: size,
-            digest: image_digest(app, inst, &src),
+            file,
+            sha256: packed.then_some(delivered_sha),
+            size_bytes: verified.size,
+            digest,
+            config_digest: verified.config_digest,
+            content_sha256: verified.sha256,
+            expected_digest: inst.digest.clone(),
+            packed,
         });
     }
+
+    // ---- Docker 离线安装材料（升级包不需要：目标机已具备 Docker 环境） ----
+    if !is_upgrade {
+        let _pkg_lock = crate::io_util::lock(
+            &PathBuf::from(store::effective_storage(app)?.docker_pkg_root).join(".packages.lock"),
+        )?;
+        let pkg_dirs = crate::docker_pkgs::pick_pkg_dirs(
+            app,
+            &server.arch,
+            &server.docker_version,
+            &server.os_family,
+            &server.os_version,
+        )?;
+
+        let mut copied = 0u32;
+        for pkg_dir in &pkg_dirs {
+            let pkgs_src = pkg_dir.join("packages");
+            for entry in fs::read_dir(&pkgs_src)? {
+                let entry = entry?;
+                if !entry.path().is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                crate::io_util::require_space(
+                    &sdir,
+                    entry.metadata()?.len().saturating_mul(2) + 128 * 1024 * 1024,
+                )?;
+                fs::copy(
+                    entry.path(),
+                    sdir.join("docker-offline/packages").join(&name),
+                )?;
+                copied += 1;
+            }
+        }
+        emit(
+            app,
+            "docker-pkg",
+            &format!(
+                "Docker 安装材料：{} 个组（{copied} 个文件）",
+                pkg_dirs.len()
+            ),
+        );
+        // compose 插件（独立按 arch 匹配）
+        match crate::docker_pkgs::compose_plugin_path(app, &server.arch) {
+            Some(p) => {
+                fs::copy(
+                    &p,
+                    sdir.join("docker-offline/packages").join("docker-compose"),
+                )?;
+            }
+            None => {
+                return Err(AppError::Invalid(format!(
+                    "{} 缺少 {} 的 Compose 插件",
+                    server.name, server.arch
+                )))
+            }
+        }
+    } // end if !is_upgrade
 
     // ---- 渲染并写文件 ----
     let mut ctx = base_ctx.clone();
     ctx["images"] = json!(images_info
         .iter()
+        .filter(|i| i.packed)
         .map(|i| json!({ "file": i.file, "reference": i.reference }))
         .collect::<Vec<_>>());
 
-    let writes: Vec<(&str, PathBuf)> = if is_upgrade {
+    ctx["disk_need_mb"] = json!(
+        (images_info.iter().map(|i| i.size_bytes).sum::<u64>() * 3 / 1048576
+            + dir_size(&sdir.join("docker-offline")) / 1048576
+            + 1024)
+    );
+    let mut writes: Vec<(&str, PathBuf)> = if is_upgrade {
         vec![
-            ("compose/docker-compose.yml.j2", sdir.join("stack/docker-compose.yml")),
+            (
+                "compose/docker-compose.yml.j2",
+                sdir.join("stack/docker-compose.yml"),
+            ),
             ("scripts/upgrade.sh.j2", sdir.join("scripts/upgrade.sh")),
             ("scripts/ops.sh.j2", sdir.join("scripts/ops.sh")),
+            ("scripts/precheck.sh.j2", sdir.join("scripts/precheck.sh")),
+            (
+                "scripts/apply-firewall.sh.j2",
+                sdir.join("scripts/apply-firewall.sh"),
+            ),
+            ("docs/README.md.j2", sdir.join("README.md")),
+            ("docs/OPS-GUIDE.md.j2", sdir.join("docs/OPS-GUIDE.md")),
+            ("docs/PORT-MATRIX.md.j2", sdir.join("docs/PORT-MATRIX.md")),
         ]
     } else {
         vec![
-            ("compose/docker-compose.yml.j2", sdir.join("stack/docker-compose.yml")),
+            (
+                "compose/docker-compose.yml.j2",
+                sdir.join("stack/docker-compose.yml"),
+            ),
             ("scripts/precheck.sh.j2", sdir.join("scripts/precheck.sh")),
             ("scripts/deploy.sh.j2", sdir.join("scripts/deploy.sh")),
             ("scripts/ops.sh.j2", sdir.join("scripts/ops.sh")),
-            ("scripts/apply-firewall.sh.j2", sdir.join("scripts/apply-firewall.sh")),
-            ("install/install-docker.sh.j2", sdir.join("docker-offline/install-docker.sh")),
+            (
+                "scripts/apply-firewall.sh.j2",
+                sdir.join("scripts/apply-firewall.sh"),
+            ),
+            (
+                "install/install-docker.sh.j2",
+                sdir.join("docker-offline/install-docker.sh"),
+            ),
             ("docs/README.md.j2", sdir.join("README.md")),
             ("docs/OPS-GUIDE.md.j2", sdir.join("docs/OPS-GUIDE.md")),
             ("docs/PORT-MATRIX.md.j2", sdir.join("docs/PORT-MATRIX.md")),
         ]
     };
+    writes.push(("scripts/runtime.sh.j2", sdir.join("scripts/runtime.sh")));
     for (tpl, path) in writes {
         let content = render(env, tpl, &ctx)?;
         // compose 渲染产物做 YAML 语法校验：非法 YAML 在现场 compose config 才暴露
@@ -1179,64 +1029,9 @@ fn build_server(
         f.write_all(content.as_bytes())?;
     }
 
-    // ---- Docker 离线安装材料（升级包不需要：目标机已具备 Docker 环境） ----
-    if !is_upgrade {
-        let pkg_dirs = crate::docker_pkgs::pick_pkg_dirs(app, &server.arch, &server.docker_version, &server.os_family);
-    if pkg_dirs.is_empty() {
-        warnings.push(format!(
-            "「{}」(Docker {} {} 系) 无匹配离线安装包：构建产物不含 Docker 安装材料，deploy.sh 将要求现场已装 Docker 或人工安装",
-            server.name, server.docker_version, server.os_family
-        ));
-    } else {
-        let is_static = pkg_dirs
-            .iter()
-            .any(|d| d.file_name().map(|n| n.to_string_lossy().contains("-static-")).unwrap_or(false));
-        // rpm/deb 主包但缺依赖组（cli/containerd）：现场 localinstall 依赖解析会失败
-        let deps_found = pkg_dirs.iter().any(|d| d.file_name().map(|n| n.to_string_lossy().contains("-deps")).unwrap_or(false));
-        if !is_static && !deps_found && crate::docker_pkgs::os_pkg_class(&server.os_family) != "static" {
-            warnings.push(format!(
-                "「{}」的 Docker {} 包缺少依赖组（docker-ce-cli/containerd 等）：建议在安装包库一并导入，否则现场离线安装可能因依赖不全失败",
-                server.name, server.docker_version
-            ));
-        }
-        let mut copied = 0u32;
-        for pkg_dir in &pkg_dirs {
-            let pkgs_src = pkg_dir.join("packages");
-            for entry in fs::read_dir(&pkgs_src)? {
-                let entry = entry?;
-                if !entry.path().is_file() {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') {
-                    continue;
-                }
-                fs::copy(entry.path(), sdir.join("docker-offline/packages").join(&name))?;
-                copied += 1;
-            }
-        }
-        emit(
-            app,
-            "docker-pkg",
-            &format!("Docker 安装材料：{} 个组（{copied} 个文件）", pkg_dirs.len()),
-        );
-    }
-    // compose 插件（独立按 arch 匹配）
-    match crate::docker_pkgs::compose_plugin_path(app, &server.arch) {
-        Some(p) => {
-            fs::copy(&p, sdir.join("docker-offline/packages").join("docker-compose"))?;
-        }
-        None => {
-            warnings.push(format!(
-                "「{}」缺 docker compose 插件（{} 架构）：deploy.sh 安装 Docker 后将因缺 compose 中止",
-                server.name, server.arch
-            ));
-        }
-    }
-    } // end if !is_upgrade
-
     // ---- manifest.json ----
     let manifest = json!({
+        "schemaVersion":2,"projectId":project.id,"serverId":server.id,"baselineBuildId":baseline_build_id,
         "buildId": build_id,
         "project": { "name": project.name, "customer": project.customer },
         "server": {
@@ -1247,7 +1042,7 @@ fn build_server(
         "images": images_info,
         "instances": instances.iter().map(|i| json!({
             "name": i.instance_name, "image": i.image,
-            "ports": i.ports.iter().map(|p| format!("{}:{}", p.host, p.container)).collect::<Vec<_>>(),
+            "ports": i.ports.iter().map(|p| format!("{}:{}/{}", p.host, p.container,p.protocol)).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "generatedAt": now,
     });
@@ -1256,11 +1051,22 @@ fn build_server(
         serde_json::to_string_pretty(&manifest)?,
     )?;
 
+    fs::write(
+        sdir.join("deployment.env"),
+        format!(
+            "PROJECT_ID={}\nSERVER_ID={}\nBUILD_ID={}\nBASELINE_BUILD_ID={}\n",
+            shell_quote(&project.id),
+            shell_quote(&server.id),
+            shell_quote(build_id),
+            shell_quote(baseline_build_id.unwrap_or(""))
+        ),
+    )?;
     // ---- SHA256SUMS ----
     write_sha256_sums(&sdir)?;
 
     // ---- 打包 ----
     let mut sr = BuildServerResult {
+        server_id: server.id.clone(),
         name: server.name.clone(),
         arch: server.arch.clone(),
         dir_name: dir_name.clone(),
@@ -1273,11 +1079,12 @@ fn build_server(
     if project.build_config.package_format != "dir" {
         let pkg_path = out_root.join(format!("{dir_name}.tar.gz"));
         emit(app, "package", &format!("打包: {}", pkg_path.display()));
+        crate::io_util::require_space(out_root, dir_size(&sdir).saturating_add(128 * 1024 * 1024))?;
         let file = File::create(&pkg_path)?;
         let level = if project.build_config.recompress_images {
             Compression::default()
         } else {
-            Compression::none() // 镜像层已压缩，store 模式加速
+            Compression::fast() // Docker save 层并不保证已压缩，快速 gzip 控制交付体积
         };
         let gz = GzEncoder::new(file, level);
         let mut tar = tar::Builder::new(gz);
@@ -1310,23 +1117,19 @@ fn copy_file_with_progress(app: &AppHandle, src: &Path, dst: &Path, label: &str)
         }
         writer.write_all(&buf[..n])?;
         copied += n as u64;
-        if total > 0 && (copied % (64 * 1024 * 1024) == 0 || copied == total) {
+        if total > 0 && (copied.is_multiple_of(64 * 1024 * 1024) || copied == total) {
             emit(
                 app,
                 "image",
-                &format!("复制镜像 {label}: {} / {} MB", copied / 1048576, total / 1048576),
+                &format!(
+                    "复制镜像 {label}: {} / {} MB",
+                    copied / 1048576,
+                    total / 1048576
+                ),
             );
         }
     }
     Ok(())
-}
-
-fn value_to_plain_string(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
-    }
 }
 
 pub fn image_tag_of(image: &str) -> String {
@@ -1336,4 +1139,3 @@ pub fn image_tag_of(image: &str) -> String {
         .map(|r| r.tag)
         .unwrap_or_else(|_| "latest".into())
 }
-

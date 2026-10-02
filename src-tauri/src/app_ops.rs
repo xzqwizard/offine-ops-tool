@@ -6,14 +6,16 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::AppHandle;
 
-/// 应用级操作：方案快照恢复 / 缓存引用治理 / 单方案导入导出 / 审计日志
-
+// 应用级操作：方案快照恢复 / 缓存引用治理 / 单方案导入导出 / 审计日志
+//
 // ==================== 审计日志 ====================
 
 const AUDIT_FILE: &str = "audit.log";
 
 fn audit_log(app: &AppHandle, action: &str, detail: &str) {
-    let Ok(storage) = store::effective_storage(app) else { return };
+    let Ok(storage) = store::effective_storage(app) else {
+        return;
+    };
     let line = format!(
         "{}\t{}\t{}\n",
         store::now_rfc3339(),
@@ -24,10 +26,17 @@ fn audit_log(app: &AppHandle, action: &str, detail: &str) {
     if let Some(parent) = p.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::OpenOptions::new().create(true).append(true).open(&p).and_then(|mut f| {
-        use std::io::Write as _;
-        f.write_all(line.as_bytes())
-    });
+    let Ok(_lock) = crate::io_util::lock(&p.with_extension("lock")) else {
+        return;
+    };
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(line.as_bytes())
+        });
 }
 
 #[tauri::command]
@@ -62,7 +71,9 @@ pub fn restore_project_from_build(app: AppHandle, dir: String) -> AppResult<Proj
     }
     let snapshot = p_canon.join("project-snapshot.json");
     if !snapshot.is_file() {
-        return Err(AppError::NotFound("该构建没有方案快照（旧版本构建）".into()));
+        return Err(AppError::NotFound(
+            "该构建没有方案快照（旧版本构建）".into(),
+        ));
     }
     let raw = fs::read_to_string(&snapshot)?;
     let mut proj: Project = serde_json::from_str(&raw)?;
@@ -76,7 +87,11 @@ pub fn restore_project_from_build(app: AppHandle, dir: String) -> AppResult<Proj
     proj.created_at = now.clone();
     proj.updated_at = now;
     store::save_project(&app, &proj)?;
-    audit_log(&app, "restore_project_from_build", &format!("{} → {}", build_id, proj.name));
+    audit_log(
+        &app,
+        "restore_project_from_build",
+        &format!("{} → {}", build_id, proj.name),
+    );
     Ok(proj)
 }
 
@@ -85,18 +100,22 @@ pub fn restore_project_from_build(app: AppHandle, dir: String) -> AppResult<Proj
 /// 导出单方案为 .oppjson（含服务器/实例/规则/私有仓库配置——含敏感字段，注意文件保管）
 #[tauri::command]
 pub fn export_project(app: AppHandle, id: String, output_path: String) -> AppResult<String> {
-    let proj = store::load_project(&app, &id)?;
+    let proj = crate::catalog::freeze(&app, &store::load_project(&app, &id)?)?;
     let raw = serde_json::to_string_pretty(&proj)?;
-    fs::write(&output_path, raw)?;
+    crate::io_util::atomic_write(std::path::Path::new(&output_path), raw.as_bytes())?;
     audit_log(&app, "export_project", &proj.name);
-    Ok(format!("已导出「{}」（{}）→ {output_path}", proj.name, proj.servers.len()))
+    Ok(format!(
+        "已导出「{}」（{}）→ {output_path}",
+        proj.name,
+        proj.servers.len()
+    ))
 }
 
 /// 导入 .oppjson：生成新 id 保存（重名自动加后缀，IP 保留原值可再编辑）
 #[tauri::command]
 pub fn import_project(app: AppHandle, input_path: String) -> AppResult<Project> {
-    let raw = fs::read_to_string(&input_path)
-        .map_err(|e| AppError::Io(format!("读取文件失败: {e}")))?;
+    let raw =
+        fs::read_to_string(&input_path).map_err(|e| AppError::Io(format!("读取文件失败: {e}")))?;
     let mut proj: Project = serde_json::from_str(&raw)
         .map_err(|e| AppError::Serialize(format!("文件不是有效的方案导出（{e}）")))?;
     // 与现有方案重名时加后缀
@@ -132,29 +151,38 @@ pub fn analyze_cache_usage(app: AppHandle) -> AppResult<Vec<CacheUsage>> {
     let projects = store::list_projects(&app)?;
     let mut loaded: Vec<(String, Project)> = Vec::new();
     for s in &projects {
-        if let Ok(p) = store::load_project(&app, &s.id) {
-            loaded.push((s.name.clone(), p));
+        loaded.push((s.name.clone(), store::load_project(&app, &s.id)?));
+    }
+    let mut paths = std::collections::HashMap::<String, Vec<String>>::new();
+    for (name, p) in loaded {
+        for i in &p.instances {
+            if !i.local_image_tar.trim().is_empty() {
+                continue;
+            }
+            let reference = crate::images::locked_reference(&i.image, &i.digest)?;
+            let server = p
+                .servers
+                .iter()
+                .find(|s| s.id == i.server_id)
+                .ok_or_else(|| AppError::Invalid("方案实例服务器引用无效；缓存未清理".into()))?;
+            let path = crate::images::cache_file_for_registry(
+                &app,
+                &reference,
+                "linux",
+                &server.arch,
+                p.registry.as_ref(),
+            )?
+            .to_string_lossy()
+            .into_owned();
+            let names = paths.entry(path).or_default();
+            if !names.contains(&name) {
+                names.push(name.clone());
+            }
         }
     }
-    // 引用匹配两侧归一化（parse_reference）：缓存 meta 存的是拉取时的原始输入串，
-    // "mysql:8.0" 与 "docker.io/library/mysql:8.0" 是同一缓存文件，裸字符串相等会误判未引用
-    let norm = |img: &str| -> Option<(String, String, String)> {
-        crate::images::parse_reference(img).ok().map(|r| (r.registry, r.repo, r.tag))
-    };
     let mut out = Vec::new();
     for c in cache {
-        let c_norm = norm(&c.reference);
-        let referenced_by: Vec<String> = loaded
-            .iter()
-            .filter(|(_, p)| {
-                p.instances.iter().any(|i| {
-                    i.image == c.reference
-                        || (c_norm.is_some()
-                            && norm(&i.image).map_or(false, |n| Some(n) == c_norm))
-                })
-            })
-            .map(|(name, _)| name.clone())
-            .collect();
+        let referenced_by = paths.get(&c.file).cloned().unwrap_or_default();
         out.push(CacheUsage {
             file: c.file,
             reference: c.reference,

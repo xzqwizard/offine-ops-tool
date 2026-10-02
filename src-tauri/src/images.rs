@@ -3,7 +3,7 @@ use crate::error::{AppError, AppResult};
 use crate::store;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{copy, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
@@ -17,13 +17,17 @@ use tauri::{AppHandle, Emitter};
 
 // ==================== 引用解析 ====================
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageRef {
     pub registry: String,
     pub repo: String,
     pub tag: String,
     pub digest: Option<String>,
+}
+
+pub fn same_reference(a: &str, b: &str) -> bool {
+    matches!((parse_reference(a), parse_reference(b)), (Ok(a), Ok(b)) if a == b)
 }
 
 impl ImageRef {
@@ -38,10 +42,22 @@ pub fn parse_reference(input: &str) -> AppResult<ImageRef> {
     if s.is_empty() {
         return Err(AppError::Invalid("镜像引用不能为空".into()));
     }
+    if s.starts_with('-')
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._:/@-".contains(c))
+    {
+        return Err(AppError::Invalid("镜像引用包含非法字符".into()));
+    }
     let (base, digest) = match s.split_once('@') {
         Some((b, d)) => (b, Some(d.to_string())),
         None => (s, None),
     };
+    if base.is_empty() || digest.as_ref().is_some_and(|d| !valid_digest(d)) {
+        return Err(AppError::Invalid(
+            "镜像 digest 必须为 sha256:64位十六进制".into(),
+        ));
+    }
     // tag：最后一个冒号且位于最后一个斜杠之后
     let mut tag = "latest".to_string();
     let mut name = base.to_string();
@@ -67,7 +83,12 @@ pub fn parse_reference(input: &str) -> AppResult<ImageRef> {
             },
         ),
     };
-    if repo.is_empty() {
+    if repo.is_empty()
+        || tag.is_empty()
+        || repo
+            .split('/')
+            .any(|p| p.is_empty() || p == "." || p == "..")
+    {
         return Err(AppError::Invalid(format!("无法解析镜像引用: {input}")));
     }
     Ok(ImageRef {
@@ -91,18 +112,22 @@ fn candidates(
     let mut hosts: Vec<String> = Vec::new();
     // 项目级私有仓库优先
     if let Some(reg) = registry {
-        let host = reg.url.trim().trim_end_matches('/').to_string();
+        let host = crate::validation::normalize_host(&reg.url).unwrap_or_default();
         if !host.is_empty() && !hosts.contains(&host) {
             hosts.push(host);
         }
     }
     if r.registry == "docker.io" {
         for m in &settings.registry_mirrors {
-            let host = m.trim().trim_end_matches('/').to_string();
+            let host = crate::validation::normalize_host(m).unwrap_or_default();
             if host.is_empty() {
                 continue;
             }
-            let host = if host == "docker.io" { "docker.io".into() } else { host };
+            let host = if host == "docker.io" {
+                "docker.io".into()
+            } else {
+                host
+            };
             if !hosts.contains(&host) {
                 hosts.push(host);
             }
@@ -119,63 +144,55 @@ fn candidates(
     }
 }
 
-/// 私有仓库认证（crane auth login；密码经 stdin 传递，不出现在命令行）。
-/// 认证失败不阻断（私有仓库可能临时不可达，让候选源回退兜底），仅日志警告。
-fn registry_login(app: &AppHandle, registry: Option<&crate::models::RegistryConfig>) -> AppResult<()> {
-    let Some(reg) = registry else { return Ok(()) };
-    let host = reg.url.trim().trim_end_matches('/');
-    if host.is_empty() {
-        return Ok(())
+// Credential-specific isolated DOCKER_CONFIG; never writes the global Docker login file.
+thread_local! { static PULL_TASK:std::cell::RefCell<String> = const {std::cell::RefCell::new(String::new())}; }
+thread_local! { static AUTH_DIR: std::cell::RefCell<Option<PathBuf>> = const {std::cell::RefCell::new(None)}; }
+struct AuthSession(PathBuf);
+impl Drop for AuthSession {
+    fn drop(&mut self) {
+        AUTH_DIR.with(|p| *p.borrow_mut() = None);
+        let _ = fs::remove_dir_all(&self.0);
     }
-    if reg.username.is_empty() && reg.password.is_empty() {
-        return Ok(()) // 匿名私有仓库直接访问
-    }
-    // 进程内按 host 记忆已成功的登录（crane 写全局 docker config，重复登录无益）
-    use std::sync::OnceLock;
-    static LOGGED: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        OnceLock::new();
-    let logged = LOGGED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    if logged.lock().unwrap().contains(host) {
-        return Ok(())
-    }
-    let exe = crate::engine::crane_path(app)?;
-    let settings = store::load_settings(app)?;
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.args(["auth", "login", host]);
-    if !reg.username.is_empty() {
-        cmd.arg("-u").arg(&reg.username);
-    }
-    let has_password = !reg.password.is_empty();
-    if has_password {
-        cmd.arg("--password-stdin");
-        cmd.stdin(std::process::Stdio::piped());
-    }
-    for (k, v) in crate::net::proxy_envs(&settings) {
-        cmd.env(k, v);
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| AppError::Io(format!("crane auth login 执行失败: {e}")))?;
-    if has_password {
-        use std::io::Write as _;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(reg.password.as_bytes());
-            let _ = stdin.write_all(b"\n");
+}
+fn registry_login(
+    app: &AppHandle,
+    registry: Option<&crate::models::RegistryConfig>,
+) -> AppResult<AuthSession> {
+    let dir = std::env::temp_dir().join(format!("preops-auth-{}", uuid::Uuid::new_v4().simple()));
+    fs::create_dir_all(&dir)?;
+    AUTH_DIR.with(|p| *p.borrow_mut() = Some(dir.clone()));
+    let session = AuthSession(dir.clone());
+    if let Some(reg) = registry {
+        if !reg.username.is_empty() || !reg.password.is_empty() {
+            let host = crate::validation::normalize_host(&reg.url)?;
+            let mut cmd = crane_command(
+                app,
+                &[
+                    "auth",
+                    "login",
+                    &host,
+                    "-u",
+                    &reg.username,
+                    "--password-stdin",
+                ],
+            )?;
+            cmd.env("DOCKER_CONFIG", &dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut child = cmd.spawn()?;
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| AppError::Io("认证输入失败".into()))?
+                .write_all(reg.password.as_bytes())?;
+            let out = child.wait_with_output()?;
+            if !out.status.success() {
+                return Err(AppError::Invalid(format!("私有仓库 {host} 认证失败")));
+            }
         }
     }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| AppError::Io(format!("crane auth login 失败: {e}")))?;
-    if !out.status.success() {
-        eprintln!(
-            "[私有仓库] {} 认证失败（将继续尝试候选镜像源）: {}",
-            host,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        return Ok(()) // 不阻断：私有仓库不可达时回退镜像源列表
-    }
-    logged.lock().unwrap().insert(host.to_string());
-    Ok(())
+    Ok(session)
 }
 
 // ==================== 查询 ====================
@@ -194,6 +211,11 @@ pub struct ImageInspect {
 
 fn run_crane(app: &AppHandle, args: &[&str]) -> AppResult<std::process::Output> {
     let mut cmd = crane_command(app, args)?;
+    AUTH_DIR.with(|p| {
+        if let Some(dir) = p.borrow().as_ref() {
+            cmd.env("DOCKER_CONFIG", dir);
+        }
+    });
     cmd.output()
         .map_err(|e| AppError::Io(format!("执行 crane 失败: {e}")))
 }
@@ -235,9 +257,11 @@ pub async fn inspect_image(
     image: String,
     registry: Option<crate::models::RegistryConfig>,
 ) -> AppResult<ImageInspect> {
-    tauri::async_runtime::spawn_blocking(move || inspect_image_sync(&app, &image, registry.as_ref()))
-        .await
-        .map_err(|e| AppError::Io(format!("查询任务异常: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        inspect_image_sync(&app, &image, registry.as_ref())
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("查询任务异常: {e}")))?
 }
 
 fn inspect_image_sync(
@@ -246,7 +270,7 @@ fn inspect_image_sync(
     registry: Option<&crate::models::RegistryConfig>,
 ) -> AppResult<ImageInspect> {
     let settings = store::load_settings(app)?;
-    registry_login(app, registry)?;
+    let _auth = registry_login(app, registry)?;
     let r = parse_reference(image)?;
     let mut errors: Vec<String> = Vec::new();
 
@@ -266,13 +290,11 @@ fn inspect_image_sync(
                             .filter_map(|m| m.platform.as_ref())
                             .filter(|p| !p.os.is_empty() && !p.architecture.is_empty())
                             .filter(|p| p.os != "unknown" && p.architecture != "unknown")
-                            .map(|p| {
-                                match &p.variant {
-                                    Some(v) if !v.is_empty() => {
-                                        format!("{}/{}:{}", p.os, p.architecture, v)
-                                    }
-                                    _ => format!("{}/{}", p.os, p.architecture),
+                            .map(|p| match &p.variant {
+                                Some(v) if !v.is_empty() => {
+                                    format!("{}/{}:{}", p.os, p.architecture, v)
                                 }
+                                _ => format!("{}/{}", p.os, p.architecture),
                             })
                             .collect::<BTreeSet<_>>()
                             .into_iter()
@@ -289,9 +311,9 @@ fn inspect_image_sync(
                 // 2) 单架构：从 config 读 os/arch
                 if let Ok(cfg_out) = run_crane(app, &["config", &cand]) {
                     if cfg_out.status.success() {
-                        if let Ok(cfg) =
-                            serde_json::from_str::<RawConfig>(&String::from_utf8_lossy(&cfg_out.stdout))
-                        {
+                        if let Ok(cfg) = serde_json::from_str::<RawConfig>(
+                            &String::from_utf8_lossy(&cfg_out.stdout),
+                        ) {
                             let digest = query_digest(app, &cand)?;
                             return Ok(ImageInspect {
                                 is_list: false,
@@ -332,9 +354,14 @@ fn total_download_hint(app: &AppHandle, candidates: &[String], platform: &str) -
             if !o.status.success() {
                 continue;
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&o.stdout)) {
+            if let Ok(v) =
+                serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&o.stdout))
+            {
                 if let Some(layers) = v.get("layers").and_then(|l| l.as_array()) {
-                    let total: u64 = layers.iter().filter_map(|l| l.get("size").and_then(|s| s.as_u64())).sum();
+                    let total: u64 = layers
+                        .iter()
+                        .filter_map(|l| l.get("size").and_then(|s| s.as_u64()))
+                        .sum();
                     if total > 0 {
                         return total;
                     }
@@ -352,9 +379,11 @@ pub async fn list_image_tags(
     image: String,
     registry: Option<crate::models::RegistryConfig>,
 ) -> AppResult<Vec<String>> {
-    tauri::async_runtime::spawn_blocking(move || list_image_tags_sync(&app, &image, registry.as_ref()))
-        .await
-        .map_err(|e| AppError::Io(format!("tag 查询任务异常: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        list_image_tags_sync(&app, &image, registry.as_ref())
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("tag 查询任务异常: {e}")))?
 }
 
 fn list_image_tags_sync(
@@ -363,7 +392,7 @@ fn list_image_tags_sync(
     registry: Option<&crate::models::RegistryConfig>,
 ) -> AppResult<Vec<String>> {
     let settings = store::load_settings(app)?;
-    registry_login(app, registry)?;
+    let _auth = registry_login(app, registry)?;
     let r = parse_reference(image)?;
     let mut errors: Vec<String> = Vec::new();
     for cand in candidates(&settings, &r, registry) {
@@ -408,25 +437,53 @@ fn cache_dir(app: &AppHandle) -> AppResult<PathBuf> {
 
 /// 缓存文件名必须包含 registry+repo+tag/digest+平台：不同版本/不同源的同名
 /// repo 绝不能共用缓存（否则换 tag 后命中旧 tar，现场 load 到错误版本）。
-fn sanitize_ref(r: &ImageRef, os: &str, arch: &str) -> String {
-    // digest 优先（版本唯一）；否则用 tag；registry 前缀区分私有源
-    let version = r.digest.as_deref().unwrap_or(&r.tag);
-    let registry = if r.registry == "docker.io" { "hub" } else { &r.registry };
-    let raw = format!("{registry}_{}-{version}_{os}_{arch}", r.repo.replace('/', "_"));
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
+pub fn valid_digest(s: &str) -> bool {
+    s.strip_prefix("sha256:")
+        .is_some_and(|v| v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()))
 }
-
-pub fn cache_file_for(app: &AppHandle, image: &str, os: &str, arch: &str) -> AppResult<PathBuf> {
+pub fn load_reference(image: &str) -> AppResult<String> {
     let r = parse_reference(image)?;
-    Ok(cache_dir(app)?.join(format!("{}.tar", sanitize_ref(&r, os, arch))))
+    if r.digest.is_some() {
+        Ok(format!(
+            "offline.local/image:{}",
+            crate::io_util::hash(image)
+        ))
+    } else {
+        Ok(image.into())
+    }
+}
+pub fn locked_reference(image: &str, digest: &str) -> AppResult<String> {
+    let r = parse_reference(image)?;
+    if digest.is_empty() {
+        return Ok(image.into());
+    }
+    if !valid_digest(digest) || r.digest.as_ref().is_some_and(|d| d != digest) {
+        return Err(AppError::Invalid("引用与锁定 digest 不一致".into()));
+    }
+    Ok(format!("{}/{}@{}", r.registry, r.repo, digest))
+}
+pub fn cache_key(image: &str, os: &str, arch: &str, sources: &[String]) -> AppResult<String> {
+    let r = parse_reference(image)?;
+    Ok(crate::io_util::hash(&serde_json::json!({"version":2,"registry":r.registry,"repo":r.repo,"tag":r.tag,"digest":r.digest,"os":os,"arch":arch,"sources":sources}).to_string()))
+}
+pub fn cache_file_for(app: &AppHandle, image: &str, os: &str, arch: &str) -> AppResult<PathBuf> {
+    cache_file_for_registry(app, image, os, arch, None)
+}
+pub fn cache_file_for_registry(
+    app: &AppHandle,
+    image: &str,
+    os: &str,
+    arch: &str,
+    registry: Option<&crate::models::RegistryConfig>,
+) -> AppResult<PathBuf> {
+    let settings = store::load_settings(app)?;
+    let key = cache_key(
+        image,
+        os,
+        arch,
+        &candidates(&settings, &parse_reference(image)?, registry),
+    )?;
+    Ok(cache_dir(app)?.join(format!("v2-{key}.tar")))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -482,10 +539,14 @@ pub fn delete_cached_image(app: AppHandle, file: String) -> AppResult<()> {
         .canonicalize()
         .map_err(|_| AppError::Invalid(format!("文件不存在: {file}")))?;
     let dir_canon = dir.canonicalize()?;
-    if !p_canon.starts_with(&dir_canon) {
+    if p_canon.parent() != Some(dir_canon.as_path())
+        || p_canon.extension().and_then(|e| e.to_str()) != Some("tar")
+    {
         return Err(AppError::Invalid("仅允许删除镜像缓存目录内的文件".into()));
     }
+    let _lock = crate::io_util::lock(&p_canon.with_extension("lock"))?;
     fs::remove_file(&p_canon)?;
+    crate::app_ops::__audit(&app, "delete_cached_image", &file);
     let _ = fs::remove_file(p_canon.with_extension("tar.meta.json"));
     Ok(())
 }
@@ -506,7 +567,7 @@ pub struct PullResult {
 }
 
 fn emit(app: &AppHandle, status: &str, detail: &str) {
-    let _ = app.emit("image-pull", serde_json::json!({ "status": status, "detail": detail }));
+    let _ = app.emit("image-pull", serde_json::json!({ "status": status, "detail": detail,"taskId":PULL_TASK.with(|v|v.borrow().clone()) }));
 }
 
 /// 拉取镜像到缓存（跨架构 docker-archive，后台线程执行）。命中缓存直接返回。
@@ -516,10 +577,16 @@ pub async fn pull_image(
     image: String,
     arch: String,
     registry: Option<crate::models::RegistryConfig>,
+    task_id: Option<String>,
 ) -> AppResult<PullResult> {
-    tauri::async_runtime::spawn_blocking(move || pull_image_sync(&app, &image, &arch, registry.as_ref()))
-        .await
-        .map_err(|e| AppError::Io(format!("拉取任务异常: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        PULL_TASK.with(|v| {
+            *v.borrow_mut() = task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+        });
+        pull_image_sync(&app, &image, &arch, registry.as_ref())
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("拉取任务异常: {e}")))?
 }
 
 fn pull_image_sync(
@@ -528,22 +595,8 @@ fn pull_image_sync(
     arch: &str,
     registry: Option<&crate::models::RegistryConfig>,
 ) -> AppResult<PullResult> {
-    let os = "linux";
-    let final_path = cache_file_for(app, image, os, arch)?;
-    if final_path.is_file() {
-        return Ok(PullResult {
-            reference: image.to_string(),
-            platform: format!("{os}/{arch}"),
-            cache_file: final_path.to_string_lossy().into_owned(),
-            size_bytes: final_path.metadata().map(|m| m.len()).unwrap_or(0),
-            digest: String::new(),
-            source: "cache".into(),
-            cached: true,
-            elapsed_ms: 0,
-        });
-    }
-    let result = pull_image_inner(app, image, os, arch, &final_path, registry)?;
-    Ok(result)
+    let final_path = cache_file_for_registry(app, image, "linux", arch, registry)?;
+    pull_image_inner(app, image, "linux", arch, &final_path, registry)
 }
 
 pub fn pull_image_inner(
@@ -555,142 +608,129 @@ pub fn pull_image_inner(
     registry: Option<&crate::models::RegistryConfig>,
 ) -> AppResult<PullResult> {
     let settings = store::load_settings(app)?;
-    registry_login(app, registry)?;
+    let _auth = registry_login(app, registry)?;
+    let _lock = crate::io_util::lock(&final_path.with_extension("lock"))?;
     let r = parse_reference(image)?;
     let start = Instant::now();
-    let dir = final_path.parent().unwrap_or(Path::new("."));
-    // 唯一临时名：并发拉取同一镜像（手动 + 构建自动）不得共写同一临时文件，
-    // 否则交错写入产出损坏 tar 并毒化缓存
-    let unique = format!(
-        ".{}.{}.tmp",
-        final_path.file_name().unwrap_or_default().to_string_lossy(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let tmp = dir.join(format!("{unique}.downloading"));
-
-    // 进度监视：查平台 manifest 层总量，轮询临时文件增长推百分比/速度
+    let tmp = crate::io_util::unique_sibling(final_path);
+    let _clean = crate::io_util::Cleanup(tmp.clone());
+    let rewritten = crate::io_util::unique_sibling(final_path);
+    let _rewrite_clean = crate::io_util::Cleanup(rewritten.clone());
     let platform = format!("{os}/{arch}");
-    let total_hint = total_download_hint(app, &candidates(&settings, &r, registry), &platform);
-    if total_hint > 0 {
-        let watch_tmp = tmp.clone();
+    let mut errors = vec![];
+    for cand in candidates(&settings, &r, registry) {
+        // Resolve before pulling: a moving tag cannot change the recorded content underneath us.
+        let digest = match query_digest(app, &cand) {
+            Ok(d) if valid_digest(&d) => d,
+            Ok(_) => {
+                errors.push(format!("{cand}: digest 无效"));
+                continue;
+            }
+            Err(e) => {
+                errors.push(e.to_string());
+                continue;
+            }
+        };
+        if r.digest.as_ref().is_some_and(|d| d != &digest) {
+            errors.push(format!("{cand}: 锁定 digest 不匹配"));
+            continue;
+        }
+        let meta_path = final_path.with_extension("tar.meta.json");
+        if let Ok(raw) = fs::read_to_string(&meta_path) {
+            if let Ok(m) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if m["version"] == 2
+                    && m["digest"].as_str() == Some(&digest)
+                    && m["source"].as_str() == Some(&cand)
+                    && m["reference"]
+                        .as_str()
+                        .is_some_and(|r| same_reference(r, image))
+                    && m["platform"].as_str() == Some(&platform)
+                {
+                    if let Ok(v) = crate::image_archive::verify(final_path, image, os, arch) {
+                        if m["sha256"].as_str() == Some(&v.sha256) {
+                            return Ok(PullResult {
+                                reference: image.into(),
+                                platform,
+                                cache_file: final_path.to_string_lossy().into_owned(),
+                                size_bytes: v.size,
+                                digest,
+                                source: cand,
+                                cached: true,
+                                elapsed_ms: start.elapsed().as_millis() as u64,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let parsed = parse_reference(&cand)?;
+        let immutable = format!("{}/{}@{digest}", parsed.registry, parsed.repo);
+        let total = total_download_hint(app, std::slice::from_ref(&immutable), &platform);
+        crate::io_util::require_space(final_path, total.saturating_mul(3).max(256 * 1024 * 1024))?;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        let watch_path = tmp.clone();
         let watch_app = app.clone();
         let watch_ref = image.to_string();
         let watch_arch = arch.to_string();
-        std::thread::spawn(move || {
-            let mut last_bytes = 0u64;
-            let mut last_time = std::time::Instant::now();
-            for _ in 0..(60 * 60 * 2) {
-                // 700ms 间隔，最长监视约 80 分钟
-                if !watch_tmp.exists() {
-                    break
+        let pull_task = PULL_TASK.with(|v| v.borrow().clone());
+        let watcher = std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(m) = fs::metadata(&watch_path) {
+                    let _=watch_app.emit("image-pull-progress",serde_json::json!({"taskId":pull_task,"reference":watch_ref,"arch":watch_arch,"bytes":m.len(),"total":total,"percent":if total>0 {(m.len() as f64/total as f64*100.0).min(99.0)}else{0.0},"speedBps":0}));
                 }
-                let Ok(md) = fs::metadata(&watch_tmp) else { break };
-                let cur = md.len();
-                let elapsed = last_time.elapsed().as_millis().max(1);
-                let speed = (cur.saturating_sub(last_bytes)) as f64 / (elapsed as f64 / 1000.0);
-                last_bytes = cur;
-                last_time = std::time::Instant::now();
-                let percent = ((cur as f64 / total_hint as f64) * 100.0).min(99.0);
-                let _ = watch_app.emit(
-                    "image-pull-progress",
-                    serde_json::json!({
-                        "reference": watch_ref, "arch": watch_arch,
-                        "bytes": cur, "total": total_hint,
-                        "percent": percent, "speedBps": speed as u64,
-                    }),
-                );
-                if cur >= total_hint {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(700));
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
         });
-    }
-
-    let mut errors: Vec<String> = Vec::new();
-    let mut ok_source = String::new();
-
-    for cand in candidates(&settings, &r, registry) {
-        emit(app, "pulling", &format!("{} → {os}/{arch}", cand));
-        let platform = format!("{os}/{arch}");
-        match run_crane(app, &["pull", "--platform", &platform, "--format=tarball", &cand, &tmp.to_string_lossy()]) {
-            Ok(o) if o.status.success() => {
-                ok_source = cand.clone();
-                break;
+        emit(app, "pulling", &format!("{immutable} → {platform}"));
+        let out = run_crane(
+            app,
+            &[
+                "pull",
+                "--platform",
+                &platform,
+                "--format=tarball",
+                &immutable,
+                &tmp.to_string_lossy(),
+            ],
+        );
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = watcher.join();
+        match out {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                errors.push(format!("{cand}: {}", String::from_utf8_lossy(&o.stderr)));
+                continue;
             }
-            Ok(o) => errors.push(format!(
-                "{cand}: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            )),
-            Err(e) => errors.push(format!("{cand}: {e}")),
+            Err(e) => {
+                errors.push(e.to_string());
+                continue;
+            }
         }
-        let _ = fs::remove_file(&tmp);
+        rewrite_archive(&tmp, &rewritten, &load_reference(image)?)?;
+        let v = crate::image_archive::verify(&rewritten, image, os, arch)?;
+        let meta = serde_json::json!({"version":2,"reference":image,"platform":platform,"digest":digest,"source":cand,"pulledAt":store::now_rfc3339(),"sizeBytes":v.size,"sha256":v.sha256,"configDigest":v.config_digest});
+        // A missing meta after a crash is a cache miss, never an accepted half-commit.
+        fs::rename(&rewritten, final_path)?;
+        crate::io_util::atomic_write(&meta_path, serde_json::to_string_pretty(&meta)?.as_bytes())?;
+        crate::app_ops::__audit(app, "pull_image", &format!("{image} {platform} {digest}"));
+        emit(app, "done", &format!("{image} {platform} 完成"));
+        return Ok(PullResult {
+            reference: image.into(),
+            platform,
+            cache_file: final_path.to_string_lossy().into_owned(),
+            size_bytes: v.size,
+            digest,
+            source: cand,
+            cached: false,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        });
     }
-
-    if ok_source.is_empty() {
-        emit(app, "error", &format!("拉取失败: {}", errors.join("；")));
-        return Err(AppError::Io(format!(
-            "镜像拉取失败（已尝试全部镜像源）：{}",
-            errors.join("；")
-        )));
-    }
-
-    // RepoTags 改写为用户原始引用，保证 docker load 后与 compose 一致
-    emit(app, "rewrite", "规范化镜像标签（RepoTags）…");
-    let rewrite_tmp = dir.join(format!("{unique}.rewriting"));
-    if let Err(e) = rewrite_docker_archive(&tmp, &rewrite_tmp, image) {
-        // 失败清理两份临时文件（几百 MB 的 tar 残留会持续占用缓存盘）
-        let _ = fs::remove_file(&tmp);
-        let _ = fs::remove_file(&rewrite_tmp);
-        return Err(e);
-    }
-    let _ = fs::remove_file(&tmp);
-    // rename 冲突防护：另一并发拉取已抢先落位时，以现有文件为准（同引用同平台内容一致）
-    match fs::rename(&rewrite_tmp, final_path) {
-        Ok(()) => {}
-        Err(_) => {
-            let _ = fs::remove_file(&rewrite_tmp);
-        }
-    }
-
-    let digest = query_digest(app, &ok_source).unwrap_or_default();
-    let size = final_path.metadata().map(|m| m.len()).unwrap_or(0);
-    let meta = serde_json::json!({
-        "reference": image,
-        "platform": format!("{os}/{arch}"),
-        "digest": digest,
-        "source": ok_source,
-        "pulledAt": store::now_rfc3339(),
-        "sizeBytes": size,
-    });
-    let _ = fs::write(
-        final_path.with_extension("tar.meta.json"),
-        serde_json::to_string_pretty(&meta)?,
-    );
-
-    let elapsed = start.elapsed().as_millis() as u64;
-    emit(
-        app,
-        "done",
-        &format!("{} ({os}/{arch}) 完成，{:.1} MB，{}ms", image, size as f64 / 1048576.0, elapsed),
-    );
-    Ok(PullResult {
-        reference: image.to_string(),
-        platform: format!("{os}/{arch}"),
-        cache_file: final_path.to_string_lossy().into_owned(),
-        size_bytes: size,
-        digest,
-        source: ok_source,
-        cached: false,
-        elapsed_ms: elapsed,
-    })
+    Err(AppError::Io(format!("镜像拉取失败：{}", errors.join("；"))))
 }
 
 /// 改写 docker-archive 中的 manifest.json RepoTags 为规范引用
-fn rewrite_docker_archive(src: &Path, dst: &Path, canonical_ref: &str) -> AppResult<()> {
+pub fn rewrite_archive(src: &Path, dst: &Path, canonical_ref: &str) -> AppResult<()> {
     let f = File::open(src)?;
     let mut archive = tar::Archive::new(f);
     let mut builder = tar::Builder::new(File::create(dst)?);
@@ -710,12 +750,11 @@ fn rewrite_docker_archive(src: &Path, dst: &Path, canonical_ref: &str) -> AppRes
         } else if name != "repositories" {
             // docker save 老格式还有 repositories 文件（仅旧版本），保留其余条目原样
             let mut header = entry.header().clone();
-            let mut data = Vec::new();
-            copy(&mut entry, &mut data)?;
+
             // 修正 header 大小并重算校验和（entry 读取后 size 不变，直接使用）
-            header.set_size(data.len() as u64);
+            header.set_size(entry.size());
             header.set_cksum();
-            builder.append_data(&mut header, path, data.as_slice())?;
+            builder.append_data(&mut header, path, &mut entry)?;
         }
     }
     builder.into_inner()?.flush()?;

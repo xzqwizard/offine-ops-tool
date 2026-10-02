@@ -7,17 +7,17 @@ use tauri::{AppHandle, Emitter};
 
 /// 统一的外网访问入口：所有 HTTP 请求走系统 curl（自动应用代理设置），
 /// 所有外部子进程（crane 等）注入标准代理环境变量。
-
+///
 /// 解析生效的代理 URL，如 `http://127.0.0.1:7890`、`socks5h://user:pass@host:port`。
 /// 未启用或配置不完整返回 None（直连）。用户名/密码做百分号编码（含 @:/# 等字符的
 /// 密码不编码会生成非法 URL）。
 pub fn proxy_url(settings: &AppSettings) -> Option<String> {
     let p = settings.proxy.as_ref()?;
     if !p.enabled {
-        return None
+        return None;
     }
     if p.host.trim().is_empty() || p.port == 0 {
-        return None
+        return None;
     }
     // socks5h：DNS 解析也走代理（防污染）；http 代理同 URL 形式
     let scheme = match p.scheme.as_str() {
@@ -44,7 +44,7 @@ pub fn mask_proxy_url(settings: &AppSettings) -> Option<String> {
         let scheme_end = prefix.find("://").map(|i| i + 3).unwrap_or(0);
         let user = &prefix[scheme_end..];
         let user = user.split(':').next().unwrap_or_default();
-        Some(format!("{}://{user}:***@{rest}", &prefix[..scheme_end]))
+        Some(format!("{}{user}:***{rest}", &prefix[..scheme_end]))
     } else {
         Some(raw)
     }
@@ -65,9 +65,28 @@ fn percent_encode(s: &str) -> String {
 
 /// 供子进程（crane 等）使用的代理环境变量
 pub fn proxy_envs(settings: &AppSettings) -> Vec<(String, String)> {
-    let mut envs = Vec::new();
+    let mut envs = [
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ]
+    .iter()
+    .map(|k| (k.to_string(), String::new()))
+    .collect::<Vec<_>>();
     if let Some(url) = proxy_url(settings) {
-        for key in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"] {
+        for key in [
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "ALL_PROXY",
+            "https_proxy",
+            "http_proxy",
+            "all_proxy",
+        ] {
             envs.push((key.to_string(), url.clone()));
         }
         let no_proxy = settings
@@ -82,30 +101,16 @@ pub fn proxy_envs(settings: &AppSettings) -> Vec<(String, String)> {
 }
 
 /// HTTP GET（curl），自动应用代理与超时。返回响应体。
-
-pub fn http_get_with_settings(settings: &AppSettings, url: &str, timeout_secs: u64) -> AppResult<String> {
-    let mut args: Vec<String> = vec![
-        "-sSL".into(),
-        "--max-time".into(),
-        timeout_secs.to_string(),
-    ];
-    if let Some(proxy) = proxy_url(settings) {
-        args.push("-x".into());
-        args.push(proxy);
-        if let Some(p) = settings.proxy.as_ref() {
-            if let Some(np) = p.no_proxy.as_ref() {
-                if !np.trim().is_empty() {
-                    args.push("--noproxy".into());
-                    args.push(np.trim().into());
-                }
-            }
-        }
-    }
-    args.push(url.into());
-    let output = std::process::Command::new("curl")
-        .args(&args)
+///
+pub fn http_get_with_settings(
+    settings: &AppSettings,
+    url: &str,
+    timeout_secs: u64,
+) -> AppResult<String> {
+    let output = curl_command(settings)
+        .args(["-fsSL", "--max-time", &timeout_secs.to_string(), url])
         .output()
-        .map_err(|e| AppError::Io(format!("调用系统 curl 失败: {e}")))?;
+        .map_err(|e| AppError::Io(e.to_string()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let mut msg = stderr.trim().to_string();
@@ -133,7 +138,11 @@ fn probe(settings: &AppSettings, url: &str) -> ConnectivityResult {
     let mut args: Vec<String> = vec![
         "-sS".into(),
         "-o".into(),
-        "NUL".into(),
+        if cfg!(windows) {
+            "NUL".into()
+        } else {
+            "/dev/null".into()
+        },
         "-w".into(),
         "%{http_code}".into(),
         "--max-time".into(),
@@ -144,7 +153,7 @@ fn probe(settings: &AppSettings, url: &str) -> ConnectivityResult {
         args.push(proxy);
     }
     args.push(url.into());
-    let out = std::process::Command::new("curl").args(&args).output();
+    let out = curl_command(settings).args(&args).output();
     let latency = start.elapsed().as_millis() as u64;
     match out {
         Ok(o) if o.status.success() => {
@@ -157,7 +166,11 @@ fn probe(settings: &AppSettings, url: &str) -> ConnectivityResult {
                 ok,
                 status,
                 latency_ms: latency,
-                error: if ok { String::new() } else { format!("HTTP {code}") },
+                error: if ok {
+                    String::new()
+                } else {
+                    format!("HTTP {code}")
+                },
             }
         }
         Ok(o) => ConnectivityResult {
@@ -210,23 +223,78 @@ pub async fn test_network(
             None => store::load_settings(&app)?,
         };
         let proxy_used = proxy_url(&settings); // 探测开关判定用完整 URL
-        let mut targets: Vec<&str> = Vec::new();
+        let mut targets: Vec<String> = Vec::new();
         if proxy_used.is_some() {
-            targets.push("https://www.google.com/");
+            targets.push("https://www.google.com/".into());
         }
-        targets.push("https://auth.docker.io/token");
-        targets.push("https://registry-1.docker.io/v2/");
-        targets.push("https://docker.m.daocloud.io/v2/");
+        targets.push("https://auth.docker.io/token".into());
+        targets.push("https://registry-1.docker.io/v2/".into());
+        for mirror in &settings.registry_mirrors {
+            let host = crate::validation::normalize_host(mirror)?;
+            let url = format!("https://{host}/v2/");
+            if !targets.contains(&url) {
+                targets.push(url);
+            }
+        }
         let mut results = Vec::new();
         for url in targets {
-            emit_test(&app, url, "running", None);
-            let r = probe(&settings, url);
-            emit_test(&app, url, "done", Some(&r));
+            emit_test(&app, &url, "running", None);
+            let r = probe(&settings, &url);
+            emit_test(&app, &url, "done", Some(&r));
             results.push(r);
         }
         // 对外报告用脱敏地址（明文密码不应出现在界面/日志）
-        Ok(TestNetworkReport { proxy_used: mask_proxy_url(&settings), results })
+        Ok(TestNetworkReport {
+            proxy_used: mask_proxy_url(&settings),
+            results,
+        })
     })
     .await
     .map_err(|e| AppError::Io(format!("测试任务异常: {e}")))?
+}
+
+pub fn curl_command(settings: &AppSettings) -> std::process::Command {
+    let mut c = std::process::Command::new("curl");
+    c.arg("--proxy")
+        .arg(proxy_url(settings).unwrap_or_default());
+    let np = settings
+        .proxy
+        .as_ref()
+        .and_then(|p| p.no_proxy.as_deref())
+        .unwrap_or("localhost,127.0.0.1,::1");
+    c.arg("--noproxy").arg(np);
+    for (k, v) in proxy_envs(settings) {
+        c.env(k, v);
+    }
+    c
+}
+pub fn download(
+    settings: &AppSettings,
+    url: &str,
+    path: &std::path::Path,
+    timeout: u64,
+) -> AppResult<()> {
+    if !url.starts_with("https://") {
+        return Err(AppError::Invalid("下载必须使用 HTTPS".into()));
+    }
+    let out = curl_command(settings)
+        .args([
+            "-fsSL",
+            "--retry",
+            "2",
+            "--max-time",
+            &timeout.to_string(),
+            "-o",
+        ])
+        .arg(path)
+        .arg(url)
+        .output()?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(path);
+        return Err(AppError::Io(format!(
+            "下载失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(())
 }

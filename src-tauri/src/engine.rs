@@ -1,12 +1,12 @@
 use crate::error::{AppError, AppResult};
-use crate::net::{http_get_with_settings, proxy_envs, proxy_url};
+use crate::net::{http_get_with_settings, proxy_envs};
 use crate::store;
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{copy, Read, Write};
+use std::io::{copy, Read};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 
@@ -14,8 +14,9 @@ use tauri::{AppHandle, Emitter};
 /// - 官方 Windows 发行版：go-containerregistry releases（附 checksums.txt）
 /// - 安装位置：<镜像缓存根>/bin/crane.exe（随存储根配置，不占 C 盘应用目录）
 /// - 所有外网下载自动应用代理设置
-
-const RELEASES_API: &str = "https://api.github.com/repos/google/go-containerregistry/releases/latest";
+///
+const RELEASES_API: &str =
+    "https://api.github.com/repos/google/go-containerregistry/releases/latest";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,7 +68,10 @@ pub fn engine_status(app: AppHandle) -> AppResult<EngineStatus> {
 }
 
 fn emit(app: &AppHandle, step: &str, detail: &str) {
-    let _ = app.emit("engine-install", serde_json::json!({ "step": step, "detail": detail }));
+    let _ = app.emit(
+        "engine-install",
+        serde_json::json!({ "step": step, "detail": detail }),
+    );
 }
 
 /// 下载并安装 crane 引擎（后台线程执行，幂等：已安装同版本则跳过）
@@ -90,7 +94,9 @@ fn engine_install_sync(app: &AppHandle, force: bool) -> AppResult<EngineStatus> 
     let rel: GithubRelease = serde_json::from_str(&rel_raw)
         .map_err(|e| AppError::Serialize(format!("解析 GitHub Release 失败: {e}")))?;
     let tag = rel.tag_name;
-    let current = fs::read_to_string(&marker).ok().map(|v| v.trim().to_string());
+    let current = fs::read_to_string(&marker)
+        .ok()
+        .map(|v| v.trim().to_string());
     if !force && current.as_deref() == Some(tag.as_str()) && exe.is_file() {
         emit(app, "done", &format!("已安装最新版 {tag}，跳过"));
         return engine_status_inner(&exe, &marker);
@@ -118,24 +124,9 @@ fn engine_install_sync(app: &AppHandle, force: bool) -> AppResult<EngineStatus> 
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    let mut curl_args: Vec<String> = vec!["-sSL".into(), "--max-time".into(), "300".into()];
-    if let Some(p) = proxy_url(&settings) {
-        curl_args.push("-x".into());
-        curl_args.push(p);
-    }
-    curl_args.push("-o".into());
-    curl_args.push(tmp.to_string_lossy().into_owned());
-    curl_args.push(format!("{base}/{asset_name}"));
-    let out = std::process::Command::new("curl")
-        .args(&curl_args)
-        .output()
-        .map_err(|e| AppError::Io(format!("curl 下载失败: {e}")))?;
-    if !out.status.success() {
-        return Err(AppError::Io(format!(
-            "下载失败: {}（可尝试在设置中配置代理）",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
+    let _cleanup = crate::io_util::Cleanup(tmp.clone());
+    let _lock = crate::io_util::lock(&dir.join(".engine.lock"))?;
+    crate::net::download(&settings, &format!("{base}/{asset_name}"), &tmp, 300)?;
 
     emit(app, "verify", "校验 SHA256…");
     let actual = sha256_file(&tmp)?;
@@ -147,15 +138,14 @@ fn engine_install_sync(app: &AppHandle, force: bool) -> AppResult<EngineStatus> 
     }
 
     emit(app, "extract", "解压 crane.exe…");
-    let exe_tmp = dir.join(".crane.exe.extracting");
+    let exe_tmp = crate::io_util::unique_sibling(&exe);
+    let _exe_cleanup = crate::io_util::Cleanup(exe_tmp.clone());
     extract_crane(&tmp, &exe_tmp)?;
 
     // 原子替换
-    let _ = fs::remove_file(&exe);
     fs::rename(&exe_tmp, &exe)?;
     let _ = fs::remove_file(&tmp);
-    let mut m = File::create(&marker)?;
-    m.write_all(tag.as_bytes())?;
+    crate::io_util::atomic_write(&marker, tag.as_bytes())?;
 
     emit(app, "done", &format!("crane {tag} 安装完成"));
     engine_status_inner(&exe, &marker)
@@ -190,7 +180,7 @@ fn extract_crane(archive: &Path, dest: &Path) -> AppResult<()> {
         if name.eq_ignore_ascii_case("crane.exe") {
             let mut out = File::create(dest)?;
             copy(&mut entry, &mut out)?;
-            return Ok(())
+            return Ok(());
         }
     }
     Err(AppError::Io("压缩包中未找到 crane.exe".into()))
@@ -203,7 +193,7 @@ fn sha256_file(path: &Path) -> AppResult<String> {
     loop {
         let n = f.read(&mut buf)?;
         if n == 0 {
-            break
+            break;
         }
         hasher.update(&buf[..n]);
     }
