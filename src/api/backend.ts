@@ -102,8 +102,8 @@ export const backend = {
     return invoke('analyze_cache_usage')
   },
 
-  async purgeUnrefCache(): Promise<number> {
-    return invoke<number>('purge_unref_cache')
+  async purgeUnrefCache(): Promise<[number, number, string[]]> {
+    return invoke<[number, number, string[]]>('purge_unref_cache')
   },
 
   async listDockerVersions(arch: string): Promise<string[]> {

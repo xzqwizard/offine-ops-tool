@@ -69,32 +69,42 @@ pub fn run() {
 
 /// CLI 模式构建（main.rs --build 调用）：初始化最小 Tauri 应用获取路径上下文，
 /// 结果写入 <cwd>/build-cli-result.txt，随后退出进程
-pub fn run_cli_build(project_id: &str) -> String {
+pub fn run_cli_build(project_id: &str, out_log: Option<String>) -> i32 {
     let code = project_id.to_string();
     tauri::Builder::default()
         .setup(move |app| {
             let handle = app.handle().clone();
             let code2 = code.clone();
-            let result = std::thread::spawn(move || {
+            let (result, exit_code) = std::thread::spawn(move || {
                 let proj = match store::load_project(&handle, &code2) {
                     Ok(p) => p,
-                    Err(e) => return format!("[cli] 加载方案失败: {e}"),
+                    Err(e) => return (format!("[cli] 加载方案失败: {e}"), 2),
                 };
                 match builder::build_inner(&handle, &proj, true, None) {
-                    Ok(r) => format!(
-                        "[cli] 构建完成: {}
+                    Ok(r) => (
+                        format!(
+                            "[cli] 构建完成: {}
 [cli] 产物: {}
 [cli] 服务器: {} 台",
-                        r.build_id, r.output_dir, r.servers.len()
+                            r.build_id, r.output_dir, r.servers.len()
+                        ),
+                        0,
                     ),
-                    Err(e) => format!("[cli] 构建失败: {e}"),
+                    Err(e) => (format!("[cli] 构建失败: {e}"), 1),
                 }
             })
             .join()
-            .unwrap_or_else(|_| "[cli] 构建线程异常".into());
+            .unwrap_or_else(|_| ("[cli] 构建线程异常".into(), 1));
             let _ = std::fs::write("build-cli-result.txt", &result);
             println!("{result}");
-            std::process::exit(0);
+            if let Some(log) = &out_log {
+                // 结果也写入 --out 指定的日志（exit 后 main 侧不可达，必须在此写）
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(log) {
+                    let _ = writeln!(f, "{result}");
+                }
+            }
+            std::process::exit(exit_code);
         })
         .run(tauri::generate_context!())
         .expect("cli build failed");

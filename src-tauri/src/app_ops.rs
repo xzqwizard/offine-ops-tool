@@ -1,4 +1,3 @@
-use crate::build_history::list_build_history;
 use crate::error::{AppError, AppResult};
 use crate::models::Project;
 use crate::store;
@@ -137,11 +136,23 @@ pub fn analyze_cache_usage(app: AppHandle) -> AppResult<Vec<CacheUsage>> {
             loaded.push((s.name.clone(), p));
         }
     }
+    // 引用匹配两侧归一化（parse_reference）：缓存 meta 存的是拉取时的原始输入串，
+    // "mysql:8.0" 与 "docker.io/library/mysql:8.0" 是同一缓存文件，裸字符串相等会误判未引用
+    let norm = |img: &str| -> Option<(String, String, String)> {
+        crate::images::parse_reference(img).ok().map(|r| (r.registry, r.repo, r.tag))
+    };
     let mut out = Vec::new();
     for c in cache {
+        let c_norm = norm(&c.reference);
         let referenced_by: Vec<String> = loaded
             .iter()
-            .filter(|(_, p)| p.instances.iter().any(|i| i.image == c.reference))
+            .filter(|(_, p)| {
+                p.instances.iter().any(|i| {
+                    i.image == c.reference
+                        || (c_norm.is_some()
+                            && norm(&i.image).map_or(false, |n| Some(n) == c_norm))
+                })
+            })
             .map(|(name, _)| name.clone())
             .collect();
         out.push(CacheUsage {
@@ -155,21 +166,30 @@ pub fn analyze_cache_usage(app: AppHandle) -> AppResult<Vec<CacheUsage>> {
     Ok(out)
 }
 
-/// 一键清理未被任何方案引用的缓存镜像，返回释放字节数
+/// 一键清理未被任何方案引用的缓存镜像，返回 (清理数, 释放字节, 失败明细)
 #[tauri::command]
-pub fn purge_unref_cache(app: AppHandle) -> AppResult<u64> {
+pub fn purge_unref_cache(app: AppHandle) -> AppResult<(u32, u64, Vec<String>)> {
     let usage = analyze_cache_usage(app.clone())?;
     let mut freed = 0u64;
     let mut count = 0u32;
+    let mut errors: Vec<String> = Vec::new();
     for u in usage.iter().filter(|u| u.referenced_by.is_empty()) {
-        crate::images::delete_cached_image(app.clone(), u.file.clone())?;
-        freed += u.size_bytes;
-        count += 1;
+        match crate::images::delete_cached_image(app.clone(), u.file.clone()) {
+            Ok(()) => {
+                freed += u.size_bytes;
+                count += 1;
+            }
+            Err(e) => errors.push(format!("{}: {e}", u.reference)),
+        }
     }
-    if count > 0 {
-        audit_log(&app, "purge_unref_cache", &format!("{count} 项，释放 {freed} 字节"));
+    if count > 0 || !errors.is_empty() {
+        audit_log(
+            &app,
+            "purge_unref_cache",
+            &format!("{count} 项释放 {freed} 字节，失败 {} 项", errors.len()),
+        );
     }
-    Ok(freed)
+    Ok((count, freed, errors))
 }
 
 /// 内部审计入口（catalog 等模块复用）

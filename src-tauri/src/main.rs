@@ -22,6 +22,7 @@ fn cli_build(project_id: &str, log_path: &str) {
     use std::io::Write as _;
     let mut log = std::fs::File::create(log_path).expect("无法创建 CLI 构建日志");
     let _ = writeln!(log, "[cli] 构建 {project_id} 开始");
-    let result = offline_preops_tool_lib::run_cli_build(project_id);
-    let _ = writeln!(log, "{result}");
+    // 结果与退出码在 run_cli_build 内部处理（进程在 Tauri setup 内退出）
+    let code = offline_preops_tool_lib::run_cli_build(project_id, Some(log_path.to_string()));
+    std::process::exit(code);
 }

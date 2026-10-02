@@ -2,7 +2,7 @@ use crate::error::{AppError, AppResult};
 use crate::store;
 use serde::Serialize;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tauri::AppHandle;
 
 /// 构建历史管理：扫描产物根下各项目的 build-manifest.json，
@@ -20,6 +20,8 @@ pub struct BuildHistoryEntry {
     pub servers: Vec<BuildHistoryServer>,
     pub dir: String,
     pub total_size_bytes: u64,
+    /// 是否含 project-snapshot.json（可"恢复方案"）
+    pub has_snapshot: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -105,6 +107,7 @@ pub fn list_build_history(app: AppHandle) -> AppResult<Vec<BuildHistoryEntry>> {
                 kind: v["kind"].as_str().unwrap_or("full").into(),
                 total_size_bytes: servers.iter().map(|s| s.size_bytes).sum(),
                 dir: bpath.to_string_lossy().into_owned(),
+                has_snapshot: bpath.join("project-snapshot.json").is_file(),
                 servers,
             });
         }

@@ -102,16 +102,25 @@ use tauri::AppHandle;
 
 /// 自定义目录文件（用户保存的"我的中间件" + 拉取的远程目录），自定义条目覆盖内置同 id
 fn custom_catalog_path(app: &AppHandle) -> AppResult<PathBuf> {
+    // 放配置目录（settings.json 旁）：随工具数据备份/恢复，不受 projectsRoot 改盘影响
     let s = store::effective_storage(app)?;
-    Ok(PathBuf::from(s.projects_root).join("../custom-catalog.json"))
+    Ok(PathBuf::from(s.config_dir).join("custom-catalog.json"))
 }
 
 fn load_custom(app: &AppHandle) -> CatalogFile {
-    custom_catalog_path(app)
-        .ok()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    match custom_catalog_path(app) {
+        Ok(p) if p.is_file() => match fs::read_to_string(&p) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+                // 损坏时隔离而非静默清空（否则下次保存会以空表覆掉全部自定义条目）
+                let backup = p.with_extension(format!("corrupt-{}", chrono::Utc::now().timestamp()));
+                let _ = fs::rename(&p, &backup);
+                eprintln!("[目录] custom-catalog.json 损坏已隔离为 {}（{e}）", backup.display());
+                CatalogFile::default()
+            }),
+            Err(_) => CatalogFile::default(),
+        },
+        _ => CatalogFile::default(),
+    }
 }
 
 fn save_custom(app: &AppHandle, cat: &CatalogFile) -> AppResult<()> {
@@ -119,17 +128,21 @@ fn save_custom(app: &AppHandle, cat: &CatalogFile) -> AppResult<()> {
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&p, serde_json::to_string_pretty(cat)?)?;
+    // 原子写：损坏的自定义目录会让"我的中间件"整体消失
+    let tmp = p.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(cat)?)?;
+    fs::rename(&tmp, &p)?;
     Ok(())
 }
 
 use std::fs;
 
-/// 目录 = 内置 + 自定义（自定义同 id 覆盖内置；远程目录条目在拉取时合入自定义）
-#[tauri::command]
-pub fn list_catalog(app: AppHandle) -> AppResult<CatalogFile> {
+/// 目录 = 内置 + 自定义（自定义同 id 覆盖内置；远程目录条目在拉取时合入自定义）。
+/// 构建端（builder）必须走本函数：前端表单用的就是合并层，若构建只看内置，
+/// 自定义/远程条目的卷挂载、健康检查、depends_on 等会全部静默丢失。
+pub fn merged_catalog(app: &AppHandle) -> AppResult<CatalogFile> {
     let mut merged = preset()?;
-    let custom = load_custom(&app);
+    let custom = load_custom(app);
     for t in custom.templates {
         if let Some(builtin) = merged.templates.iter_mut().find(|b| b.id == t.id) {
             *builtin = t.clone(); // 覆盖
@@ -140,7 +153,15 @@ pub fn list_catalog(app: AppHandle) -> AppResult<CatalogFile> {
     if !custom.updated_at.is_empty() {
         merged.updated_at = custom.updated_at;
     }
+    if custom.version > merged.version {
+        merged.version = custom.version;
+    }
     Ok(merged)
+}
+
+#[tauri::command]
+pub fn list_catalog(app: AppHandle) -> AppResult<CatalogFile> {
+    merged_catalog(&app)
 }
 
 /// 保存自定义中间件条目（手动输入的镜像存为"我的中间件"；同 id 覆盖）

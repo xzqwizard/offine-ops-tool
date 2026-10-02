@@ -125,7 +125,7 @@ pub struct DiskSpaceInfo {
 
 /// 查询存储根所在盘的剩余空间（构建前预检用）
 #[tauri::command]
-pub fn get_disk_space(app: AppHandle, path: String) -> AppResult<DiskSpaceInfo> {
+pub fn get_disk_space(_app: AppHandle, path: String) -> AppResult<DiskSpaceInfo> {
     use fs2::{available_space, total_space};
     let p = std::path::PathBuf::from(path.trim());
     let target = if p.exists() { p } else {
@@ -150,7 +150,6 @@ pub fn get_disk_space(app: AppHandle, path: String) -> AppResult<DiskSpaceInfo> 
 /// 尊重存储设置：projects 用 effective_storage 的实际根（用户可能改到其他盘）。
 #[tauri::command]
 pub fn backup_app_data(app: AppHandle, output_path: String) -> AppResult<String> {
-    use std::io::Write as _;
     let storage = store::effective_storage(&app)?;
     let projects_root = std::path::PathBuf::from(&storage.projects_root);
     let settings_file = std::path::PathBuf::from(&storage.config_dir).join("settings.json");

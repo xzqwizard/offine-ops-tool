@@ -177,8 +177,17 @@ async function saveAsCustom() {
         id: `custom-${customImage.value.replace(/[^a-zA-Z0-9]/g, '-').slice(0, 40)}`,
         displayName: value.trim(),
         category: '我的中间件',
-        defaultImage: customImage.value.trim().replace(/:[^:@/]+$/, ''),
-        recommendedTags: [],
+        defaultImage: (() => {
+          // 先分离 @digest 再剥 :tag；原正则会把 @sha256:abcd 剥成 @sha256
+          const ref = customImage.value.trim()
+          const at = ref.indexOf('@')
+          const base = at >= 0 ? ref.slice(0, at) : ref
+          const digest = at >= 0 ? ref.slice(at) : ''
+          const ci = base.lastIndexOf(':')
+          const name = ci > base.lastIndexOf('/') ? base.slice(0, ci) : base
+          return digest ? name + digest : name
+        })(),
+        recommendedTags: [extractTag(customImage.value.trim())].filter((t) => t && t !== 'latest'),
         supportedArches: [],
         ports: ports.value.map((p) => ({
           name: p.name, container: p.container, defaultHost: p.host, protocol: p.protocol
@@ -197,8 +206,11 @@ async function saveAsCustom() {
       await backend.saveCustomTemplate(tpl, '我的中间件')
       ElMessage.success(`已保存「${value.trim()}」，下次可从目录直接选择`)
     })
-  } catch {
-    /* 取消 */
+  } catch (e) {
+    // 区分用户取消与真实错误：取消是 string 'cancel'
+    if (e !== 'cancel' && e !== 'close') {
+      ElMessage.error(`保存失败: ${toAppError(e).message}`)
+    }
   } finally {
     savingTpl.value = false
   }

@@ -169,8 +169,10 @@ async function handlePurgeUnref() {
   }
   purging.value = true
   try {
-    const freed = await backend.purgeUnrefCache()
-    ElMessage.success(`已清理，释放 ${(freed / 1048576).toFixed(1)} MB`)
+    const [count, freed, errors] = await backend.purgeUnrefCache()
+    let msg = `已清理 ${count} 项，释放 ${(freed / 1048576).toFixed(1)} MB`
+    if (errors.length) msg += `；${errors.length} 项失败（可能被占用）`
+    ElMessage.success(msg)
     await refreshCache()
   } catch (e) {
     ElMessage.error(`清理失败: ${toAppError(e).message}`)

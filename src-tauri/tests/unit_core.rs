@@ -63,6 +63,10 @@ fn sample_ctx() -> serde_json::Value {
         "disk_need_mb": 15360,
         "kernel_reqs": ["vm.max_map_count>=262144"],
         "kernel_reqs_raw": "vm.max_map_count>=262144",
+        "logical_backups": [
+            "{ docker exec mysql sh -c 'mysqldump -uroot -p\"$MYSQL_ROOT_PASSWORD\" --single-transaction --all-databases' | gzip > \"$BACKUP_DIR/$TS/mysql.sql.gz\"; } || { rm -f \"$BACKUP_DIR/$TS/mysql.sql.gz\"; echo \"  [!] mysql 逻辑备份失败\"; }",
+            "docker exec redis sh -c 'redis-cli -a \"$REDIS_PASSWORD\" BGSAVE' >/dev/null 2>&1 || true; sleep 2; cp x y 2>/dev/null || echo \"  [!] redis RDB 失败\""
+        ],
     })
 }
 
@@ -127,6 +131,37 @@ fn deploy_health_check_references_and_tcp() {
         assert!(out.status.success(), "deploy.sh 语法错误: {}", String::from_utf8_lossy(&out.stderr));
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ops_sh_renders_and_passes_bash_check() {
+    let env = template_env().unwrap();
+    let out = render(&env, "scripts/ops.sh.j2", &sample_ctx()).unwrap();
+    // 逻辑备份命令必须渲染进 backup
+    assert!(out.contains("mysqldump"));
+    // report 子命令必须存在且引用的 LOG_DIR 已在头部定义（曾因未定义必现崩溃）
+    assert!(out.contains("cmd_report"));
+    let defining = out.find("LOG_DIR=").unwrap_or(0);
+    let using = out.find("REPORT=").unwrap_or(0);
+    assert!(defining < using && defining > 0, "LOG_DIR 定义必须先于使用");
+    // bash 语法检查（Git Bash 探测，无则跳过）
+    let candidates = [
+        "D:/Environment/Git/usr/bin/bash.exe",
+        "C:/Program Files/Git/usr/bin/bash.exe",
+    ];
+    let bash = candidates.iter().find(|p| std::path::Path::new(p).is_file());
+    if let Some(bash) = bash {
+        let dir = std::env::temp_dir().join(format!("opost-opschk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("ops.sh");
+        std::fs::write(&f, out.replace("
+", "
+")).unwrap();
+        let p = f.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        let o = std::process::Command::new(bash).args(["-n", &p]).output().unwrap();
+        assert!(o.status.success(), "ops.sh 语法错误: {}", String::from_utf8_lossy(&o.stderr));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[test]
