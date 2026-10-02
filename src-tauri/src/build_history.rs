@@ -142,22 +142,38 @@ pub fn open_dir_in_explorer(dir: String) -> AppResult<()> {
     Ok(())
 }
 
-/// 读取基线构建的 manifest（升级包对比用）
+/// 读取基线构建的 manifest（升级包对比用）。
+/// 不按当前方案名定位目录（方案改名后目录名与当前名不一致），
+/// 而是全库扫描 build-manifest.json 匹配 projectId+buildId。
 pub fn read_baseline(
     app: &AppHandle,
     baseline_build_id: &str,
-    project_name: &str,
+    project_id: &str,
 ) -> AppResult<serde_json::Value> {
+    // buildId 净化（命令入参，防路径穿越）
+    if baseline_build_id.is_empty()
+        || !baseline_build_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(AppError::Invalid(format!("非法的构建号: {baseline_build_id}")));
+    }
     let root = artifact_root(app)?;
-    let mf = root
-        .join(sanitize_project_dir_name(project_name))
-        .join(baseline_build_id)
-        .join("build-manifest.json");
-    let raw = fs::read_to_string(&mf)
-        .map_err(|_| AppError::NotFound(format!("基线构建 {baseline_build_id} 不存在")))?;
-    Ok(serde_json::from_str(&raw)?)
-}
-
-fn sanitize_project_dir_name(s: &str) -> String {
-    crate::builder::sanitize(s)
+    if let Ok(projects) = fs::read_dir(&root) {
+        for proj in projects.flatten() {
+            let pdir = proj.path();
+            if !pdir.is_dir() {
+                continue;
+            }
+            let mf = pdir.join(baseline_build_id).join("build-manifest.json");
+            let Ok(raw) = fs::read_to_string(&mf) else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+            if v["projectId"].as_str() == Some(project_id) {
+                return Ok(v);
+            }
+        }
+    }
+    Err(AppError::NotFound(format!(
+        "基线构建 {baseline_build_id} 不存在（若方案已改名或构建已删除，请重新选择基线）"
+    )))
 }

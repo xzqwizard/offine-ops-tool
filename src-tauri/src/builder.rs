@@ -392,7 +392,7 @@ fn build_upgrade(
     auto_pull: bool,
     baseline_build_id: &str,
 ) -> AppResult<BuildResult> {
-    let baseline = crate::build_history::read_baseline(app, baseline_build_id, &project.name)?;
+    let baseline = crate::build_history::read_baseline(app, baseline_build_id, &project.id)?;
     // 校验基线归属同一方案
     let b_project = baseline["projectId"].as_str().unwrap_or_default();
     if b_project != project.id {
@@ -543,6 +543,44 @@ fn build_inner(
     fs::write(out_root.join("build-report.md"), &report)?;
 
     // ---- 构建索引（机器可读：升级包对比基线 / 构建历史列表） ----
+    // 升级包只含变更镜像，但 manifest 合并基线镜像集（含未变更项），
+    // 保证该构建可作为下一轮增量对比的基线
+    let servers_index: Vec<serde_json::Value> = result
+        .servers
+        .iter()
+        .map(|s| {
+            let mut all: Vec<serde_json::Value> = s
+                .images
+                .iter()
+                .map(|i| json!({ "reference": i.reference, "digest": i.digest, "file": i.file }))
+                .collect();
+            if let Some((b, _)) = upgrade {
+                let baseline_imgs = b["servers"].as_array().and_then(|arr| {
+                    arr.iter()
+                        .find(|bs| bs["name"].as_str() == Some(s.name.as_str()))
+                        .and_then(|bs| bs["images"].as_array().cloned())
+                });
+                if let Some(bimgs) = baseline_imgs {
+                    let changed_refs: std::collections::HashSet<String> = all
+                        .iter()
+                        .filter_map(|i| i["reference"].as_str().map(String::from))
+                        .collect();
+                    for bi in bimgs {
+                        if let Some(r) = bi["reference"].as_str() {
+                            if !changed_refs.contains(r) {
+                                all.push(bi.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            json!({
+                "name": s.name, "arch": s.arch, "dirName": s.dir_name,
+                "packageFile": s.package_file, "sizeBytes": s.size_bytes,
+                "images": all,
+            })
+        })
+        .collect();
     let index = json!({
         "buildId": result.build_id,
         "projectId": project.id,
@@ -550,13 +588,7 @@ fn build_inner(
         "generatedAt": result.generated_at,
         "kind": if upgrade.is_some() { "upgrade" } else { "full" },
         "baselineBuildId": upgrade.map(|(_, id)| id),
-        "servers": result.servers.iter().map(|s| json!({
-            "name": s.name, "arch": s.arch, "dirName": s.dir_name,
-            "packageFile": s.package_file, "sizeBytes": s.size_bytes,
-            "images": s.images.iter().map(|i| json!({
-                "reference": i.reference, "digest": i.digest, "file": i.file
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
+        "servers": servers_index,
     });
     fs::write(
         out_root.join("build-manifest.json"),
@@ -591,7 +623,13 @@ fn build_server(
         format!("{}_{}", sanitize(&server.name), server.arch)
     };
     let sdir = out_root.join(&dir_name);
-    for d in ["stack", "images", "scripts", "docker-offline/packages", "docs", "firewall", "logs"] {
+    // 升级包不需要 docker-offline/docs/firewall（目标机已具备 Docker 环境，避免空目录误导现场）
+    let dirs: &[&str] = if is_upgrade {
+        &["stack", "images", "scripts", "logs"]
+    } else {
+        &["stack", "images", "scripts", "docker-offline/packages", "docs", "firewall", "logs"]
+    };
+    for d in dirs {
         fs::create_dir_all(sdir.join(d))?;
     }
 
@@ -796,16 +834,21 @@ fn build_server(
 
     // ---- 镜像解析与复制：本地 tar > 缓存 > 在线拉取（auto_pull） ----
     // 升级模式：与基线集合比对，未变更的镜像跳过（不装入升级包）
+    // 比对键与基线侧对称：digest 优先，否则回退缓存 meta 的拉取 digest，最后裸引用兜底
     let mut images_info: Vec<BuildImageInfo> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for inst in &instances {
         if let Some(base) = baseline_set {
-            let key = if inst.digest.is_empty() {
+            let cache_probe = crate::images::cache_file_for(app, &inst.image, "linux", &server.arch)
+                .unwrap_or_else(|_| PathBuf::from("N/A"));
+            let meta_digest = image_digest(app, inst, &cache_probe);
+            let key = if meta_digest.is_empty() {
                 inst.image.clone()
             } else {
-                format!("{}@{}", inst.image, inst.digest)
+                format!("{}@{}", inst.image, meta_digest)
             };
-            if base.contains(&key) {
+            // 裸引用兜底：基线时代码未记录 digest（本地 tar 场景）也能匹配
+            if base.contains(&key) || base.contains(&inst.image) {
                 emit(
                     app,
                     "image",

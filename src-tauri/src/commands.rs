@@ -146,27 +146,29 @@ pub fn get_disk_space(app: AppHandle, path: String) -> AppResult<DiskSpaceInfo> 
 
 // ==================== 工具数据备份（方案/设置随包迁移，不含镜像缓存与产物） ====================
 
-/// 备份工具数据（projects/settings/logs 的源数据；cache/dist 体积大且可再生，排除）
+/// 备份工具数据（全部方案 + 设置；cache/dist 体积大且可再生，排除）。
+/// 尊重存储设置：projects 用 effective_storage 的实际根（用户可能改到其他盘）。
 #[tauri::command]
 pub fn backup_app_data(app: AppHandle, output_path: String) -> AppResult<String> {
     use std::io::Write as _;
-    let base = app_base(&app)?;
+    let storage = store::effective_storage(&app)?;
+    let projects_root = std::path::PathBuf::from(&storage.projects_root);
+    let settings_file = std::path::PathBuf::from(&storage.config_dir).join("settings.json");
     let file = std::fs::File::create(&output_path)
         .map_err(|e| crate::error::AppError::Io(format!("创建备份文件失败: {e}")))?;
     let mut zip = zip::ZipWriter::new(file);
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let mut count = 0u32;
-    for sub in ["projects", "settings.json"] {
-        let p = base.join(sub);
-        if p.is_file() {
-            zip.start_file(sub, options)
-                .map_err(|e| crate::error::AppError::Io(e.to_string()))?;
-            std::io::copy(&mut std::fs::File::open(&p)?, &mut zip)?;
-            count += 1;
-        } else if p.is_dir() {
-            add_dir_to_zip(&mut zip, &p, sub, options)?;
-        }
+    if settings_file.is_file() {
+        zip.start_file("settings.json", options)
+            .map_err(|e| crate::error::AppError::Io(e.to_string()))?;
+        std::io::copy(&mut std::fs::File::open(&settings_file)?, &mut zip)?;
+        count += 1;
+    }
+    if projects_root.is_dir() {
+        add_dir_to_zip(&mut zip, &projects_root, "projects", options)?;
+        count += 1;
     }
     zip.finish().map_err(|e| crate::error::AppError::Io(e.to_string()))?;
     Ok(format!("已备份 {count} 项 → {output_path}"))
@@ -193,10 +195,13 @@ fn add_dir_to_zip(
     Ok(())
 }
 
-/// 从备份恢复（覆盖式；恢复后重启应用生效）
+/// 从备份恢复（覆盖式；恢复后需重启应用生效）。
+/// 恢复目标同样按 effective_storage 解析（与备份对称）。
 #[tauri::command]
 pub fn restore_app_data(app: AppHandle, backup_path: String) -> AppResult<String> {
-    let base = app_base(&app)?;
+    let storage = store::effective_storage(&app)?;
+    let settings_file = std::path::PathBuf::from(&storage.config_dir).join("settings.json");
+    let projects_root = std::path::PathBuf::from(&storage.projects_root);
     let file = std::fs::File::open(&backup_path)
         .map_err(|e| crate::error::AppError::Io(format!("打开备份失败: {e}")))?;
     let mut zip = zip::ZipArchive::new(file)
@@ -209,13 +214,23 @@ pub fn restore_app_data(app: AppHandle, backup_path: String) -> AppResult<String
         if entry.is_dir() {
             continue;
         }
-        // 路径穿越防护
+        // 路径穿越防护：条目必须是纯相对路径——
+        // 拒绝 ..、反斜杠、绝对路径（join 绝对路径会整体替换 base）
         let name = entry.name().to_string();
-        if name.contains("..") {
+        if name.contains("..") || name.contains('\\') || std::path::Path::new(&name).is_absolute() {
             continue;
         }
-        let out_path = base.join(&name);
-        if let Some(parent) = out_path.parent() {
+        let (out_path, parent): (std::path::PathBuf, Option<std::path::PathBuf>) =
+            match name.strip_prefix("projects/") {
+                Some(rest) => {
+                    (projects_root.join(rest), Some(projects_root.clone()))
+                }
+                None if name == "settings.json" => {
+                    (settings_file.clone(), settings_file.parent().map(|p| p.to_path_buf()))
+                }
+                None => continue, // 未知条目跳过
+            };
+        if let Some(parent) = parent {
             std::fs::create_dir_all(parent)?;
         }
         let mut out = std::fs::File::create(&out_path)?;
@@ -223,12 +238,4 @@ pub fn restore_app_data(app: AppHandle, backup_path: String) -> AppResult<String
         count += 1;
     }
     Ok(format!("已恢复 {count} 个文件（重启应用后生效）"))
-}
-
-fn app_base(app: &AppHandle) -> AppResult<std::path::PathBuf> {
-    let exe = std::env::current_exe()
-        .map_err(|e| crate::error::AppError::Io(format!("无法定位程序位置: {e}")))?;
-    exe.parent()
-        .map(|p| p.join("data"))
-        .ok_or_else(|| crate::error::AppError::Io("无法取得数据目录".into()))
 }

@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as openDirectory, save as saveFileDialog, open as openFileDialog } from "@tauri-apps/plugin-dialog"
 import { backend, toAppError } from '@/api/backend'
+import { useProjectStore } from '@/stores/project'
 import type {
   AppSettings,
   StorageInfo,
@@ -210,6 +211,7 @@ async function handleBackupData() {
     if (!path) return
     backing.value = true
     try {
+      await useProjectStore().flushPending()
       const msg = await backend.backupAppData(path)
       ElMessage.success(msg)
     } catch (e) {
@@ -245,6 +247,8 @@ async function handleRestoreData() {
     try {
       const msg = await backend.restoreAppData(path)
       ElMessage.success(msg)
+      // 清内存态：旧方案/设置若留在内存，随后的自动保存会反向覆盖恢复的数据
+      useProjectStore().close()
     } catch (e) {
       ElMessage.error(`恢复失败: ${toAppError(e).message}`)
     } finally {

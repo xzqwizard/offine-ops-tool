@@ -119,7 +119,8 @@ fn candidates(
     }
 }
 
-/// 私有仓库认证（crane auth login；无密码时匿名）
+/// 私有仓库认证（crane auth login；密码经 stdin 传递，不出现在命令行）。
+/// 认证失败不阻断（私有仓库可能临时不可达，让候选源回退兜底），仅日志警告。
 fn registry_login(app: &AppHandle, registry: Option<&crate::models::RegistryConfig>) -> AppResult<()> {
     let Some(reg) = registry else { return Ok(()) };
     let host = reg.url.trim().trim_end_matches('/');
@@ -129,32 +130,51 @@ fn registry_login(app: &AppHandle, registry: Option<&crate::models::RegistryConf
     if reg.username.is_empty() && reg.password.is_empty() {
         return Ok(()) // 匿名私有仓库直接访问
     }
-    let mut args: Vec<String> = vec!["auth".into(), "login".into(), host.into()];
-    if !reg.username.is_empty() {
-        args.push("-u".into());
-        args.push(reg.username.clone());
-    }
-    if !reg.password.is_empty() {
-        args.push("-p".into());
-        args.push(reg.password.clone());
+    // 进程内按 host 记忆已成功的登录（crane 写全局 docker config，重复登录无益）
+    use std::sync::OnceLock;
+    static LOGGED: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        OnceLock::new();
+    let logged = LOGGED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if logged.lock().unwrap().contains(host) {
+        return Ok(())
     }
     let exe = crate::engine::crane_path(app)?;
     let settings = store::load_settings(app)?;
     let mut cmd = std::process::Command::new(&exe);
-    cmd.args(&args);
+    cmd.args(["auth", "login", host]);
+    if !reg.username.is_empty() {
+        cmd.arg("-u").arg(&reg.username);
+    }
+    let has_password = !reg.password.is_empty();
+    if has_password {
+        cmd.arg("--password-stdin");
+        cmd.stdin(std::process::Stdio::piped());
+    }
     for (k, v) in crate::net::proxy_envs(&settings) {
         cmd.env(k, v);
     }
-    let out = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| AppError::Io(format!("crane auth login 执行失败: {e}")))?;
+    if has_password {
+        use std::io::Write as _;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(reg.password.as_bytes());
+            let _ = stdin.write_all(b"\n");
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| AppError::Io(format!("crane auth login 失败: {e}")))?;
     if !out.status.success() {
-        return Err(AppError::Io(format!(
-            "私有仓库 {} 认证失败: {}",
+        eprintln!(
+            "[私有仓库] {} 认证失败（将继续尝试候选镜像源）: {}",
             host,
             String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        );
+        return Ok(()) // 不阻断：私有仓库不可达时回退镜像源列表
     }
+    logged.lock().unwrap().insert(host.to_string());
     Ok(())
 }
 
@@ -621,7 +641,12 @@ pub fn pull_image_inner(
     // RepoTags 改写为用户原始引用，保证 docker load 后与 compose 一致
     emit(app, "rewrite", "规范化镜像标签（RepoTags）…");
     let rewrite_tmp = dir.join(format!("{unique}.rewriting"));
-    rewrite_docker_archive(&tmp, &rewrite_tmp, image)?;
+    if let Err(e) = rewrite_docker_archive(&tmp, &rewrite_tmp, image) {
+        // 失败清理两份临时文件（几百 MB 的 tar 残留会持续占用缓存盘）
+        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(&rewrite_tmp);
+        return Err(e);
+    }
     let _ = fs::remove_file(&tmp);
     // rename 冲突防护：另一并发拉取已抢先落位时，以现有文件为准（同引用同平台内容一致）
     match fs::rename(&rewrite_tmp, final_path) {

@@ -5,13 +5,13 @@ export function genStrongPassword(length = 16): string {
   const digits = '23456789'
   const symbols = '!@#$%^&*-_+='
   const all = upper + lower + digits + symbols
-  const len = Math.max(12, Math.min(length, 64))
+  const len = Math.max(8, Math.min(length, 64))
 
   const buf = new Uint32Array(len)
   crypto.getRandomValues(buf)
-  const pick = (set: string) => set[buf[0] % set.length]
-  // 先保证四类各一
-  const chars: string[] = [pick(upper), pick(lower), pick(digits), pick(symbols)]
+  // 每次取样用独立随机字（同一 buf[0] 派生四类会严格配对，熵坍缩）
+  const pick = (idx: number, set: string) => set[buf[idx] % set.length]
+  const chars: string[] = [pick(0, upper), pick(1, lower), pick(2, digits), pick(3, symbols)]
   for (let i = chars.length; i < len; i++) {
     chars.push(all[buf[i] % all.length])
   }

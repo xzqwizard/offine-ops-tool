@@ -93,13 +93,18 @@ export function buildProjectFromTemplate(
   for (const i of tpl.instances) {
     const meta = catalog.find((t) => t.id === i.templateId)
     if (!meta) continue
+    // 模板数据防御：serverIdx 越界时跳过该实例（否则 serverId 为 undefined 入方案）
+    if (i.serverIdx < 0 || i.serverIdx >= serverIds.length) continue
     const params: Record<string, unknown> = {}
     for (const h of meta.envHints) {
       if (h.default) params[h.key] = h.default
     }
     for (const k of i.secretKeys) {
       // MINIO_ROOT_USER 是账号不是密码：用户名用随机可读串，密码用强密码
-      params[k] = k.endsWith('USER') ? `admin${genStrongPassword(6)}` : genStrongPassword()
+      // MinIO 用户名仅允许字母数字（16 位内），密码用完整强密码
+      params[k] = k.endsWith('USER')
+        ? 'admin' + genStrongPassword(6).replace(/[^a-zA-Z0-9]/g, '').slice(0, 6)
+        : genStrongPassword()
     }
     project.instances.push({
       id: genId('inst'),

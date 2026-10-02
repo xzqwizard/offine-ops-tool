@@ -118,6 +118,10 @@ async function deleteBuildEntry(entry: BuildHistoryEntry) {
   }
   try {
     await backend.deleteBuild(entry.dir)
+    if (baselineBuildId.value === entry.buildId) {
+      baselineBuildId.value = null
+      upgradeMode.value = false
+    }
     ElMessage.success('已删除')
     await refreshHistory()
   } catch (e) {
@@ -165,18 +169,19 @@ async function handleBuild() {
   // 磁盘空间预检：估算（已知镜像来源体积 ×2.5 冗余 + 1GB），不足时二次确认
   try {
     const space = await backend.getDiskSpace(artifactRoot.value)
-    const knownBytes = store.project.instances.reduce((sum, i) => {
-      if (!i.localImageTar) return sum
-      return sum // 本地 tar 体积前端拿不到，由估算冗余覆盖
-    }, 0)
     let estimated = 1024 * 1024 * 1024 // 基础 1GB
     const cacheList = await backend.listImageCache().catch(() => [])
-    const missingPull = store.project.instances.filter(
-      (i) => !i.localImageTar &&
-        !cacheList.some((c) => c.reference === i.image && c.platform.includes(store.project!.servers.find((s) => s.id === i.serverId)?.arch ?? ''))
-    )
-    estimated += missingPull.length * 600 * 1024 * 1024 // 每个未知在线镜像按 600MB 估算
-    estimated += knownBytes * 2.5
+    const missingPull = store.project.instances.filter((i) => {
+      if (i.localImageTar) return false
+      const arch = store.project!.servers.find((s) => s.id === i.serverId)?.arch
+      if (!arch) return true // 服务器已删除等异常：按需拉取保守估
+      return !cacheList.some((c) => c.reference === i.image && c.platform === `linux/${arch}`)
+    })
+    // 每个需在线拉取的镜像按 600MB 估算（实际体积前端不可知）
+    estimated += missingPull.length * 600 * 1024 * 1024
+    // 本地 tar 镜像整份拷入产物（体积未知按 500MB/个保守估算）×2（缓存+产物两份）
+    const localTarCount = store.project.instances.filter((i) => i.localImageTar).length
+    estimated += localTarCount * 500 * 1024 * 1024 * 2
     if (space.freeBytes < estimated) {
       try {
         await ElMessageBox.confirm(
@@ -284,10 +289,10 @@ async function copyOutputDir() {
       <div class="flex justify-end mt-4">
         <button
           class="px-8 py-2.5 rounded-xl font-headline font-bold text-xs uppercase tracking-wider transition-all bg-gradient-to-br from-primary to-primary-dim text-on-primary hover:opacity-90 active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed"
-          :disabled="building"
+          :disabled="building || (upgradeMode && !baselineBuildId)"
           @click="handleBuild"
         >
-          {{ building ? '构建中…' : '开始构建离线包' }}
+          {{ building ? '构建中…' : upgradeMode ? '生成升级包' : '开始构建离线包' }}
         </button>
       </div>
 

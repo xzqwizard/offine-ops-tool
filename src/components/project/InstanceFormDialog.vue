@@ -171,6 +171,11 @@ watch(
   }
 )
 
+// 多选集合变化时同步首台到 formServerId（selectedServer/在线检查依赖它）
+watch(formServerIds, (ids) => {
+  formServerId.value = ids[0] ?? ''
+})
+
 function init() {
   keyword.value = ''
   category.value = '全部'
@@ -253,11 +258,11 @@ function removePort(index: number) {
 }
 
 function handleSave() {
-  // 编辑=单服务器；新增=可多选批量（一台不兼容跳过并提示）
-  const targetIds =
-    props.editingId || formServerIds.value.length <= 1
-      ? [formServerId.value]
-      : formServerIds.value.filter(Boolean)
+  // 编辑=单服务器（formServerId 由 init 赋值）；新增统一读多选集合，
+  // 避免读到只在 init 时赋值的过期单选值（选 1 台会部署到错误机器）
+  const targetIds = props.editingId
+    ? [formServerId.value]
+    : formServerIds.value.filter(Boolean)
   if (!targetIds.length || targetIds.some((id) => !id)) {
     ElMessage.warning('请选择目标服务器')
     return

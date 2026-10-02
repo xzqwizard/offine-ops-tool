@@ -58,8 +58,9 @@ cmd_status() {
 
 cmd_cron_backup() {
   # 每日 02:00 自动备份（root 用 /etc/cron.d，普通用户用 crontab）
-  CRON_LINE="0 2 * * * cd \"$BASE_DIR\" && bash scripts/ops.sh backup >> logs/cron-backup.log 2>&1"
   if [ "$(id -u)" -eq 0 ]; then
+    # /etc/cron.d 格式必须含用户名字段（分 时 日 月 周 用户 命令），否则 cron 拒绝执行
+    CRON_LINE="0 2 * * * root cd \"$BASE_DIR\" && bash scripts/ops.sh backup >> logs/cron-backup.log 2>&1"
     {
       echo 'SHELL=/bin/bash'
       echo 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
@@ -68,7 +69,9 @@ cmd_cron_backup() {
     chmod 644 /etc/cron.d/offlinepreops-backup
     echo "已配置每日 02:00 自动备份（/etc/cron.d/offlinepreops-backup）"
   else
-    (crontab -l 2>/dev/null | grep -v offlinepreops; echo "$CRON_LINE") | crontab -
+    CRON_LINE="0 2 * * * cd \"$BASE_DIR\" && bash scripts/ops.sh backup >> logs/cron-backup.log 2>&1"
+    # 幂等：按命令特征剔除旧条目（"offlinepreops" 只是 cron.d 文件名，不在用户 crontab 里）
+    (crontab -l 2>/dev/null | grep -v 'ops\.sh backup'; echo "$CRON_LINE") | crontab -
     echo "已配置每日 02:00 自动备份（用户 crontab）"
   fi
   echo "  $CRON_LINE"

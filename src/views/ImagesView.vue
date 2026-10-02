@@ -65,6 +65,7 @@ onMounted(async () => {
 onUnmounted(() => {
   disposed = true
   unlistenPull?.()
+  unlistenProgress?.()
 })
 
 async function refreshEngine() {
