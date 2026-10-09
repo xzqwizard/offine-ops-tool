@@ -3,6 +3,7 @@ set -euo pipefail
 [ "$(id -u)" -eq 0 ] || { echo '需要 root'; exit 1; }
 [ "${1:-}" = --apply ] || { echo '用法: apply-firewall.sh --apply；限制本机配置 IPv4 上 Docker 发布端口的来源'; exit 1; }
 command -v iptables >/dev/null && command -v iptables-restore >/dev/null && iptables -nL DOCKER-USER >/dev/null || { echo '不支持的防火墙后端：需要 Docker IPv4 iptables DOCKER-USER（原生 nftables 不支持）'; exit 1; }
+iptables -C FORWARD -j DOCKER-USER 2>/dev/null || { echo 'DOCKER-USER 未接入转发路径，拒绝误报策略已生效'; exit 1; }
 CHAIN={{ firewall_chain | shq }}
 # Commit all chain changes together. A failed rule leaves the previous policy in place.
 iptables-restore --noflush <<'RULES'
@@ -20,6 +21,9 @@ iptables-restore --noflush <<'RULES'
 COMMIT
 RULES
 iptables -C DOCKER-USER -m conntrack --ctorigdst {{ server.ip | shq }} -j "$CHAIN" 2>/dev/null || iptables -I DOCKER-USER 1 -m conntrack --ctorigdst {{ server.ip | shq }} -j "$CHAIN"
+# Bridge-to-host traffic handled by docker-proxy traverses INPUT instead of FORWARD.
+# Keep host-local traffic available; enforce the same source policy on external INPUT.
+iptables -C INPUT ! -i lo -d {{ server.ip | shq }} -m conntrack --ctdir ORIGINAL -j "$CHAIN" 2>/dev/null || iptables -I INPUT 1 ! -i lo -d {{ server.ip | shq }} -m conntrack --ctdir ORIGINAL -j "$CHAIN"
 if [ "${2:-}" != --no-persist ]; then
   command -v systemctl >/dev/null || { echo '需要 systemd 持久化'; exit 1; }
   mkdir -p /etc/offline-preops
@@ -40,4 +44,4 @@ UNIT
   systemctl daemon-reload
   systemctl enable "$CHAIN.service"
 fi
-printf '白名单已应用到 DOCKER-USER；未列出的外部来源将被拒绝。宿主本地访问不经过该链。\n'
+printf '白名单已应用到 DOCKER-USER 与宿主 INPUT；请核对允许/拒绝来源实测结果。宿主本地访问保留。\n'
