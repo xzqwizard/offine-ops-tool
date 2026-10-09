@@ -365,10 +365,61 @@ fn os_credentials_round_trip_unicode_and_special_chars() {
         .params
         .insert("APP_SECRET".into(), json!(secret));
     credentials::protect_project(&mut p, &catalog::preset().unwrap()).unwrap();
-    assert!(p.instances[0].params["APP_SECRET"]
-        .as_str()
-        .unwrap()
-        .starts_with("dpapi:"));
+    assert!(
+        p.instances[0].params["APP_SECRET"]["$offlinePreOpsSecret"]["ciphertext"]
+            .as_str()
+            .unwrap()
+            .starts_with("dpapi:")
+    );
     credentials::reveal_project(&mut p).unwrap();
     assert_eq!(p.instances[0].params["APP_SECRET"], json!(secret));
+}
+
+#[cfg(windows)]
+#[test]
+fn literal_credential_prefix_and_nonsecret_text_round_trip_with_legacy_compatibility() {
+    for secret in [
+        "dpapi:literal-password",
+        "dpapi:v1:not-ciphertext",
+        "dpapi:",
+        "普通密码",
+    ] {
+        let mut p = project();
+        p.registry = Some(RegistryConfig {
+            url: "registry.example.org".into(),
+            username: "user".into(),
+            password: secret.into(),
+        });
+        p.instances[0]
+            .params
+            .insert("APP_PASSWORD".into(), json!(secret));
+        p.instances[0]
+            .params
+            .insert("COMMENT".into(), json!("dpapi:plain-comment"));
+        credentials::protect_project(&mut p, &catalog::preset().unwrap()).unwrap();
+        let persisted = serde_json::to_vec(&p).unwrap();
+        let mut p: Project = serde_json::from_slice(&persisted).unwrap();
+        credentials::reveal_project(&mut p).unwrap();
+        assert_eq!(p.registry.unwrap().password, secret);
+        assert_eq!(p.instances[0].params["APP_PASSWORD"], json!(secret));
+        assert_eq!(
+            p.instances[0].params["COMMENT"],
+            json!("dpapi:plain-comment")
+        );
+    }
+    let protected =
+        credentials::protect("legacy secret")
+            .unwrap()
+            .replacen("dpapi:v1:", "dpapi:", 1);
+    assert_eq!(credentials::reveal(&protected).unwrap(), "legacy secret");
+    let mut p = project();
+    p.instances[0]
+        .params
+        .insert("APP_SECRET".into(), json!(protected));
+    credentials::migrate_project(&mut p, &catalog::preset().unwrap()).unwrap();
+    let migrated = serde_json::to_string(&p).unwrap();
+    credentials::migrate_project(&mut p, &catalog::preset().unwrap()).unwrap();
+    assert_eq!(serde_json::to_string(&p).unwrap(), migrated);
+    credentials::reveal_project(&mut p).unwrap();
+    assert_eq!(p.instances[0].params["APP_SECRET"], json!("legacy secret"));
 }

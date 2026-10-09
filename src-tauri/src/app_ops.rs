@@ -86,7 +86,7 @@ pub fn restore_project_from_build(app: AppHandle, dir: String) -> AppResult<Proj
     let now = store::now_rfc3339();
     proj.created_at = now.clone();
     proj.updated_at = now;
-    store::save_project(&app, &proj)?;
+    let proj = store::save_project(&app, &proj)?;
     audit_log(
         &app,
         "restore_project_from_build",
@@ -127,7 +127,7 @@ pub fn import_project(app: AppHandle, input_path: String) -> AppResult<Project> 
     let now = store::now_rfc3339();
     proj.created_at = now.clone();
     proj.updated_at = now;
-    store::save_project(&app, &proj)?;
+    let proj = store::save_project(&app, &proj)?;
     audit_log(&app, "import_project", &proj.name);
     Ok(proj)
 }

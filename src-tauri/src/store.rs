@@ -296,7 +296,7 @@ pub fn storage_lock(app: &AppHandle) -> AppResult<std::fs::File> {
     crate::io_util::lock(&config_dir(app)?.join(".storage.lock"))
 }
 
-pub fn save_project(app: &AppHandle, project: &Project) -> AppResult<()> {
+pub fn save_project(app: &AppHandle, project: &Project) -> AppResult<Project> {
     let cat = crate::catalog::for_project(app, project)?;
     crate::validation::require(project, &cat, false)?;
     let mut frozen = crate::catalog::freeze(app, project)?;
@@ -310,10 +310,11 @@ pub fn save_project(app: &AppHandle, project: &Project) -> AppResult<()> {
             r.url = crate::validation::normalize_host(&r.url)?;
         }
     }
+    let canonical = p.clone();
     crate::credentials::protect_project(&mut p, &cat)?;
     crate::io_util::atomic_write(&path, serde_json::to_string_pretty(&p)?.as_bytes())?;
     crate::app_ops::__audit(app, "save_project", &project.id);
-    Ok(())
+    Ok(canonical)
 }
 
 pub fn delete_project(app: &AppHandle, id: &str) -> AppResult<()> {
@@ -346,8 +347,8 @@ fn migrate_credentials_at_rest(app: &AppHandle) -> AppResult<()> {
         settings = serde_json::from_slice(&fs::read(&path)?)?;
         if let Some(p) = &mut settings.proxy {
             if let Some(pw) = &mut p.password {
-                if !pw.is_empty() && !pw.starts_with("dpapi:") {
-                    *pw = crate::credentials::protect(pw)?;
+                if !pw.is_empty() && !pw.starts_with("dpapi:v1:") {
+                    *pw = crate::credentials::protect(&crate::credentials::reveal(pw)?)?;
                     crate::io_util::atomic_write(
                         &path,
                         serde_json::to_string_pretty(&settings)?.as_bytes(),
@@ -389,7 +390,7 @@ fn migrate_credentials_at_rest(app: &AppHandle) -> AppResult<()> {
             let mut p: Project = serde_json::from_slice(&fs::read(&path)?)?;
             let before = serde_json::to_vec(&p)?;
             let cat = crate::catalog::overlay(catalog.clone(), &p);
-            crate::credentials::protect_project(&mut p, &cat)?;
+            crate::credentials::migrate_project(&mut p, &cat)?;
             if serde_json::to_vec(&p)? != before {
                 crate::io_util::atomic_write(&path, serde_json::to_string_pretty(&p)?.as_bytes())?;
             }

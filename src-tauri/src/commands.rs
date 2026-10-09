@@ -30,8 +30,7 @@ pub fn create_project(app: AppHandle, name: String, customer: String) -> AppResu
         registry: None,
         template_snapshots: vec![],
     };
-    store::save_project(&app, &project)?;
-    Ok(project)
+    store::save_project(&app, &project)
 }
 
 /// 保存方案：服务端刷新 updated_at 后整体写入
@@ -42,8 +41,7 @@ pub fn save_project(app: AppHandle, mut project: Project) -> AppResult<Project> 
     }
     store::validate_id(&project.id)?;
     project.updated_at = store::now_rfc3339();
-    store::save_project(&app, &project)?;
-    Ok(project)
+    store::save_project(&app, &project)
 }
 
 #[tauri::command]
@@ -78,7 +76,6 @@ pub fn clone_project(app: AppHandle, id: String, new_name: String) -> AppResult<
             i.server_id = n.clone();
         }
     }
-    let stale = p.network_rules.is_empty();
     for r in &mut p.network_rules {
         if let Some(n) = id_map.get(&r.from_server_id) {
             r.from_server_id = n.clone();
@@ -87,9 +84,7 @@ pub fn clone_project(app: AppHandle, id: String, new_name: String) -> AppResult<
             r.to_server_id = n.clone();
         }
     }
-    let _ = stale;
-    store::save_project(&app, &p)?;
-    Ok(p)
+    store::save_project(&app, &p)
 }
 
 #[tauri::command]

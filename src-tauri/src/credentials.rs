@@ -3,13 +3,17 @@ use crate::error::{AppError, AppResult};
 // Windows DPAPI binds credentials to the current OS user. Passwords remain plaintext only
 // in memory; portable exports strip office credentials and never export these ciphertexts.
 pub fn protect(value: &str) -> AppResult<String> {
-    if value.is_empty() || value.starts_with("dpapi:") {
+    if value.is_empty() {
         return Ok(value.into());
     }
-    Ok(format!("dpapi:{}", transform(value, false)?))
+    // This API accepts plaintext, including passwords whose literal prefix is dpapi:.
+    Ok(format!("dpapi:v1:{}", transform(value, false)?))
 }
 pub fn reveal(value: &str) -> AppResult<String> {
-    match value.strip_prefix("dpapi:") {
+    match value
+        .strip_prefix("dpapi:v1:")
+        .or_else(|| value.strip_prefix("dpapi:"))
+    {
         Some(v) => transform(v, true),
         None => Ok(value.into()),
     }
@@ -113,7 +117,7 @@ pub fn protect_project(
         for (k, v) in &mut i.params {
             if secret_param(cat, &i.template_id, k) {
                 if let Some(s) = v.as_str() {
-                    *v = serde_json::json!(protect(s)?);
+                    *v = serde_json::json!({"$offlinePreOpsSecret": {"version": 1, "ciphertext": protect(s)?}});
                 }
             }
         }
@@ -124,9 +128,21 @@ pub fn reveal_project(p: &mut crate::models::Project) -> AppResult<()> {
     if let Some(r) = &mut p.registry {
         r.password = reveal(&r.password)?;
     }
+    let cat = crate::catalog::overlay(crate::catalog::preset()?, p);
     for i in &mut p.instances {
-        for v in i.params.values_mut() {
-            if let Some(s) = v.as_str().filter(|s| s.starts_with("dpapi:")) {
+        for (k, v) in &mut i.params {
+            if let Some(envelope) = v.get("$offlinePreOpsSecret") {
+                if envelope["version"] != 1 {
+                    return Err(AppError::Invalid("不支持的凭据存储版本".into()));
+                }
+                let s = envelope["ciphertext"]
+                    .as_str()
+                    .ok_or_else(|| AppError::Invalid("凭据密文无效".into()))?;
+                *v = serde_json::json!(reveal(s)?);
+            } else if let Some(s) = v
+                .as_str()
+                .filter(|s| secret_param(&cat, &i.template_id, k) && s.starts_with("dpapi:"))
+            {
                 *v = serde_json::json!(reveal(s)?);
             }
         }
@@ -146,8 +162,29 @@ pub fn strip_project(p: &mut crate::models::Project, cat: &crate::catalog::Catal
     }
     for i in &mut p.instances {
         i.params.retain(|k, v| {
-            !secret_param(cat, &i.template_id, k)
-                && !v.as_str().is_some_and(|v| v.starts_with("dpapi:"))
+            !secret_param(cat, &i.template_id, k) && v.get("$offlinePreOpsSecret").is_none()
         });
     }
+}
+
+/// Only stored records use this path; do not call protect_project twice on stored ciphertext.
+pub fn migrate_project(
+    p: &mut crate::models::Project,
+    cat: &crate::catalog::CatalogFile,
+) -> AppResult<()> {
+    if let Some(r) = &mut p.registry {
+        if !r.password.is_empty() && !r.password.starts_with("dpapi:v1:") {
+            r.password = protect(&reveal(&r.password)?)?;
+        }
+    }
+    for i in &mut p.instances {
+        for (k, v) in &mut i.params {
+            if secret_param(cat, &i.template_id, k) && v.get("$offlinePreOpsSecret").is_none() {
+                if let Some(s) = v.as_str() {
+                    *v = serde_json::json!({"$offlinePreOpsSecret": {"version": 1, "ciphertext": protect(&reveal(s)?)?}});
+                }
+            }
+        }
+    }
+    Ok(())
 }
