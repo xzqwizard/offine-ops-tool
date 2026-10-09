@@ -2,14 +2,11 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { backend } from '@/api/backend'
 import type { Project, ProjectSummary } from '@/types/project'
-
-let saveTimer: number | undefined
-/** 保存序号：丢弃乱序返回的过期保存响应 */
-let saveSeq = 0
-/** 保存链：所有保存请求严格串行执行（后端整体覆盖写，乱序落盘会用旧快照覆盖新数据） */
-let saveChain: Promise<void> = Promise.resolve()
+import { mergeSavedDraft } from '@/utils/projectDraft'
 
 export const useProjectStore = defineStore('project', () => {
+  let saveTimer: number | undefined
+  let saveChain: Promise<void> = Promise.resolve()
   let loadSeq = 0
   const loading = ref(false)
   const project = ref<Project | null>(null)
@@ -32,35 +29,50 @@ export const useProjectStore = defineStore('project', () => {
 
   /** 执行保存（排队串行）。仅"发起后无编辑"的响应才回写内存，防止在途快照回滚用户输入 */
   function save(): Promise<void> {
-    const snapshot = project.value ? JSON.parse(JSON.stringify(project.value)) as Project : null
-    const revBefore = revision.value
     const run = async () => {
+      const snapshot = project.value ? JSON.parse(JSON.stringify(project.value)) as Project : null
+      const revBefore = revision.value
       if (!snapshot) return
-      const seq = ++saveSeq
       saving.value = true
       try {
         const saved = await backend.saveProject(snapshot)
-        if (seq !== saveSeq || !project.value || saved.id !== project.value.id) return
+        if (!project.value || saved.id !== project.value.id) return
         // 响应回来前发生了编辑：不回写（会丢编辑），保持 dirty 由后续保存落盘
         if (revision.value !== revBefore) return
         project.value = saved
         dirty.value = false
         await refreshSummaries().catch(() => undefined)
       } finally {
-        if (seq === saveSeq) saving.value = false
+        saving.value = false
       }
     }
-    saveChain = saveChain.then(run, run)
-    return saveChain
+    const result = saveChain.then(run)
+    saveChain = result.catch(() => undefined)
+    return result
   }
 
   /** 修改并立即持久化（表单新增/修改/删除后自动保存） */
   async function commit(fn: (p: Project) => void) {
-    if (!project.value) return
-    fn(project.value)
-    touch()
-    dirty.value = true // 先置位：保存失败时界面保持"待保存"警示
-    await save()
+    const run = async () => {
+      if (!project.value) return
+      const before = JSON.parse(JSON.stringify(project.value)) as Project
+      const draft = JSON.parse(JSON.stringify(before)) as Project
+      const revBefore = revision.value
+      fn(draft)
+      saving.value = true
+      try {
+        const saved = await backend.saveProject(draft)
+        if (project.value?.id !== saved.id) return
+        const edited = revision.value !== revBefore
+        project.value = edited ? mergeSavedDraft(before, saved, project.value) : saved
+        touch()
+        dirty.value = edited
+        await refreshSummaries().catch(() => undefined)
+      } finally { saving.value = false }
+    }
+    const result = saveChain.then(run)
+    saveChain = result.catch(() => undefined)
+    await result
   }
 
   /** 修改并防抖自动保存（名称等连续输入场景） */

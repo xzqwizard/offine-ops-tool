@@ -88,7 +88,7 @@ const levelIcon: Record<string, { icon: string; cls: string }> = {
       </div>
 
       <div
-        v-if="!hasBlockingErrors(issues) && issues.length"
+        v-if="!hasBlockingErrors(issues) && !stale"
         class="bg-success/10 border border-success/30 rounded-xl p-3 text-sm text-success flex items-center gap-2"
       >
         <span class="material-symbols-outlined text-lg">check_circle</span>

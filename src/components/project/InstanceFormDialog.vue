@@ -9,6 +9,7 @@ import type { ImageInspect } from '@/types/images'
 import type { MiddlewareInstance, PortBinding, ServerInfo } from '@/types/project'
 import { genId } from '@/utils/id'
 import { genStrongPassword } from '@/utils/password'
+import { platformMatches, supportedArch } from '@/utils/platform'
 
 const props = defineProps<{
   modelValue: boolean
@@ -16,12 +17,13 @@ const props = defineProps<{
   editingId: string | null
   servers: ServerInfo[]
   templates: MiddlewareTemplate[]
+  submitting: boolean
 }>()
 
 const emit = defineEmits<{
   (e: 'update:modelValue', v: boolean): void
-  (e: 'save', inst: MiddlewareInstance): void
-  (e: 'saveMany', insts: MiddlewareInstance[]): void
+  (e: 'save', inst: MiddlewareInstance, template?: MiddlewareTemplate): void
+  (e: 'saveMany', insts: MiddlewareInstance[], template?: MiddlewareTemplate): void
 }>()
 
 const store = useProjectStore()
@@ -39,6 +41,15 @@ const localImageTar = ref('')
 const customImage = ref('')
 const category = ref('全部')
 const keyword = ref('')
+const savedCustomTemplate = ref<MiddlewareTemplate | null>(null)
+const customDataVolume = ref('')
+const customDataUser = ref('')
+const customCommand = ref('[]')
+const readiness = ref<'none' | 'exec' | 'tcp'>('none')
+const readinessCommand = ref('["curl", "-f", "http://127.0.0.1:8080/health"]')
+const readinessTimeout = ref(60)
+let tagsSeq = 0
+let inspectSeq = 0
 
 const categories = computed(() => {
   const set = new Set(props.templates.map((t) => t.category))
@@ -58,15 +69,15 @@ const filteredTemplates = computed(() => {
 })
 
 const selectedTemplate = computed(() =>
-  props.templates.find((t) => t.id === selectedTemplateId.value)
+  savedCustomTemplate.value?.id === selectedTemplateId.value ? savedCustomTemplate.value : props.templates.find((t) => t.id === selectedTemplateId.value)
 )
 
 const selectedServer = computed(() => props.servers.find((s) => s.id === formServerId.value))
 
 const archMismatch = computed(() => {
-  if (!selectedServer.value || !selectedTemplate.value) return false
+  if (mode.value !== 'catalog' || !selectedServer.value || !selectedTemplate.value) return false
   if (!selectedTemplate.value.supportedArches.length) return false
-  return !selectedTemplate.value.supportedArches.includes(selectedServer.value.arch)
+  return !supportedArch(selectedTemplate.value.supportedArches, selectedServer.value.arch)
 })
 
 // 在线检查结果插入：目录模式在版本 tag 之后，手动模式在镜像引用之后
@@ -89,16 +100,19 @@ const editingReference = ref('')
 
 async function loadOnlineTags() {
   if (!selectedTemplate.value) return
+  const seq = ++tagsSeq
+  const image = selectedTemplate.value.defaultImage
   tagsLoading.value = true
   try {
-    const tags = await backend.listImageTags(selectedTemplate.value.defaultImage, store.project?.registry ?? undefined)
+    const tags = await backend.listImageTags(image, store.project?.registry ?? undefined)
+    if (seq !== tagsSeq || image !== selectedTemplate.value?.defaultImage || !props.modelValue) return
     onlineTags.value = tags
     tagsLoaded.value = true
     ElMessage.success(`已获取 ${tags.length} 个版本（可输入过滤）`)
   } catch (e) {
-    ElMessage.warning(toAppError(e).message)
+    if (seq === tagsSeq) ElMessage.warning(toAppError(e).message)
   } finally {
-    tagsLoading.value = false
+    if (seq === tagsSeq) tagsLoading.value = false
   }
 }
 
@@ -111,6 +125,7 @@ const currentReference = computed(() => {
 })
 
 async function checkImage() {
+  const seq = ++inspectSeq
   const ref = currentReference.value
   if (!ref) {
     ElMessage.warning('请先填写镜像引用')
@@ -121,11 +136,11 @@ async function checkImage() {
   inspectRef.value = ref
   try {
     const checked = await backend.inspectImage(ref, store.project?.registry ?? undefined)
-    if (inspectRef.value === ref && currentReference.value === ref) inspect.value = checked
+    if (seq === inspectSeq && props.modelValue && inspectRef.value === ref && currentReference.value === ref) inspect.value = checked
   } catch (e) {
-    ElMessage.error(`镜像检查失败: ${toAppError(e).message}`)
+    if (seq === inspectSeq) ElMessage.error(`镜像检查失败: ${toAppError(e).message}`)
   } finally {
-    inspecting.value = false
+    if (seq === inspectSeq) inspecting.value = false
   }
 }
 
@@ -136,35 +151,50 @@ const inspectRef = ref('')
 /** 单个平台条目是否匹配服务器架构。
  * 忽略 variant（arm64:v8 属于 arm64）；处理 OCI 架构名别名：
  * 镜像清单用 goarch（loong64），服务器侧用 loongarch64。 */
-const ARCH_ALIASES: Record<string, string[]> = {
-  loongarch64: ['loongarch64', 'loong64'],
-  arm64: ['arm64', 'aarch64'],
-  amd64: ['amd64', 'x86_64']
-}
 function archMatches(a: string): boolean {
-  if (!selectedServer.value) return false
-  const names = ARCH_ALIASES[selectedServer.value.arch] ?? [selectedServer.value.arch]
-  return names.some((n) => {
-    const base = `linux/${n}`
-    return a === base || a.startsWith(`${base}:`) || a.startsWith(`${base}/`)
-  })
+  return !!selectedServer.value && platformMatches(a, selectedServer.value.arch)
 }
 const onlineArchOk = computed<boolean | null>(() => {
   if (!inspect.value || !selectedServer.value) return null
   // 检查结果必须对应当前引用（改了 tag/镜像后旧结论作废）
   if (inspectRef.value !== currentReference.value) return null
-  const base = `linux/${selectedServer.value.arch}`
-  return inspect.value.arches.some(
-    (a) => a === base || a.startsWith(`${base}:`) || a.startsWith(`${base}/`)
-  )
+  return inspect.value.arches.some(archMatches)
 })
 
 const savingTpl = ref(false)
 
+function customTemplate(displayName: string, id: string, category: string): MiddlewareTemplate {
+  const parseArgs = (text: string) => {
+    const args: unknown = JSON.parse(text)
+    if (!Array.isArray(args) || !args.every(a => typeof a === 'string')) throw new Error('命令必须是 JSON 字符串数组')
+    return args as string[]
+  }
+  const ref = customImage.value.trim()
+  const base = ref.split('@')[0]
+  const ci = base.lastIndexOf(':')
+  const name = ci > base.lastIndexOf('/') ? base.slice(0, ci) : base
+  if (readiness.value === 'tcp' && !ports.value.some(p => p.expose && p.protocol === 'tcp')) throw new Error('TCP 探针需要至少一个发布的 TCP 端口')
+  return {
+    id, displayName, category,
+    defaultImage: ref.includes('@') ? name + ref.slice(ref.indexOf('@')) : name,
+    recommendedTags: [extractTag(ref)].filter(t => t && t !== 'latest'),
+    supportedArches: [],
+    ports: ports.value.map(p => ({ name: p.name, container: p.container, defaultHost: p.host, protocol: p.protocol })),
+    envHints: Object.keys(params.value).map(k => ({ key: k, label: k, secret: /PASSWORD|SECRET|TOKEN|_KEY$|_PASS$|_PWD$/i.test(k), required: false, default: '' })),
+    dataVolume: customDataVolume.value.trim(), dataUser: customDataUser.value.trim() || null,
+    command: parseArgs(customCommand.value), dependsOn: [],
+    healthCheck: readiness.value === 'none' ? null : { type: readiness.value, cmd: readiness.value === 'exec' ? parseArgs(readinessCommand.value) : [] },
+    healthTimeoutSec: readinessTimeout.value, minMemoryGb: 0.5, kernelReqs: [], remark: `自定义：${ref}`
+  }
+}
+
 /** 手动输入的镜像存为"我的中间件"（下次目录直接选） */
 async function saveAsCustom() {
+  if (savingTpl.value) return
+  savingTpl.value = true
   if (!customImage.value.trim()) {
     ElMessage.warning('请先填写镜像引用')
+    savingTpl.value = false
     return
   }
   const displayName = instanceName.value.trim() || customImage.value.split('/').pop() || '自定义'
@@ -176,37 +206,12 @@ async function saveAsCustom() {
     }).then(async ({ value }) => {
       if (!value.trim()) return
       savingTpl.value = true
-      const tpl = {
-        id: `custom-${customImage.value.replace(/[^a-zA-Z0-9]/g, '-').slice(0, 40)}`,
-        displayName: value.trim(),
-        category: '我的中间件',
-        defaultImage: (() => {
-          // 先分离 @digest 再剥 :tag；原正则会把 @sha256:abcd 剥成 @sha256
-          const ref = customImage.value.trim()
-          const at = ref.indexOf('@')
-          const base = at >= 0 ? ref.slice(0, at) : ref
-          const digest = at >= 0 ? ref.slice(at) : ''
-          const ci = base.lastIndexOf(':')
-          const name = ci > base.lastIndexOf('/') ? base.slice(0, ci) : base
-          return digest ? name + digest : name
-        })(),
-        recommendedTags: [extractTag(customImage.value.trim())].filter((t) => t && t !== 'latest'),
-        supportedArches: [],
-        ports: ports.value.map((p) => ({
-          name: p.name, container: p.container, defaultHost: p.host, protocol: p.protocol
-        })),
-        envHints: Object.keys(params.value).map((k) => ({ key: k, label: k, secret: false, required: false, default: '' })),
-        dataVolume: '/data',
-        dataUser: null,
-        command: [],
-        dependsOn: [],
-        healthCheck: inspect.value && inspectRef.value === currentReference.value ? { type: 'exec', cmd: ['sh', '-c', 'true'] } : null,
-        healthTimeoutSec: 60,
-        minMemoryGb: 0.5,
-        kernelReqs: [],
-        remark: `自定义：${customImage.value.trim()}`
-      }
+      const tpl = customTemplate(value.trim(), genId('custom'), '我的中间件')
       await backend.saveCustomTemplate(tpl, '我的中间件')
+      savedCustomTemplate.value = tpl
+      selectedTemplateId.value = tpl.id
+      tag.value = extractTag(customImage.value.trim()) || 'latest'
+      mode.value = 'catalog'
       window.dispatchEvent(new Event('catalog-updated'))
       ElMessage.success(`已保存「${value.trim()}」，下次可从目录直接选择`)
     })
@@ -225,6 +230,14 @@ watch(mode, (m) => {
   if (m === 'custom' && !customImage.value.trim()) {
     const t = selectedTemplate.value
     customImage.value = t ? withTag(t.defaultImage, tag.value) : ''
+    if (t) {
+      customDataVolume.value = t.dataVolume
+      customDataUser.value = t.dataUser ?? ''
+      customCommand.value = JSON.stringify(t.command)
+      readiness.value = t.healthCheck?.type === 'tcp' ? 'tcp' : t.healthCheck ? 'exec' : 'none'
+      readinessCommand.value = JSON.stringify(t.healthCheck?.cmd ?? [])
+      readinessTimeout.value = t.healthTimeoutSec ?? 60
+    }
   }
 })
 
@@ -241,6 +254,14 @@ watch(formServerIds, (ids) => {
 })
 
 function init() {
+  ++tagsSeq
+  ++inspectSeq
+  savedCustomTemplate.value = null
+  customDataVolume.value = ''
+  customDataUser.value = ''
+  customCommand.value = '[]'
+  readiness.value = 'none'
+  readinessTimeout.value = 60
   keyword.value = ''
   category.value = '全部'
   // 在线检查/在线 tag 状态必须随弹窗重置：残留的旧结论会用旧镜像的
@@ -254,11 +275,23 @@ function init() {
     ? store.project?.instances.find((i) => i.id === props.editingId)
     : null
   if (editing) {
+    const config = props.templates.find(t => t.id === editing.templateId && t.category === '实例配置')
     formServerId.value = editing.serverId
     formServerIds.value = [editing.serverId]
-    mode.value = editing.templateId === 'custom' ? 'custom' : 'catalog'
+    mode.value = editing.templateId === 'custom' || config ? 'custom' : 'catalog'
     selectedTemplateId.value = editing.templateId
-    customImage.value = editing.templateId === 'custom' ? editing.image : ''
+    customImage.value = mode.value === 'custom' ? editing.image : ''
+    if (config) {
+      customDataVolume.value = config.dataVolume
+      customDataUser.value = config.dataUser ?? ''
+      customCommand.value = JSON.stringify(config.command)
+      readiness.value = config.healthCheck?.type === 'tcp' ? 'tcp' : config.healthCheck ? 'exec' : 'none'
+      readinessCommand.value = JSON.stringify(config.healthCheck?.cmd ?? [])
+      readinessTimeout.value = config.healthTimeoutSec ?? 60
+    } else if (editing.templateId === 'custom') {
+      // Preserve the legacy raw custom mount until the user explicitly changes it.
+      customDataVolume.value = '/data'
+    }
     tag.value = editing.templateId === 'custom' ? '' : extractTag(editing.image)
     instanceName.value = editing.instanceName
     ports.value = JSON.parse(JSON.stringify(editing.ports))
@@ -291,6 +324,10 @@ function extractTag(image: string): string {
 }
 
 function selectTemplate(t: MiddlewareTemplate) {
+  ++tagsSeq
+  onlineTags.value = []
+  tagsLoaded.value = false
+  tagsLoading.value = false
   selectedTemplateId.value = t.id
   tag.value = t.recommendedTags[0] ?? ''
   if (!instanceName.value || !props.editingId) {
@@ -323,6 +360,7 @@ function removePort(index: number) {
 }
 
 function handleSave() {
+  if (props.submitting || savingTpl.value) return
   // 编辑=单服务器（formServerId 由 init 赋值）；新增统一读多选集合，
   // 避免读到只在 init 时赋值的过期单选值（选 1 台会部署到错误机器）
   const targetIds = props.editingId
@@ -336,13 +374,13 @@ function handleSave() {
     ElMessage.warning('请先选择中间件')
     return
   }
-  if (props.editingId && selectedServer.value && archMismatch.value) {
+  if (targetIds.length === 1 && selectedServer.value && archMismatch.value) {
     ElMessage.error(
       `架构不兼容：${selectedTemplate.value!.displayName} 不支持 ${selectedServer.value.arch}，请更换镜像/版本或改用手动输入`
     )
     return
   }
-  if (props.editingId && selectedServer.value && onlineArchOk.value === false) {
+  if (!localImageTar.value.trim() && targetIds.length === 1 && selectedServer.value && onlineArchOk.value === false) {
     ElMessage.error(
       `在线检查确认：${currentReference.value} 不支持 linux/${selectedServer.value.arch}`
     )
@@ -360,7 +398,7 @@ function handleSave() {
     ElMessage.warning('版本 tag 不能为空')
     return
   }
-  for (const h of selectedTemplate.value?.envHints ?? []) {
+  for (const h of mode.value === 'catalog' ? selectedTemplate.value?.envHints ?? [] : []) {
     if (h.required && !params.value[h.key]?.trim()) {
       ElMessage.warning(`参数「${h.label}」为必填项`)
       return
@@ -373,10 +411,14 @@ function handleSave() {
     }
   }
 
-  const image =
+  let image =
     mode.value === 'custom'
       ? customImage.value.trim()
       : withTag(selectedTemplate.value!.defaultImage, tag.value.trim())
+  if (localImageTar.value.trim() && image.includes('@')) {
+    ElMessage.warning('本地 tar 使用独立内容校验；请将镜像引用改为该归档中的 repo:tag，移除 @digest')
+    return
+  }
 
   const cleanParams: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(params.value)) {
@@ -391,9 +433,8 @@ function handleSave() {
       : targetIds.filter((id) => {
           const s = props.servers.find((x) => x.id === id)
           if (!s) return false
-          const mismatch =
-            selectedTemplate.value?.supportedArches.length &&
-            !selectedTemplate.value.supportedArches.includes(s.arch)
+          const mismatch = (mode.value === 'catalog' && selectedTemplate.value && !supportedArch(selectedTemplate.value.supportedArches, s.arch)) ||
+            (!localImageTar.value.trim() && inspect.value && inspectRef.value === image && !inspect.value.arches.some(a => platformMatches(a, s.arch)))
           if (mismatch) skipped.push(`${s.name}(${s.arch})`)
           return !mismatch
         })
@@ -405,15 +446,20 @@ function handleSave() {
     ElMessage.warning(`已跳过架构不兼容的服务器：${skipped.join('、')}`)
   }
 
-  const digest =
+  const digest = localImageTar.value.trim() ? '' :
     inspect.value && inspectRef.value === image && inspect.value.digest
       ? inspect.value.digest
       : image === editingReference.value ? editingDigest.value : ''
 
+  let template: MiddlewareTemplate | undefined
+  if (mode.value === 'custom') {
+    try { template = customTemplate(instanceName.value.trim(), selectedTemplateId.value.startsWith('instcfg-') ? selectedTemplateId.value : genId('instcfg'), '实例配置') }
+    catch (e) { ElMessage.warning(toAppError(e).message); return }
+  }
   const instances: MiddlewareInstance[] = finalIds.map((serverId) => ({
     id: props.editingId ?? genId('inst'),
     serverId,
-    templateId: mode.value === 'custom' ? 'custom' : selectedTemplate.value!.id,
+    templateId: template?.id ?? (mode.value === 'custom' ? 'custom' : selectedTemplate.value!.id),
     image,
     digest,
     instanceName: instanceName.value.trim(),
@@ -423,9 +469,9 @@ function handleSave() {
   }))
 
   if (instances.length === 1 && (props.editingId || formServerIds.value.length <= 1)) {
-    emit('save', instances[0])
+    emit('save', instances[0], template)
   } else {
-    emit('saveMany', instances)
+    emit('saveMany', instances, template)
   }
 }
 </script>
@@ -436,6 +482,9 @@ function handleSave() {
     :title="editingId ? '编辑中间件实例' : '添加中间件'"
     width="920"
     top="4vh"
+    :close-on-click-modal="!submitting && !savingTpl"
+    :close-on-press-escape="!submitting && !savingTpl"
+    :show-close="!submitting && !savingTpl"
     @update:model-value="emit('update:modelValue', $event)"
   >
     <!-- 目标服务器（新增可多选批量部署，编辑单台） -->
@@ -656,7 +705,7 @@ function handleSave() {
               placeholder="M0：docker save 导出的 tar 文件绝对路径（选填）"
             />
             <div class="text-xs text-on-surface-variant mt-1">
-              未填写时构建产物将不包含该镜像，部署前需自行 docker load
+              填写后按本地 tar 内容校验并清除仓库 digest 锁；未填写时使用可信缓存或自动拉取。
             </div>
           </el-form-item>
         </el-form>
@@ -740,12 +789,22 @@ function handleSave() {
         <el-form-item label="本地镜像 tar">
           <el-input v-model="localImageTar" placeholder="docker save 导出的 tar 文件绝对路径（选填）" />
         </el-form-item>
+        <el-divider content-position="left">部署配置（随实例保存，可另存为我的中间件）</el-divider>
+        <el-form-item label="持久化目录"><el-input v-model="customDataVolume" placeholder="容器内绝对路径，如 /var/lib/app；留空不挂载" /></el-form-item>
+        <el-form-item label="运行属主"><el-input v-model="customDataUser" placeholder="UID:GID，如 1000:1000；留空使用镜像默认" /></el-form-item>
+        <el-form-item label="启动命令"><el-input v-model="customCommand" placeholder='JSON 数组，如 ["app", "--serve"]' /></el-form-item>
+        <el-form-item label="就绪检查">
+          <el-select v-model="readiness"><el-option value="none" label="仅检查稳定运行" /><el-option value="tcp" label="TCP：检查首个发布 TCP 端口" /><el-option value="exec" label="执行业务探针（可检查 HTTP）" /></el-select>
+          <el-input v-if="readiness === 'exec'" v-model="readinessCommand" type="textarea" class="mt-2" placeholder='镜像内命令 JSON 数组，如 ["curl", "-f", "http://127.0.0.1:8080/health"]' />
+          <p class="text-xs text-on-surface-variant mt-1">探针需在镜像内可执行并反映业务就绪；在线镜像检查只确认镜像信息。</p>
+        </el-form-item>
+        <el-form-item label="就绪超时"><el-input-number v-model="readinessTimeout" :min="1" :max="3600" /> 秒</el-form-item>
       </el-form>
     </div>
 
     <template #footer>
-      <el-button @click="emit('update:modelValue', false)">取消</el-button>
-      <el-button type="primary" @click="handleSave">确定并保存</el-button>
+      <el-button :disabled="submitting || savingTpl" @click="emit('update:modelValue', false)">取消</el-button>
+      <el-button type="primary" :loading="submitting" :disabled="savingTpl" @click="handleSave">确定并保存</el-button>
     </template>
   </el-dialog>
 </template>

@@ -6,6 +6,7 @@ import { backend, toAppError } from '@/api/backend'
 import type { MiddlewareTemplate } from '@/types/catalog'
 import type { MiddlewareInstance } from '@/types/project'
 import InstanceFormDialog from './InstanceFormDialog.vue'
+import { applyInstanceTemplate, replaceInstance } from '@/utils/projectDraft'
 
 const store = useProjectStore()
 const availableCatalog = ref<MiddlewareTemplate[]>([])
@@ -15,6 +16,7 @@ const catalog = computed(() => {
 })
 const dialogOpen = ref(false)
 const editingId = ref<string | null>(null) // null = 新增
+const submitting = ref(false)
 
 async function refreshCatalog() {
   try {
@@ -71,14 +73,7 @@ async function handleDelete(inst: MiddlewareInstance) {
   }
   try {
     await store.commit((p) => {
-      p.instances = p.instances.filter((i) => i.id !== inst.id)
-      p.networkRules = p.networkRules.filter(
-        (r) =>
-          !(
-            r.toServerId === inst.serverId &&
-            inst.ports.some((p) => p.host === r.toPort && p.protocol === r.protocol && p.expose)
-          )
-      )
+      replaceInstance(p, inst)
     })
     ElMessage.success('已删除并保存')
   } catch (e) {
@@ -87,7 +82,8 @@ async function handleDelete(inst: MiddlewareInstance) {
 }
 
 /** 批量保存实例（多选服务器部署）：逐个校验，全部通过才落盘 */
-function saveInstances(insts: MiddlewareInstance[]) {
+async function saveInstances(insts: MiddlewareInstance[], template?: MiddlewareTemplate) {
+  if (submitting.value) return
   for (const inst of insts) {
     const err = validateInstance(inst)
     if (err) {
@@ -95,40 +91,40 @@ function saveInstances(insts: MiddlewareInstance[]) {
       return
     }
   }
-  store
-    .commit((p) => {
-      for (const inst of insts) {
+  submitting.value = true
+  try { await store.commit((p) => {
+      for (const inst of applyInstanceTemplate(p, insts, template)) {
         p.instances.push(inst)
       }
     })
-    .then(() => {
       dialogOpen.value = false
       ElMessage.success(`已在 ${insts.length} 台服务器上添加`)
-    })
-    .catch((e) => ElMessage.error(`保存失败: ${toAppError(e).message}`))
+  } catch (e) { ElMessage.error(`保存失败: ${toAppError(e).message}`) }
+  finally { submitting.value = false }
 }
 
 /** 保存实例（新增或更新），含 R2 同机宿主端口冲突校验；通过后自动保存 */
-function saveInstance(inst: MiddlewareInstance) {
+async function saveInstance(inst: MiddlewareInstance, template?: MiddlewareTemplate) {
+  if (submitting.value) return
   const err = validateInstance(inst)
   if (err) {
     ElMessage.warning(err)
     return
   }
-  store
-    .commit((p) => {
-      const idx = p.instances.findIndex((i) => i.id === inst.id)
+  submitting.value = true
+  try { await store.commit((p) => {
+      const configured = applyInstanceTemplate(p, [inst], template)[0]
+      const idx = p.instances.findIndex((i) => i.id === configured.id)
       if (idx >= 0) {
-        p.instances[idx] = inst
+        replaceInstance(p, p.instances[idx], configured)
       } else {
-        p.instances.push(inst)
+        p.instances.push(configured)
       }
     })
-    .then(() => {
       dialogOpen.value = false
       ElMessage.success('已保存')
-    })
-    .catch((e) => ElMessage.error(`保存失败: ${toAppError(e).message}`))
+  } catch (e) { ElMessage.error(`保存失败: ${toAppError(e).message}`) }
+  finally { submitting.value = false }
 }
 
 function validateInstance(inst: MiddlewareInstance): string | null {
@@ -243,6 +239,7 @@ function validateInstance(inst: MiddlewareInstance): string | null {
       :editing-id="editingId"
       :servers="servers"
       :templates="catalog"
+      :submitting="submitting"
       @save="saveInstance"
       @save-many="saveInstances"
     />

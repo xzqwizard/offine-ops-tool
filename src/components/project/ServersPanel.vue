@@ -16,6 +16,8 @@ import { genId } from '@/utils/id'
 const store = useProjectStore()
 
 const dialogOpen = ref(false)
+const submitting = ref(false)
+let versionsSeq = 0
 const editingIndex = ref(-1) // -1 = 新增
 const form = ref<ServerInfo>(emptyForm())
 
@@ -80,25 +82,29 @@ function validateForm(): string | null {
 }
 
 async function loadDockerVersions(arch: string) {
+  const seq = ++versionsSeq
   if (!OFFICIAL_DOCKER_ARCHES.includes(arch)) {
     dockerVersions.value = []
     dockerError.value = ''
+    dockerLoading.value = false
     return
   }
   dockerLoading.value = true
   dockerError.value = ''
   try {
     const list = await backend.listDockerVersions(arch)
+    if (seq !== versionsSeq || form.value.arch !== arch) return
     dockerVersions.value = list
     // 仅新增模式自动选最新版；编辑模式绝不静默覆盖用户已填版本
     if (list.length && editingIndex.value < 0 && !form.value.dockerVersion) {
       form.value.dockerVersion = list[0]
     }
   } catch (e) {
+    if (seq !== versionsSeq) return
     dockerVersions.value = []
     dockerError.value = toAppError(e).message
   } finally {
-    dockerLoading.value = false
+    if (seq === versionsSeq) dockerLoading.value = false
   }
 }
 
@@ -129,19 +135,22 @@ function openEdit(index: number) {
 }
 
 async function handleSave() {
+  if (submitting.value) return
   const err = validateForm()
   if (err) {
     ElMessage.warning(err)
     return
   }
   const isEdit = editingIndex.value >= 0
-  const target = form.value
+  const target: ServerInfo = JSON.parse(JSON.stringify(form.value))
+  const index = editingIndex.value
+  if (!isEdit) target.id = genId('srv')
+  submitting.value = true
   try {
     await store.commit((p) => {
       if (isEdit) {
-        p.servers[editingIndex.value] = target
+        p.servers[index] = target
       } else {
-        target.id = genId('srv')
         p.servers.push(target)
       }
     })
@@ -149,7 +158,7 @@ async function handleSave() {
     ElMessage.success(`服务器「${target.name}」已保存`)
   } catch (e) {
     ElMessage.error(`保存失败: ${toAppError(e).message}`)
-  }
+  } finally { submitting.value = false }
 }
 
 async function handleDelete(index: number) {
@@ -345,7 +354,7 @@ async function handleDelete(index: number) {
       </el-form>
       <template #footer>
         <el-button @click="dialogOpen = false">取消</el-button>
-        <el-button type="primary" @click="handleSave">确定并保存</el-button>
+        <el-button type="primary" :loading="submitting" @click="handleSave">确定并保存</el-button>
       </template>
     </el-dialog>
   </div>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { VueFlow, type Node, type Edge, type NodeProps } from '@vue-flow/core'
+import { VueFlow, Handle, Position, type Node, type Edge, type NodeProps } from '@vue-flow/core'
 import '@vue-flow/core/dist/style.css'
 import '@vue-flow/core/dist/theme-default.css'
 import { useProjectStore } from '@/stores/project'
@@ -44,20 +44,20 @@ const nodes = computed<Node<ServerNodeData>[]>(() => {
 
 const edges = computed<Edge[]>(() => {
   // 同一对服务器聚合成一条边；自指规则（from==to）无拓扑意义，跳过
-  const grouped = new Map<string, { from: string; to: string; ports: Set<number> }>()
+  const grouped = new Map<string, { from: string; to: string; ports: Set<string> }>()
   for (const r of rules.value) {
     if (r.fromServerId === r.toServerId) continue
     const key = `${r.fromServerId}->${r.toServerId}`
     if (!grouped.has(key)) {
       grouped.set(key, { from: r.fromServerId, to: r.toServerId, ports: new Set() })
     }
-    grouped.get(key)!.ports.add(r.toPort)
+    grouped.get(key)!.ports.add(`${r.toPort}/${r.protocol}`)
   }
   return Array.from(grouped.values()).map((g, i) => ({
     id: `e-${i}`,
     source: g.from,
     target: g.to,
-    label: Array.from(g.ports).sort((a, b) => a - b).join(','),
+    label: Array.from(g.ports).sort((a, b) => parseInt(a) - parseInt(b) || a.localeCompare(b)).join(', '),
     animated: true,
     labelStyle: { fill: 'var(--t-on-surface-variant)', fontSize: '10px', fontFamily: 'monospace' },
     labelBgStyle: { fill: 'var(--t-surface)', fillOpacity: 0.85 },
@@ -92,6 +92,8 @@ function nodeStyle(p: NodeProps<ServerNodeData>) {
     >
       <template #node-server="props">
         <div :style="nodeStyle(props)" class="server-node">
+          <Handle type="target" :position="Position.Left" />
+          <Handle type="source" :position="Position.Right" />
           <div class="font-bold">{{ props.data.name }}</div>
           <div class="mono dim">{{ props.data.arch }} · {{ props.data.ip }}</div>
           <div class="small">{{ props.data.instances }}</div>

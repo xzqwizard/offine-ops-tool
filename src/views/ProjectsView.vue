@@ -7,10 +7,12 @@ import { useProjectStore } from '@/stores/project'
 import { backend, toAppError } from '@/api/backend'
 import { ARCH_TEMPLATES, buildProjectFromTemplate, type ArchTemplate } from '@/utils/archTemplates'
 import type { MiddlewareTemplate } from '@/types/catalog'
+import { formatTime as fmtTime } from '@/utils/time'
 
 const router = useRouter()
 const store = useProjectStore()
 const loading = ref(false)
+const submitting = ref(false)
 const createOpen = ref(false)
 const form = ref({ name: '', customer: '' })
 
@@ -38,10 +40,12 @@ onMounted(async () => {
 })
 
 async function handleCreate() {
+  if (submitting.value) return
   if (!form.value.name.trim()) {
     ElMessage.warning('请输入方案名称')
     return
   }
+  submitting.value = true
   try {
     const p = await store.create(form.value.name, form.value.customer)
     createOpen.value = false
@@ -50,7 +54,7 @@ async function handleCreate() {
     router.push({ name: 'project-edit', params: { id: p.id } })
   } catch (e) {
     ElMessage.error(`创建失败: ${toAppError(e).message}`)
-  }
+  } finally { submitting.value = false }
 }
 
 function openClone(id: string, name: string) {
@@ -60,11 +64,14 @@ function openClone(id: string, name: string) {
 }
 
 async function handleClone() {
+  if (submitting.value) return
   if (!cloneTarget.value || !cloneName.value.trim()) {
     ElMessage.warning('请输入新方案名称')
     return
   }
+  submitting.value = true
   try {
+    await store.flushPending()
     const p = await backend.cloneProject(cloneTarget.value.id, cloneName.value)
     cloneOpen.value = false
     ElMessage.success(`已复制为「${p.name}」（服务器 IP 已清空待填）`)
@@ -72,7 +79,7 @@ async function handleClone() {
     router.push({ name: 'project-edit', params: { id: p.id } })
   } catch (e) {
     ElMessage.error(`复制失败: ${toAppError(e).message}`)
-  }
+  } finally { submitting.value = false }
 }
 
 function openTpl() {
@@ -83,6 +90,7 @@ function openTpl() {
 }
 
 async function handleTplCreate() {
+  if (submitting.value) return
   if (!tplSelected.value) {
     ElMessage.warning('请选择架构模板')
     return
@@ -91,6 +99,7 @@ async function handleTplCreate() {
     ElMessage.warning('请输入方案名称')
     return
   }
+  submitting.value = true
   try {
     let catalog = catalogCache
     if (!catalog.length) {
@@ -99,17 +108,14 @@ async function handleTplCreate() {
     }
     const p = await store.create(tplName.value, tplCustomer.value)
     // 叠放模板内容后整体保存（create 只落了空方案）
-    p.customer = tplCustomer.value
-    buildProjectFromTemplate(p, tplSelected.value, catalog)
-    const saved = await backend.saveProject(p)
-    store.project = saved
-    await store.refreshSummaries()
+    await store.commit(draft => buildProjectFromTemplate(draft, tplSelected.value!, catalog))
+    const saved = store.project!
     tplOpen.value = false
     ElMessage.success(`方案「${saved.name}」已按模板生成（补填服务器 IP 后即可校验构建）`)
     router.push({ name: 'project-edit', params: { id: saved.id } })
   } catch (e) {
     ElMessage.error(`模板创建失败: ${toAppError(e).message}`)
-  }
+  } finally { submitting.value = false }
 }
 
 async function handleDelete(id: string, name: string) {
@@ -169,10 +175,6 @@ function openProject(id: string) {
   router.push({ name: 'project-edit', params: { id } })
 }
 
-function fmtTime(iso: string) {
-  if (!iso) return '-'
-  return iso.replace('T', ' ').replace(/([+-]\d{2}:\d{2}|Z)$/, '')
-}
 </script>
 
 <template>
@@ -252,7 +254,7 @@ function fmtTime(iso: string) {
       <template #footer>
         <el-button @click="tplOpen = true">从模板创建…</el-button>
         <el-button @click="createOpen = false">取消</el-button>
-        <el-button type="primary" @click="handleCreate">创建</el-button>
+        <el-button type="primary" :loading="submitting" @click="handleCreate">创建</el-button>
       </template>
     </el-dialog>
 
@@ -264,7 +266,7 @@ function fmtTime(iso: string) {
       <el-input v-model="cloneName" placeholder="新方案名称" maxlength="60" />
       <template #footer>
         <el-button @click="cloneOpen = false">取消</el-button>
-        <el-button type="primary" @click="handleClone">复制并打开</el-button>
+        <el-button type="primary" :loading="submitting" @click="handleClone">复制并打开</el-button>
       </template>
     </el-dialog>
 
@@ -291,7 +293,7 @@ function fmtTime(iso: string) {
       </div>
       <template #footer>
         <el-button @click="tplOpen = false">取消</el-button>
-        <el-button type="primary" :disabled="!tplSelected" @click="handleTplCreate">生成并打开</el-button>
+        <el-button type="primary" :loading="submitting" :disabled="!tplSelected" @click="handleTplCreate">生成并打开</el-button>
       </template>
     </el-dialog>
   </div>
