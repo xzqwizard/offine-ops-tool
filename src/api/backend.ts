@@ -67,6 +67,7 @@ export const backend = {
   async getStorageInfo(): Promise<StorageInfo> {
     return invoke<StorageInfo>('get_storage_info')
   },
+  async migrateStorage(settings: AppSettings, taskId: string): Promise<StorageInfo> { return invoke('migrate_storage', { settings, taskId }) },
 
   async listCatalog(): Promise<CatalogFile> {
     return invoke<CatalogFile>('list_catalog')

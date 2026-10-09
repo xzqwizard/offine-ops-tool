@@ -1,17 +1,15 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as openDirectory, save as saveFileDialog, open as openFileDialog } from "@tauri-apps/plugin-dialog"
 import { backend, toAppError } from '@/api/backend'
-import { useBuildTaskStore } from '@/stores/buildTask'
 import { useProjectStore } from '@/stores/project'
+import { useTaskStore } from '@/stores/tasks'
 import type {
   AppSettings,
   StorageInfo,
   ProxyConfig,
-  ConnectivityResult,
-  NetTestEvent
+  TestNetworkReport
 } from '@/types/project'
 
 const loading = ref(true)
@@ -24,23 +22,34 @@ const newMirror = ref('')
 
 // ---- 连通性测试（弹窗 + 实时进度） ----
 interface TestItem {
+  target: string
   label: string
   state: 'pending' | 'running' | 'ok' | 'fail'
   latencyMs: number
   error: string
 }
 const testOpen = ref(false)
-const testing = ref(false)
-const testItems = reactive<TestItem[]>([])
-const testProxyUsed = ref<string | null>(null)
-let unlistenNetTest: UnlistenFn | null = null
-let disposed = false
+const tasks = useTaskStore()
+const preparingTest = ref(false)
+const networkTask = computed(() => tasks.latest('network-test'))
+const testing = computed(() => preparingTest.value || tasks.active.some(t => t.key === 'network-test'))
+const testProxyUsed = computed(() => (networkTask.value?.result as TestNetworkReport | undefined)?.proxyUsed ?? null)
+const testItems = computed<TestItem[]>(() => {
+  const task = networkTask.value
+  if (!task) return []
+  const report = task.result as TestNetworkReport | undefined
+  const targets = [...new Set([...(task.parameters.targets as string[] ?? []), ...Object.keys(task.items ?? {}), ...(report?.results.map(r => r.target) ?? [])])]
+  return targets.map(target => {
+    const event = task.items?.[target]
+    const result = report?.results.find(r => r.target === target) ?? event?.result
+    return { target, label: labelOf(target), state: result ? result.ok ? 'ok' : 'fail' : ['failed', 'cancelled'].includes(task.status) ? 'fail' : event?.state === 'running' ? 'running' : 'pending', latencyMs: result?.latencyMs ?? 0, error: result?.error || (['failed', 'cancelled'].includes(task.status) ? task.error ?? '未执行' : '') }
+  })
+})
 
 function labelOf(target: string): string {
   if (target.includes('www.google.com')) return '代理通道（google.com）'
   if (target.includes('auth.docker.io')) return 'Docker Hub 认证端点'
   if (target.includes('registry-1.docker.io')) return 'Docker Hub Registry'
-  if (target.includes('daocloud')) return '国内镜像源（daocloud）'
   return target
 }
 
@@ -94,40 +103,25 @@ async function loadAll() {
 
 onMounted(async () => {
   await loadAll()
-  try {
-    const fn = await listen<NetTestEvent>('net-test', (e) => {
-      const { target, state, result } = e.payload
-      const item = testItems.find((t) => t.label === labelOf(target))
-      if (!item) return
-      if (state === 'running') {
-        item.state = 'running'
-      } else if (result) {
-        item.state = result.ok ? 'ok' : 'fail'
-        item.latencyMs = result.latencyMs
-        item.error = result.ok ? '' : result.error || '不可达'
-      }
-    })
-    // 竞态防护：await 期间组件可能已卸载，立即注销
-    if (disposed) fn()
-    else unlistenNetTest = fn
-  } catch {
-    /* 非 Tauri 环境忽略 */
-  }
-})
-
-onUnmounted(() => {
-  disposed = true
-  unlistenNetTest?.()
 })
 
 async function handleSave() {
-  if (useBuildTaskStore().busy || backing.value) { ElMessage.warning('请等待构建或备份恢复结束后保存设置'); return }
+  if (saving.value) return
+  if (tasks.busy || backing.value) { ElMessage.warning('请等待任务或备份恢复结束后保存设置'); return }
   if (!settings.value) return
   saving.value = true
+  const snapshot: AppSettings = JSON.parse(JSON.stringify(settings.value))
+  const previousProjectsRoot = storage.value?.projectsRoot
   try {
     await useProjectStore().flushPending()
-    settingsSave = backend.saveSettings(settings.value)
+    settingsSave = backend.saveSettings(snapshot)
     storage.value = await settingsSave
+    if (storage.value.projectsRoot !== previousProjectsRoot) {
+      await useProjectStore().close()
+      await useProjectStore().refreshSummaries()
+    }
+    settings.value = await backend.getSettings()
+    if (!settings.value.proxy) settings.value.proxy = emptyProxy()
     ElMessage.success('设置已保存（目录已就绪）')
   } catch (e) {
     ElMessage.error(`保存失败: ${toAppError(e).message}`)
@@ -137,48 +131,36 @@ async function handleSave() {
   }
 }
 
+async function migrateStorage() {
+  if (!settings.value || tasks.busy || saving.value || backing.value) return
+  saving.value = true
+  const snapshot: AppSettings = JSON.parse(JSON.stringify(settings.value))
+  try {
+    await useProjectStore().flushPending()
+    storage.value = await tasks.run('storage-migration', '复制并切换存储目录', { paths: ROOT_FIELDS.map(f => ({ from: storage.value?.[f.effKey], to: snapshot[f.key] })) }, ['storage-migration'], id => backend.migrateStorage(snapshot, id))
+    await useProjectStore().close()
+    await useProjectStore().refreshSummaries()
+    settings.value = await backend.getSettings()
+    if (!settings.value.proxy) settings.value.proxy = emptyProxy()
+    ElMessage.success('复制和校验完成，已切换目录；旧目录保留，可在设置中回退')
+  } catch (e) { ElMessage.error(`迁移失败，旧数据保留: ${toAppError(e).message}`) }
+  finally { saving.value = false }
+}
+
 /** 弹窗内逐目标实时测试；直接使用界面当前配置（未保存也生效） */
 async function runTest() {
   if (!settings.value || testing.value) return
   const snapshot: AppSettings = JSON.parse(JSON.stringify(settings.value))
 
-  // 预置目标（启用代理时先测代理通道；auth/registry 是拉镜像的实际依赖）
-  const targets: string[] = []
-  const proxyOn = snapshot.proxy?.enabled && !!snapshot.proxy.host.trim() && !!snapshot.proxy.port
-  if (proxyOn) targets.push('https://www.google.com/')
-  targets.push('https://auth.docker.io/token', 'https://registry-1.docker.io/v2/', 'https://docker.m.daocloud.io/v2/')
-
-  testItems.length = 0
-  for (const t of targets) {
-    testItems.push({ label: labelOf(t), state: 'pending', latencyMs: 0, error: '' })
-  }
-  testProxyUsed.value = null
-  testOpen.value = true
-  testing.value = true
-
+  preparingTest.value = true
   try {
-    const report = await backend.testNetwork(snapshot)
-    testProxyUsed.value = report.proxyUsed
-    // 事件丢失/乱序时以最终报告兜底刷新：仅跳过已有结论（ok/fail）的项，
-    // pending/running 项必须用报告结果覆盖，否则会永久卡在"等待中"
-    for (const r of report.results) {
-      const item = testItems.find((t) => t.label === labelOf(r.target))
-      if (item && item.state !== 'ok' && item.state !== 'fail') {
-        item.state = r.ok ? 'ok' : 'fail'
-        item.latencyMs = r.latencyMs
-        item.error = r.ok ? '' : r.error || '不可达'
-      }
-    }
+    const targets = await backend.networkTargets(snapshot)
+    testOpen.value = true
+    await tasks.run('network-test', '网络连通性测试', { targets }, ['net-test'], id => backend.testNetwork(snapshot, id))
   } catch (e) {
     ElMessage.error(`测试失败: ${toAppError(e).message}`)
-    for (const item of testItems) {
-      if (item.state === 'pending' || item.state === 'running') {
-        item.state = 'fail'
-        item.error = '未执行'
-      }
-    }
   } finally {
-    testing.value = false
+    preparingTest.value = false
   }
 }
 
@@ -288,7 +270,7 @@ async function handleRestoreData() {
     }
     backing.value = true
     try {
-      if (useBuildTaskStore().busy) { ElMessage.warning('请等待构建结束后恢复'); return }
+      if (tasks.busy) { ElMessage.warning('请等待任务结束后恢复'); return }
       await settingsSave?.catch(() => undefined)
       await useProjectStore().close()
       const msg = await backend.restoreAppData(path)
@@ -376,13 +358,15 @@ function removeMirror(index: number) {
               </button>
             </template>
           </el-input>
+          <p class="text-xs font-mono text-on-surface-variant mt-1">当前数据位置：{{ storage[f.effKey] }}</p>
         </div>
       </div>
       <div class="text-xs text-on-surface-variant/60 mt-4">
         默认全部在软件所在目录的 data/ 下（便携式布局，整个目录拷走即迁移）；软件若安装在系统保护目录（如
         Program Files），请选择其他可写位置。注意：更改路径只影响新数据写入，
-        <b>不会自动搬运</b>已有数据（请手动移动旧目录内容到新位置，镜像缓存可重新拉取）。
+        <b>不会自动搬运</b>已有数据。可点击“复制并切换”将数据复制到新的空目录，校验后切换，保留旧目录供回退。迁移需要新盘至少容纳一份源数据；回退时重新填写上面的旧位置并保存。
       </div>
+      <el-button class="mt-3" :loading="saving" :disabled="tasks.busy || backing" @click="migrateStorage">复制并切换到新目录</el-button>
     </section>
 
     <!-- 镜像源 -->
@@ -618,7 +602,7 @@ function removeMirror(index: number) {
     <div class="flex flex-col gap-2">
       <div
         v-for="item in testItems"
-        :key="item.label"
+        :key="item.target"
         class="flex items-center gap-3 text-xs bg-surface-container rounded-lg px-3 py-2.5 border border-outline-variant"
       >
         <!-- 状态图标 -->

@@ -175,17 +175,64 @@ pub fn load_settings(app: &AppHandle) -> AppResult<AppSettings> {
 
 pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> AppResult<()> {
     let _storage_lock = storage_lock(app)?;
+    save_settings_locked(app, settings)
+}
+/// Normalize and validate before touching directories or encrypting UI plaintext.
+pub fn normalize_settings(settings: &AppSettings) -> AppResult<AppSettings> {
+    let mut value = settings.clone();
+    for root in [
+        &mut value.projects_root,
+        &mut value.image_cache_root,
+        &mut value.docker_pkg_root,
+        &mut value.artifact_root,
+        &mut value.log_root,
+    ] {
+        *root = root
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(path) = root {
+            let p = Path::new(path);
+            if !p.is_absolute()
+                || p.components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(AppError::Invalid(
+                    "存储目录必须是无上级跳转的绝对路径".into(),
+                ));
+            }
+        }
+    }
+    for mirror in &mut value.registry_mirrors {
+        *mirror = crate::validation::normalize_host(mirror)?;
+    }
+    let mut seen = std::collections::HashSet::new();
+    value.registry_mirrors.retain(|m| seen.insert(m.clone()));
+    if let Some(p) = &mut value.proxy {
+        p.host = p.host.trim().to_string();
+        if p.enabled
+            && (p.port == 0
+                || p.host.is_empty()
+                || !["http", "socks5"].contains(&p.scheme.as_str()))
+        {
+            return Err(AppError::Invalid("代理配置无效".into()));
+        }
+    }
+    Ok(value)
+}
+pub fn save_settings_locked(app: &AppHandle, settings: &AppSettings) -> AppResult<()> {
+    let mut persisted = normalize_settings(settings)?;
     let path = settings_path(app)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     // 校验覆盖路径可创建（提前暴露权限/盘符问题）
     for p in [
-        &settings.projects_root,
-        &settings.image_cache_root,
-        &settings.docker_pkg_root,
-        &settings.artifact_root,
-        &settings.log_root,
+        &persisted.projects_root,
+        &persisted.image_cache_root,
+        &persisted.docker_pkg_root,
+        &persisted.artifact_root,
+        &persisted.log_root,
     ]
     .into_iter()
     .flatten()
@@ -195,18 +242,7 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> AppResult<()> {
         }
     }
     let _lock = data_lock(app)?;
-    let mut persisted = settings.clone();
-    for m in &mut persisted.registry_mirrors {
-        *m = crate::validation::normalize_host(m)?;
-    }
     if let Some(p) = &mut persisted.proxy {
-        if p.enabled
-            && (p.port == 0
-                || p.host.is_empty()
-                || !["http", "socks5"].contains(&p.scheme.as_str()))
-        {
-            return Err(AppError::Invalid("代理配置无效".into()));
-        }
         if let Some(pw) = &mut p.password {
             *pw = crate::credentials::protect(pw)?;
         }

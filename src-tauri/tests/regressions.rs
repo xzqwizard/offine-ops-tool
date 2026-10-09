@@ -401,6 +401,81 @@ fn native_control_metadata_and_truncated_packages_are_checked() {
 }
 
 #[test]
+fn storage_copy_keeps_original_and_refuses_conflicts_or_recursive_destination() {
+    let t = temp();
+    let src = t.0.join("source");
+    let dst = t.0.join("target");
+    fs::create_dir_all(src.join("projects")).unwrap();
+    fs::write(src.join("projects/project.json"), "original").unwrap();
+    fs::write(src.join(".data.lock"), "lock").unwrap();
+    offline_preops_tool_lib::storage_migration::copy_root(&src, &dst).unwrap();
+    assert_eq!(
+        fs::read_to_string(src.join("projects/project.json")).unwrap(),
+        "original"
+    );
+    assert_eq!(
+        fs::read_to_string(dst.join("projects/project.json")).unwrap(),
+        "original"
+    );
+    assert!(!dst.join(".data.lock").exists());
+    assert!(
+        offline_preops_tool_lib::storage_migration::copy_root(&src, &src.join("nested")).is_err()
+    );
+    fs::write(dst.join("projects/project.json"), "other").unwrap();
+    assert!(offline_preops_tool_lib::storage_migration::copy_root(&src, &dst).is_err());
+    assert_eq!(
+        fs::read_to_string(dst.join("projects/project.json")).unwrap(),
+        "other"
+    );
+}
+
+#[test]
+fn nested_storage_moves_copy_once_and_failed_switch_removes_only_new_copies() {
+    use offline_preops_tool_lib::storage_migration::copy_roots;
+    let t = temp();
+    let src = t.0.join("cache");
+    let dst = t.0.join("new-cache");
+    fs::create_dir_all(src.join("docker-pkgs")).unwrap();
+    fs::write(src.join("image.tar"), "image").unwrap();
+    fs::write(src.join("docker-pkgs/meta.json"), "package").unwrap();
+    let paths = [
+        (src.clone(), dst.clone()),
+        (src.join("docker-pkgs"), dst.join("docker-pkgs")),
+    ];
+    let mut count = 0;
+    copy_roots(&paths, |_, _, _| count += 1, || Ok(())).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(
+        fs::read(dst.join("docker-pkgs/meta.json")).unwrap(),
+        b"package"
+    );
+    let split = t.0.join("split-cache");
+    let pkgs = t.0.join("split-pkgs");
+    copy_roots(
+        &[
+            (src.clone(), split.clone()),
+            (src.join("docker-pkgs"), pkgs.clone()),
+        ],
+        |_, _, _| {},
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(!split.join("docker-pkgs").exists());
+    assert_eq!(fs::read(pkgs.join("meta.json")).unwrap(), b"package");
+    let failed = t.0.join("failed");
+    assert!(copy_roots(
+        &[(src.clone(), failed.clone())],
+        |_, _, _| {},
+        || Err(std::io::Error::other("settings fail").into())
+    )
+    .is_err());
+    assert!(!failed.exists());
+    assert_eq!(fs::read(src.join("image.tar")).unwrap(), b"image");
+    copy_roots(&[(src, failed.clone())], |_, _, _| {}, || Ok(())).unwrap();
+    assert!(failed.join("image.tar").exists());
+}
+
+#[test]
 fn conflicting_material_basenames_cannot_overwrite_each_other() {
     let t = temp();
     for (group, sha) in [("a", "first"), ("b", "second")] {

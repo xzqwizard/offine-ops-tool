@@ -17,6 +17,7 @@ pub mod io_util;
 pub mod models;
 mod net;
 pub mod render_context;
+pub mod storage_migration;
 pub mod store;
 pub mod tasks;
 pub mod validation;
@@ -49,6 +50,7 @@ pub fn run() {
             net::test_network,
             net::network_targets,
             tasks::cancel_task,
+            storage_migration::migrate_storage,
             engine::engine_status,
             engine::engine_install,
             images::inspect_image,
