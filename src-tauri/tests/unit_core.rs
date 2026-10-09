@@ -7,6 +7,7 @@
 
 use offline_preops_tool_lib::builder::{image_tag_of, render, sanitize, template_env, TEMPLATES};
 use offline_preops_tool_lib::docker_versions::{parse_docker_versions, version_key};
+mod support;
 
 /// 样例上下文：覆盖模板引用的全部变量，防止模板变量缺失/语法错误逃逸
 fn sample_ctx() -> serde_json::Value {
@@ -118,14 +119,7 @@ fn every_script_is_valid_bash_and_upgrade_is_registered() {
     let env = template_env().unwrap();
     let ctx = sample_ctx();
     assert!(TEMPLATES.iter().any(|(n, _)| *n == "scripts/upgrade.sh.j2"));
-    let bash = if cfg!(windows) {
-        "D:/Environment/Git/usr/bin/bash.exe"
-    } else {
-        "/bin/bash"
-    };
-    if !std::path::Path::new(bash).is_file() {
-        return;
-    }
+    let bash = support::bash();
     let dir = std::env::temp_dir().join(format!("preops-syntax-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let _cleanup = offline_preops_tool_lib::io_util::Cleanup(dir.clone());
@@ -134,7 +128,7 @@ fn every_script_is_valid_bash_and_upgrade_is_registered() {
         let script = render(&env, name, &ctx).unwrap();
         assert!(!script.contains('\r'), "{name} contains CRLF line endings");
         std::fs::write(&file, script).unwrap();
-        let out = std::process::Command::new(bash)
+        let out = std::process::Command::new(&bash)
             .arg("-n")
             .arg(file)
             .output()

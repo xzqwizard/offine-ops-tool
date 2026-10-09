@@ -38,13 +38,7 @@ pub fn server_context(
                 .collect::<Vec<_>>()
                 .join(",");
             let data_volume = tpl
-                .and_then(|t| {
-                    if t.data_volume.is_empty() {
-                        None
-                    } else {
-                        Some(t.data_volume.clone())
-                    }
-                })
+                .map(|t| t.data_volume.clone())
                 .unwrap_or_else(|| "/data".into());
             let data_user = tpl.and_then(|t| t.data_user.clone());
             let command = tpl.map(|t| t.command.clone()).unwrap_or_default();
@@ -86,8 +80,13 @@ pub fn server_context(
                 })
                 .unwrap_or_default();
             json!({
+                "instance_id": inst.id,
                 "instance_name": inst.instance_name,
-                "image": crate::images::load_reference(&inst.image).unwrap_or_else(|_|inst.image.clone()),
+                "template_id": inst.template_id,
+                "data_dir": inst.id,
+                "storage_compatibility": storage_compatibility(inst),
+                "image": crate::images::locked_reference(&inst.image, &inst.digest)
+                    .and_then(|r| crate::images::load_reference(&r)).unwrap_or_else(|_|inst.image.clone()),
                 "env": env_pairs,
                 "ports": inst.ports.iter().map(|p| json!({
                     "host": p.host, "container": p.container,
@@ -232,6 +231,45 @@ pub fn server_context(
         "kernel_reqs": kernel_reqs,
         "kernel_reqs_raw": kernel_reqs_raw,
     })
+}
+
+pub fn storage_compatibility(inst: &MiddlewareInstance) -> String {
+    let stateful = [
+        "mysql-",
+        "postgresql-",
+        "mongodb-",
+        "redis-",
+        "elasticsearch-",
+        "rabbitmq-",
+        "kafka-",
+    ]
+    .iter()
+    .any(|prefix| inst.template_id.starts_with(prefix));
+    if stateful {
+        let major = crate::images::parse_reference(&inst.image)
+            .ok()
+            .and_then(|r| r.tag.split('.').next().map(str::to_string))
+            .unwrap_or_default();
+        format!("{}:{major}", inst.template_id)
+    } else {
+        inst.template_id.clone()
+    }
+}
+
+pub fn instance_contracts(ctx: &serde_json::Value) -> Vec<serde_json::Value> {
+    ctx["instances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|i| {
+            json!({
+                "instanceId": i["instance_id"], "instanceName": i["instance_name"],
+                "serverId": ctx["server_id"], "templateId": i["template_id"],
+                "dataDir": i["data_dir"], "dataVolume": i["data_volume"],
+                "storageCompatibility": i["storage_compatibility"], "runtimeReference": i["image"]
+            })
+        })
+        .collect()
 }
 
 fn uname_of(arch: &str) -> &'static str {

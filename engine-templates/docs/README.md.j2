@@ -30,7 +30,9 @@ sudo bash scripts/deploy.sh
 sudo bash scripts/ops.sh status
 ```
 
-`deploy.sh` 会安装或核对 Docker 和 Compose，预检 CPU/内存/磁盘/端口，导入镜像，启动并检查服务。失败时没有成功标记；同一构建可重跑。已有其他构建号时请使用升级包。导入的镜像 tar、Compose 文件和密码包含敏感内容，请保护整个部署目录；Compose 会被设为仅属主可读写。
+`deploy.sh` 先核对 CPU、OS/版本、工具、内存、磁盘和内核条件，通过后安装或核对 Docker 和 Compose，再检查实际 Docker 服务端版本、数据根及端口，导入镜像，启动并检查服务。失败时没有成功标记；同一构建可重跑。已有其他构建号时请使用升级包。导入的镜像 tar、Compose 文件和密码包含敏感内容，请保护整个部署目录；Compose 会被设为仅属主可读写。
 {% endif %}
+
+镜像使用 `offline.local/image:<config SHA256>` 运行引用，与 manifest 的原始来源引用分开记录，避免不同包覆盖同名 tag。持久化数据按稳定实例 ID 放在 `stack/data/<实例ID>/`；仅改服务名不会改数据目录。旧版按服务名存储的部署、跨服务器移动、挂载目标或有状态镜像主版本变化，需要停写冷备和显式数据迁移，不能直接套用增量包。
 
 运维命令、备份路径和恢复步骤见 `docs/OPS-GUIDE.md`，端口与来源规则见 `docs/PORT-MATRIX.md`。U 盘摆渡应使用支持超过 4 GB 单文件的格式，并复核外层交付校验和。

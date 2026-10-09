@@ -4,7 +4,7 @@
 
 | 服务 | 镜像 | 发布端口 | 数据目录 |
 |---|---|---|---|
-{% for inst in instances %}| `{{ inst.instance_name }}` | `{{ inst.image }}` | {{ inst.ports_csv }} | `stack/data/{{ inst.instance_name }}/` |
+{% for inst in instances %}| `{{ inst.instance_name }}` | `{{ inst.image }}` | {{ inst.ports_csv }} | {% if inst.data_volume %}`stack/data/{{ inst.data_dir | default(inst.instance_name) }}/`{% else %}无绑定数据卷{% endif %} |
 {% endfor %}
 
 ## 巡检与操作
@@ -28,7 +28,7 @@ sudo bash scripts/ops.sh restore /备份目录 --yes
 sudo bash scripts/ops.sh prune-backups 7
 ```
 
-备份根目录：`{{ server.deploy_base_dir }}/backups/{{ project_id }}/{{ server_id }}/`。每份含冷停机后的数据/编排/脚本、镜像 tar、镜像标签映射、身份和 SHA256 校验。备份会暂停本方案服务；备份成功才标记 `COMPLETE`，失败不会当作可恢复版本。只能删减已完成备份；保留数量由 `prune-backups` 参数指定。
+备份根目录：`{{ server.deploy_base_dir }}/backups/{{ project_id }}/{{ server_id }}/`。每份含冷停机后的绑定目录/编排/脚本、实际运行容器镜像的 tar、`image-map.tsv`、`service-images.tsv`、身份和 SHA256 校验。镜像按容器 `.Image` 保存，恢复后核对各服务的实际镜像 ID。备份会暂停本方案服务；备份成功才标记 `COMPLETE`，失败不会当作可恢复版本。只能删减已完成备份；保留数量由 `prune-backups` 参数指定。无绑定数据卷实例的容器可写层及镜像匿名卷不在此备份中，需配置持久化目录或另做业务备份。
 
 恢复先校验完整性、身份和归档路径，再加载镜像、停服务、切换数据与配置、启动并检查健康。失败会尝试恢复原配置、镜像标签和服务；若回退本身失败，退出码为 2，控制台会指出保留的恢复前目录。恢复成功仍保留恢复前数据于 `.before-restore.*`，核对无误后由管理员清理。恢复会覆盖备份后写入的数据，因此先确认业务停写和恢复点。不要把运行中的数据库目录直接复制为备份。
 
@@ -38,6 +38,6 @@ sudo bash scripts/ops.sh prune-backups 7
 
 ## 防火墙与错误处理
 
-本机来源白名单需单独执行 `sudo bash scripts/apply-firewall.sh --apply`；只支持 Docker IPv4 iptables `DOCKER-USER` 后端。部署和恢复脚本不会暗中首次开启防火墙。持久化后升级与恢复会重新应用相应版本的规则。拒绝来源的已建立连接可能持续到连接关闭；现场应测试允许与拒绝来源。
+本机来源白名单需单独执行 `sudo bash scripts/apply-firewall.sh --apply`；需要 Docker IPv4 iptables `DOCKER-USER` 接入 FORWARD，兼容 iptables 的 nft 后端，原生 Docker nftables 后端会被拒绝。规则同时覆盖 Docker 转发和 docker-proxy 的宿主 INPUT 路径，仅限制清单中本机配置 IPv4 地址的发布端口，保留宿主本地访问。部署和恢复脚本不会暗中首次开启防火墙。持久化后升级与恢复会重新应用相应版本的规则；`--apply --no-persist` 只应用当前规则。拒绝来源的已建立连接可能持续到连接关闭；现场应分别测试允许与拒绝来源、TCP/UDP及 Docker 重启后规则。其它主机 IP、IPv6和容器直连地址需单独配置访问策略。
 
 脚本普通失败退出非零；收到 INT/TERM 分别返回 130/143，自动回退失败返回 2。查看命令错误及 `logs/operations.log`；不要把失败返回当作服务已恢复的证明，应运行 `ops.sh status` 并验证实际业务数据。`docker compose config -q` 只验证编排，不验证数据库行为。

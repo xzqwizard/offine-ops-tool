@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter};
 #[serde(rename_all = "camelCase")]
 pub struct BuildImageInfo {
     pub reference: String,
+    pub runtime_reference: String,
     pub file: String,
     pub sha256: Option<String>,
     pub size_bytes: u64,
@@ -40,6 +41,7 @@ pub struct BuildServerResult {
     pub package_file: Option<String>,
     pub size_bytes: u64,
     pub images: Vec<BuildImageInfo>,
+    pub instances: Vec<serde_json::Value>,
     pub warnings: Vec<String>,
 }
 
@@ -169,6 +171,7 @@ fn sha256_file(path: &Path) -> AppResult<String> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 1024 * 1024];
     loop {
+        crate::tasks::check()?;
         let n = f.read(&mut buf)?;
         if n == 0 {
             break;
@@ -238,6 +241,7 @@ pub async fn build_offline_package(
     task_id: Option<String>,
 ) -> AppResult<BuildResult> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _task = crate::tasks::Session::begin(task_id.clone())?;
         EVENT_SCOPE.with(|v| {
             *v.borrow_mut() = Some((
                 project.id.clone(),
@@ -311,6 +315,7 @@ pub fn build_inner(
     auto_pull: bool,
     upgrade: Option<(&serde_json::Value, &str)>,
 ) -> AppResult<BuildResult> {
+    crate::tasks::check()?;
     let _storage_lock = store::storage_lock(app)?;
     let mut project_frozen = catalog::freeze(app, project)?;
     project_frozen.registry = project.registry.clone();
@@ -321,7 +326,7 @@ pub fn build_inner(
         true,
     )?;
     if let Some((b, _)) = upgrade {
-        validate_baseline(b, project)?;
+        validate_baseline(b, &project_frozen)?;
     }
     let storage = store::effective_storage(app)?;
     let project_root = PathBuf::from(storage.artifact_root).join(format!(
@@ -366,6 +371,7 @@ pub fn build_inner(
                 index["servers"][n]["packageFile"] = json!(s.package_file);
             }
             crate::io_util::atomic_write(&path, serde_json::to_string_pretty(&index)?.as_bytes())?;
+            crate::tasks::check()?;
             fs::rename(&staging, &final_dir)?;
             crate::app_ops::__audit(app, "build_complete", &format!("{} {build_id}", project.id));
             Ok(r)
@@ -429,6 +435,7 @@ fn build_staged(
     crate::validation::require(project, &catalog, true)?;
 
     for server in &project.servers {
+        crate::tasks::check()?;
         emit(
             app,
             "server",
@@ -538,9 +545,9 @@ fn build_staged(
     // ---- 构建索引（机器可读：升级包对比基线 / 构建历史列表） ----
     // 升级包只含变更镜像，但 manifest 合并基线镜像集（含未变更项），
     // 保证该构建可作为下一轮增量对比的基线
-    let servers_index:Vec<serde_json::Value>=result.servers.iter().map(|s|json!({"serverId":s.server_id,"name":s.name,"arch":s.arch,"osFamily":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.os_family),"osVersion":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.os_version),"dockerVersion":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.docker_version),"dockerDataRoot":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.docker_data_root),"deployBaseDir":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.deploy_base_dir),"ip":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.ip),"dirName":s.dir_name,"packageFile":s.package_file,"sizeBytes":s.size_bytes,"images":s.images,"changedImageCount":s.images.iter().filter(|i|i.packed).count()})).collect();
+    let servers_index:Vec<serde_json::Value>=result.servers.iter().map(|s|json!({"serverId":s.server_id,"name":s.name,"arch":s.arch,"osFamily":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.os_family),"osVersion":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.os_version),"dockerVersion":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.docker_version),"dockerDataRoot":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.docker_data_root),"deployBaseDir":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.deploy_base_dir),"ip":project.servers.iter().find(|o|o.id==s.server_id).map(|o|&o.ip),"dirName":s.dir_name,"packageFile":s.package_file,"sizeBytes":s.size_bytes,"images":s.images,"instances":s.instances,"changedImageCount":s.images.iter().filter(|i|i.packed).count()})).collect();
     let index = json!({
-        "schemaVersion":2,"status":"complete",
+        "schemaVersion":2,"storageSchemaVersion":1,"status":"complete",
         "buildId": result.build_id,
         "projectId": project.id,
         "projectName": project.name,
@@ -785,7 +792,10 @@ fn build_server(
     let warnings = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut pulled = std::collections::HashSet::new();
+    let mut runtime_refs = std::collections::HashMap::new();
     for inst in &instances {
+        crate::tasks::check()?;
+        let stage_started = std::time::Instant::now();
         let locked_ref = crate::images::locked_reference(&inst.image, &inst.digest)?;
         let cache = crate::images::cache_file_for_registry(
             app,
@@ -828,6 +838,15 @@ fn build_server(
             locked_ref.as_str()
         };
         let verified = crate::image_archive::verify(&src, verify_ref, "linux", &server.arch)?;
+        emit(
+            app,
+            "timing",
+            &format!(
+                "{} 材料准备和内容校验 {} ms",
+                inst.instance_name,
+                stage_started.elapsed().as_millis()
+            ),
+        );
         let digest = if local {
             if !inst.digest.is_empty()
                 || crate::images::parse_reference(&inst.image)?
@@ -857,6 +876,8 @@ fn build_server(
                 .ok_or_else(|| AppError::Invalid("缓存缺少实际 digest".into()))?
                 .to_string()
         };
+        let runtime_reference = crate::images::delivery_reference(&verified.config_digest)?;
+        runtime_refs.insert(inst.id.clone(), runtime_reference.clone());
         if !seen.insert((inst.image.clone(), verified.sha256.clone())) {
             continue;
         }
@@ -867,22 +888,27 @@ fn build_server(
             crate::io_util::hash(&format!("{}/{}", inst.image, verified.sha256))
         );
         if packed {
+            let rewrite_started = std::time::Instant::now();
             crate::io_util::require_space(
                 &sdir,
                 verified.size.saturating_mul(2) + 128 * 1024 * 1024,
             )?;
             let dst = sdir.join(&file);
-            // Rewrite locked digest references to a valid local tag. Compose uses the same tag.
-            if !local && locked_ref != inst.image {
-                crate::images::rewrite_archive(
-                    &src,
-                    &dst,
-                    &crate::images::load_reference(&inst.image)?,
-                )?;
-            } else {
-                copy_file_with_progress(app, &src, &dst, &inst.instance_name)?;
+            crate::images::rewrite_archive(&src, &dst, &runtime_reference)?;
+            let delivered =
+                crate::image_archive::verify(&dst, &runtime_reference, "linux", &server.arch)?;
+            if delivered.config_digest != verified.config_digest {
+                return Err(AppError::Invalid("镜像在构建期间发生变化".into()));
             }
-            crate::image_archive::verify(&dst, &inst.image, "linux", &server.arch)?;
+            emit(
+                app,
+                "timing",
+                &format!(
+                    "{} 归档改写和交付校验 {} ms",
+                    inst.instance_name,
+                    rewrite_started.elapsed().as_millis()
+                ),
+            );
         }
         let delivered_sha = if packed {
             crate::io_util::sha256_file(&sdir.join(&file))?
@@ -891,6 +917,7 @@ fn build_server(
         };
         images_info.push(BuildImageInfo {
             reference: inst.image.clone(),
+            runtime_reference,
             file,
             sha256: packed.then_some(delivered_sha),
             size_bytes: verified.size,
@@ -957,6 +984,12 @@ fn build_server(
 
     // ---- 渲染并写文件 ----
     let mut ctx = base_ctx.clone();
+    for inst in ctx["instances"].as_array_mut().into_iter().flatten() {
+        let id = inst["instance_id"].as_str().unwrap_or_default();
+        inst["image"] = json!(runtime_refs
+            .get(id)
+            .ok_or_else(|| AppError::Invalid("缺少实例运行镜像".into()))?);
+    }
     ctx["images"] = json!(images_info
         .iter()
         .filter(|i| i.packed)
@@ -1023,7 +1056,7 @@ fn build_server(
 
     // ---- manifest.json ----
     let manifest = json!({
-        "schemaVersion":2,"projectId":project.id,"serverId":server.id,"baselineBuildId":baseline_build_id,
+        "schemaVersion":2,"storageSchemaVersion":1,"projectId":project.id,"serverId":server.id,"baselineBuildId":baseline_build_id,
         "buildId": build_id,
         "project": { "name": project.name, "customer": project.customer },
         "server": {
@@ -1032,10 +1065,7 @@ fn build_server(
             "dockerVersion": server.docker_version,
         },
         "images": images_info,
-        "instances": instances.iter().map(|i| json!({
-            "name": i.instance_name, "image": i.image,
-            "ports": i.ports.iter().map(|p| format!("{}:{}/{}", p.host, p.container,p.protocol)).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
+        "instances": crate::render_context::instance_contracts(&ctx),
         "generatedAt": now,
     });
     fs::write(
@@ -1065,10 +1095,12 @@ fn build_server(
         package_file: None,
         size_bytes: 0,
         images: images_info,
+        instances: crate::render_context::instance_contracts(&ctx),
         warnings,
     };
 
     if project.build_config.package_format != "dir" {
+        let package_started = std::time::Instant::now();
         let pkg_path = out_root.join(format!("{dir_name}.tar.gz"));
         emit(app, "package", &format!("打包: {}", pkg_path.display()));
         crate::io_util::require_space(out_root, dir_size(&sdir).saturating_add(128 * 1024 * 1024))?;
@@ -1079,16 +1111,26 @@ fn build_server(
             Compression::fast() // Docker save 层并不保证已压缩，快速 gzip 控制交付体积
         };
         let gz = GzEncoder::new(file, level);
-        let mut tar = tar::Builder::new(gz);
+        let mut tar = tar::Builder::new(crate::io_util::CheckedWriter(gz));
         tar.append_dir_all(&dir_name, &sdir)
             .map_err(|e| AppError::Io(format!("tar 打包失败: {e}")))?;
         tar.into_inner()
             .map_err(|e| AppError::Io(format!("tar 收尾失败: {e}")))?
+            .0
             .finish()
             .map_err(|e| AppError::Io(format!("gzip 收尾失败: {e}")))?;
         sr.package_file = Some(pkg_path.to_string_lossy().into_owned());
         sr.size_bytes = pkg_path.metadata().map(|m| m.len()).unwrap_or(0);
         fs::remove_dir_all(&sdir)?;
+        emit(
+            app,
+            "timing",
+            &format!(
+                "{} 打包 {} ms",
+                server.name,
+                package_started.elapsed().as_millis()
+            ),
+        );
     } else {
         sr.size_bytes = dir_size(&sdir);
     }
@@ -1103,6 +1145,7 @@ fn copy_file_with_progress(app: &AppHandle, src: &Path, dst: &Path, label: &str)
     let mut copied = 0u64;
     let total = src.metadata().map(|m| m.len()).unwrap_or(0);
     loop {
+        crate::tasks::check()?;
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;

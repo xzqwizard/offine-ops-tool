@@ -148,6 +148,14 @@ fn image_archive_checks_tag_platform_layers_and_actual_file_sha() {
     let file = t.0.join("image.tar");
     archive(&file, "amd64", "demo:v1", true);
     let valid = image_archive::verify(&file, "demo:v1", "linux", "amd64").unwrap();
+    image_archive::verify(&file, "docker.io/library/demo:v1", "linux", "amd64").unwrap();
+    assert!(image_archive::verify(
+        &file,
+        "registry.example.org/library/demo:v1",
+        "linux",
+        "amd64"
+    )
+    .is_err());
     assert_eq!(valid.sha256, io_util::sha256_file(&file).unwrap());
     assert!(image_archive::verify(&file, "demo:v2", "linux", "amd64").is_err());
     assert!(image_archive::verify(&file, "demo:v1", "linux", "arm64").is_err());
@@ -162,7 +170,7 @@ fn image_archive_checks_tag_platform_layers_and_actual_file_sha() {
 #[test]
 fn baseline_uses_stable_server_identity_platform_and_current_content() {
     let p = project();
-    let b = json!({"schemaVersion":2,"status":"complete","projectId":p.id,"servers":[{"serverId":"srv-test","arch":"amd64","name":"old-name","osFamily":p.servers[0].os_family,"osVersion":p.servers[0].os_version,"dockerVersion":p.servers[0].docker_version,"dockerDataRoot":p.servers[0].docker_data_root,"deployBaseDir":p.servers[0].deploy_base_dir,"ip":p.servers[0].ip,"images":[{"reference":"demo:v1","contentSha256":"content-a"}]}]});
+    let b = json!({"schemaVersion":2,"storageSchemaVersion":1,"status":"complete","projectId":p.id,"servers":[{"serverId":"srv-test","arch":"amd64","name":"old-name","osFamily":p.servers[0].os_family,"osVersion":p.servers[0].os_version,"dockerVersion":p.servers[0].docker_version,"dockerDataRoot":p.servers[0].docker_data_root,"deployBaseDir":p.servers[0].deploy_base_dir,"ip":p.servers[0].ip,"instances":[{"instanceId":"inst-test","serverId":"srv-test","dataDir":"inst-test","dataVolume":"/data","storageCompatibility":"custom","runtimeReference":"offline.local/image:test"}],"images":[{"reference":"demo:v1","contentSha256":"content-a"}]}]});
     builder::validate_baseline(&b, &p).unwrap();
     let set = builder::baseline_image_set(&b, "srv-test", "amd64");
     assert!(set.contains("demo:v1@content-a"));
@@ -324,6 +332,85 @@ fn native_package_selection_requires_exact_os_roles_versions_and_hashes() {
     assert!(docker_pkgs::pick_pkg_dirs_at(&root, "amd64", "27.5.1", "ubuntu", "24.04").is_err());
 }
 
+fn deb_fixture(package: &str, version: &str, arch: &str) -> Vec<u8> {
+    let gzip_tar = |name: &str, data: &[u8]| {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        let mut head = tar::Header::new_gnu();
+        head.set_size(data.len() as u64);
+        head.set_mode(0o644);
+        head.set_cksum();
+        tar.append_data(&mut head, name, data).unwrap();
+        tar.into_inner().unwrap().finish().unwrap()
+    };
+    let control = format!(
+        "Package: {package}\nVersion: {version}\nArchitecture: {arch}\nDescription: test fixture\n"
+    );
+    let mut result = b"!<arch>\n".to_vec();
+    for (name, body) in [
+        ("debian-binary", b"2.0\n".to_vec()),
+        ("control.tar.gz", gzip_tar("./control", control.as_bytes())),
+        (
+            "data.tar.gz",
+            gzip_tar("./usr/share/test", b"fixture payload"),
+        ),
+    ] {
+        result.extend(
+            format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                format!("{name}/"),
+                0,
+                0,
+                0,
+                "100644",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        result.extend(&body);
+        if body.len() % 2 != 0 {
+            result.push(b'\n');
+        }
+    }
+    result
+}
+
+#[test]
+fn native_control_metadata_and_truncated_packages_are_checked() {
+    let t = temp();
+    let pkg = t.0.join("native.deb");
+    let good = deb_fixture("docker-ce", "27.5.1-1", "amd64");
+    fs::write(&pkg, &good).unwrap();
+    let info = docker_pkgs::verify_native(&pkg, "deb").unwrap();
+    assert_eq!(
+        (
+            info.name.as_str(),
+            info.version.as_str(),
+            info.arch.as_str()
+        ),
+        ("docker-ce", "27.5.1-1", "amd64")
+    );
+    fs::write(&pkg, &good[..good.len() - 5]).unwrap();
+    assert!(docker_pkgs::verify_native(&pkg, "deb").is_err());
+    fs::write(&pkg, b"!<arch>\n").unwrap();
+    assert!(docker_pkgs::verify_native(&pkg, "deb").is_err());
+    let mut overflow = good;
+    overflow[56..66].copy_from_slice(b"9999999999");
+    fs::write(&pkg, overflow).unwrap();
+    assert!(docker_pkgs::verify_native(&pkg, "deb").is_err());
+}
+
+#[test]
+fn conflicting_material_basenames_cannot_overwrite_each_other() {
+    let t = temp();
+    for (group, sha) in [("a", "first"), ("b", "second")] {
+        let dir = t.0.join(group);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("meta.json"), serde_json::to_vec(&json!({"arch":"amd64","kind":"deb","dockerVersion":"27.5.1","files":["same.deb"],"sha256":{"same.deb":sha}})).unwrap()).unwrap();
+    }
+    assert!(docker_pkgs::package_inventory(&[t.0.join("a"), t.0.join("b")]).is_err());
+}
+
 #[test]
 fn dependency_cycle_duplicate_hostname_and_server_removal_are_rejected() {
     let mut cat = catalog::preset().unwrap();
@@ -440,83 +527,77 @@ fn literal_credential_prefix_and_nonsecret_text_round_trip_with_legacy_compatibi
     assert_eq!(p.instances[0].params["APP_SECRET"], json!("legacy secret"));
 }
 
-fn deb_fixture(package: &str, version: &str, arch: &str) -> Vec<u8> {
-    let gzip_tar = |name: &str, data: &[u8]| {
-        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        let mut tar = tar::Builder::new(encoder);
-        let mut head = tar::Header::new_gnu();
-        head.set_size(data.len() as u64);
-        head.set_mode(0o644);
-        head.set_cksum();
-        tar.append_data(&mut head, name, data).unwrap();
-        tar.into_inner().unwrap().finish().unwrap()
-    };
-    let control = format!(
-        "Package: {package}\nVersion: {version}\nArchitecture: {arch}\nDescription: test fixture\n"
-    );
-    let mut result = b"!<arch>\n".to_vec();
-    for (name, body) in [
-        ("debian-binary", b"2.0\n".to_vec()),
-        ("control.tar.gz", gzip_tar("./control", control.as_bytes())),
-        (
-            "data.tar.gz",
-            gzip_tar("./usr/share/test", b"fixture payload"),
-        ),
-    ] {
-        result.extend(
-            format!(
-                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
-                format!("{name}/"),
-                0,
-                0,
-                0,
-                "100644",
-                body.len()
-            )
-            .as_bytes(),
-        );
-        result.extend(&body);
-        if body.len() % 2 != 0 {
-            result.push(b'\n');
-        }
-    }
-    result
-}
-
 #[test]
-fn native_control_metadata_and_truncated_packages_are_checked() {
+fn runtime_image_and_storage_identity_are_immutable_and_baseline_enforces_contracts() {
     let t = temp();
-    let pkg = t.0.join("native.deb");
-    let good = deb_fixture("docker-ce", "27.5.1-1", "amd64");
-    fs::write(&pkg, &good).unwrap();
-    let info = docker_pkgs::verify_native(&pkg, "deb").unwrap();
+    let a = t.0.join("a.tar");
+    let b = t.0.join("b.tar");
+    archive(&a, "amd64", "demo:v1", true);
+    archive(&b, "x86_64", "demo:v1", true);
+    let a_id = images::delivery_reference(
+        &image_archive::verify(&a, "demo:v1", "linux", "amd64")
+            .unwrap()
+            .config_digest,
+    )
+    .unwrap();
+    let b_id = images::delivery_reference(
+        &image_archive::verify(&b, "demo:v1", "linux", "amd64")
+            .unwrap()
+            .config_digest,
+    )
+    .unwrap();
+    assert_ne!(a_id, b_id);
+    let rewritten = t.0.join("rewritten.tar");
+    images::rewrite_archive(&a, &rewritten, &a_id).unwrap();
+    let actual = image_archive::verify(&rewritten, &a_id, "linux", "amd64").unwrap();
     assert_eq!(
-        (
-            info.name.as_str(),
-            info.version.as_str(),
-            info.arch.as_str()
-        ),
-        ("docker-ce", "27.5.1-1", "amd64")
+        images::delivery_reference(&actual.config_digest).unwrap(),
+        a_id
     );
-    fs::write(&pkg, &good[..good.len() - 5]).unwrap();
-    assert!(docker_pkgs::verify_native(&pkg, "deb").is_err());
-    fs::write(&pkg, b"!<arch>\n").unwrap();
-    assert!(docker_pkgs::verify_native(&pkg, "deb").is_err());
-    let mut overflow = good;
-    overflow[56..66].copy_from_slice(b"9999999999");
-    fs::write(&pkg, overflow).unwrap();
-    assert!(docker_pkgs::verify_native(&pkg, "deb").is_err());
-}
-
-#[test]
-fn conflicting_material_basenames_cannot_overwrite_each_other() {
-    let t = temp();
-    for (group, sha) in [("a", "first"), ("b", "second")] {
-        let dir = t.0.join(group);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("meta.json"), serde_json::to_vec(&json!({"arch":"amd64","kind":"deb","dockerVersion":"27.5.1","files":["same.deb"],"sha256":{"same.deb":sha}})).unwrap()).unwrap();
-    }
-    assert!(docker_pkgs::package_inventory(&[t.0.join("a"), t.0.join("b")]).is_err());
+    let mut p = project();
+    let context = offline_preops_tool_lib::render_context::server_context(
+        &p,
+        &p.servers[0],
+        &catalog::preset().unwrap(),
+        "build",
+        "now",
+        "srv",
+        None,
+    );
+    let contracts = offline_preops_tool_lib::render_context::instance_contracts(&context);
+    let s = &p.servers[0];
+    let baseline = json!({"schemaVersion":2,"storageSchemaVersion":1,"status":"complete","projectId":p.id,
+        "servers":[{"serverId":s.id,"arch":s.arch,"osFamily":s.os_family,"osVersion":s.os_version,"dockerVersion":s.docker_version,"dockerDataRoot":s.docker_data_root,"deployBaseDir":s.deploy_base_dir,"ip":s.ip,"instances":contracts}]});
+    p.instances[0].instance_name = "renamed".into();
+    builder::validate_baseline(&baseline, &p).unwrap();
+    let context = offline_preops_tool_lib::render_context::server_context(
+        &p,
+        s,
+        &catalog::preset().unwrap(),
+        "build",
+        "now",
+        "srv",
+        None,
+    );
+    let compose = builder::render(
+        &builder::template_env().unwrap(),
+        "compose/docker-compose.yml.j2",
+        &context,
+    )
+    .unwrap();
+    assert!(compose.contains("./data/inst-test"));
+    p.instances[0].server_id = "srv-other".into();
+    assert!(builder::validate_baseline(&baseline, &p).is_err());
+    p.instances[0].server_id = "srv-test".into();
+    let mut changed = baseline.clone();
+    changed["servers"][0]["instances"][0]["dataVolume"] = json!("/old-volume");
+    assert!(builder::validate_baseline(&changed, &p).is_err());
+    changed = baseline;
+    changed
+        .as_object_mut()
+        .unwrap()
+        .remove("storageSchemaVersion");
+    assert!(builder::validate_baseline(&changed, &p).is_err());
 }
 
 fn valid_elf() -> Vec<u8> {
@@ -553,4 +634,37 @@ fn compose_requires_complete_elf_and_persisted_integrity_metadata() {
     damaged[127] = 42;
     fs::write(&file, damaged).unwrap();
     assert!(docker_pkgs::verify_compose_at(&t.0, "amd64").is_err());
+}
+
+#[test]
+fn verified_locked_cache_can_be_used_offline_but_never_accepts_tampering() {
+    let t = temp();
+    let file = t.0.join("cached.tar");
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let image = format!("demo@{digest}");
+    archive(
+        &file,
+        "amd64",
+        &images::load_reference(&image).unwrap(),
+        true,
+    );
+    let v = image_archive::verify(&file, &image, "linux", "amd64").unwrap();
+    let meta = json!({"version":2,"reference":image,"platform":"linux/amd64","digest":digest,"configDigest":v.config_digest,"sha256":v.sha256,"source":"registry.example.org/demo"});
+    fs::write(
+        file.with_extension("tar.meta.json"),
+        serde_json::to_vec(&meta).unwrap(),
+    )
+    .unwrap();
+    let cached = images::verified_cache(&file, &image, "linux", "amd64")
+        .unwrap()
+        .unwrap();
+    assert!(cached.cached);
+    assert_eq!(cached.digest, digest);
+    assert!(images::verified_cache(&file, &image, "linux", "arm64")
+        .unwrap()
+        .is_none());
+    fs::write(&file, b"corrupt").unwrap();
+    assert!(images::verified_cache(&file, &image, "linux", "amd64")
+        .unwrap()
+        .is_none());
 }

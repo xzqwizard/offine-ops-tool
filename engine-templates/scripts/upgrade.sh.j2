@@ -21,12 +21,13 @@ bash "$PKG_DIR/scripts/precheck.sh"
 if [ "$DRY" -eq 1 ]; then printf '演练通过：身份、基线、校验和及编排有效；未运行健康检查或修改服务\n'; exit 0; fi
 BASE_DIR="$TARGET"; STACK_DIR="$TARGET/stack"; LOG_DIR="$TARGET/logs"
 lock_ops
+[ "$(identity_value "$TARGET" BUILD_ID)" = "$BASELINE" ] || die '目标版本在等待运维锁期间变化，请重新选择基线'
 snapshot 0
 rollback_dir="$LAST_BACKUP"
 rollback_on_failure() {
   rc=$?; trap - EXIT INT TERM
   if [ "$rc" -ne 0 ]; then
-    audit "upgrade failed; rollback $rollback_dir"
+    audit "upgrade failed; rollback $rollback_dir" || printf '无法写入审计日志，继续恢复快照 %s\n' "$rollback_dir" >&2
     if ! restore_snapshot "$rollback_dir"; then printf '自动回滚失败，保留快照 %s；请人工恢复\n' "$rollback_dir" >&2; exit 2; fi
     if ! bash "$TARGET/scripts/ops.sh" status; then printf '回滚后健康检查失败\n' >&2; exit 2; fi
   fi

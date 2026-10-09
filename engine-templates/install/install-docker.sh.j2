@@ -16,12 +16,13 @@ ok()   { echo -e "    \033[32m✓ $1\033[0m"; }
 bad()  { echo -e "    \033[31m✗ $1\033[0m"; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || bad "需要 root 权限"
+bash "$HERE/../scripts/precheck.sh" --before-install
 
 # 已装 Docker：版本一致则跳过引擎安装（但继续处理 compose 插件）；
 # 版本不一致不覆盖，人工确认
 SKIP_ENGINE=0
 if command -v docker >/dev/null 2>&1; then
-  CUR=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')
+  CUR=$(docker version --format {% raw %}'{{.Server.Version}}'{% endraw %} 2>/dev/null) || bad "已有 Docker 客户端但引擎不可访问；请先检查服务，避免覆盖现有安装"
   if [ "$CUR" = "$TARGET_VER" ]; then
     ok "Docker $CUR 已安装且与目标版本一致，跳过引擎安装"
     SKIP_ENGINE=1
@@ -62,6 +63,8 @@ ExecStart=/usr/bin/dockerd
 Restart=always
 RestartSec=5
 LimitNOFILE=infinity
+Delegate=yes
+KillMode=process
 [Install]
 WantedBy=multi-user.target
 UNIT
@@ -91,6 +94,7 @@ JSON
   systemctl restart docker
   sleep 2
   docker info >/dev/null 2>&1 || bad "docker info 异常，请 journalctl -u docker 排查"
+  [ "$(docker version --format {% raw %}'{{.Server.Version}}'{% endraw %})" = "$TARGET_VER" ] || bad "安装后 Docker 引擎版本与目标不符"
   ok "Docker 安装完成: $(docker --version)"
 fi
 

@@ -180,13 +180,11 @@ fn registry_login(
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            let mut child = cmd.spawn()?;
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| AppError::Io("认证输入失败".into()))?
-                .write_all(reg.password.as_bytes())?;
-            let out = child.wait_with_output()?;
+            let out = crate::tasks::output(
+                &mut cmd,
+                std::time::Duration::from_secs(60),
+                Some(reg.password.as_bytes()),
+            )?;
             if !out.status.success() {
                 return Err(AppError::Invalid(format!("私有仓库 {host} 认证失败")));
             }
@@ -216,8 +214,15 @@ fn run_crane(app: &AppHandle, args: &[&str]) -> AppResult<std::process::Output> 
             cmd.env("DOCKER_CONFIG", dir);
         }
     });
-    cmd.output()
-        .map_err(|e| AppError::Io(format!("执行 crane 失败: {e}")))
+    crate::tasks::output(
+        &mut cmd,
+        std::time::Duration::from_secs(if args.first() == Some(&"pull") {
+            1800
+        } else {
+            60
+        }),
+        None,
+    )
 }
 
 #[derive(Deserialize)]
@@ -452,6 +457,16 @@ pub fn load_reference(image: &str) -> AppResult<String> {
         Ok(image.into())
     }
 }
+/// Docker's config digest is also the immutable image ID after docker load.
+pub fn delivery_reference(config_digest: &str) -> AppResult<String> {
+    if !valid_digest(config_digest) {
+        return Err(AppError::Invalid("镜像配置摘要无效".into()));
+    }
+    Ok(format!(
+        "offline.local/image:{}",
+        config_digest[7..].to_ascii_lowercase()
+    ))
+}
 pub fn locked_reference(image: &str, digest: &str) -> AppResult<String> {
     let r = parse_reference(image)?;
     if digest.is_empty() {
@@ -580,6 +595,8 @@ pub async fn pull_image(
     task_id: Option<String>,
 ) -> AppResult<PullResult> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _task = crate::tasks::Session::begin(task_id.clone())?;
+        let _storage = store::storage_lock(&app)?;
         PULL_TASK.with(|v| {
             *v.borrow_mut() = task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
         });
@@ -587,6 +604,53 @@ pub async fn pull_image(
     })
     .await
     .map_err(|e| AppError::Io(format!("拉取任务异常: {e}")))?
+}
+
+pub fn verified_cache(
+    path: &Path,
+    image: &str,
+    os: &str,
+    arch: &str,
+) -> AppResult<Option<PullResult>> {
+    crate::tasks::check()?;
+    let Ok(raw) = fs::read(path.with_extension("tar.meta.json")) else {
+        return Ok(None);
+    };
+    let Ok(m) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return Ok(None);
+    };
+    let platform = format!("{os}/{arch}");
+    let reference = parse_reference(image)?;
+    if m["version"] != 2
+        || m["reference"]
+            .as_str()
+            .is_none_or(|r| !same_reference(r, image))
+        || m["platform"].as_str() != Some(&platform)
+        || m["digest"].as_str().is_none_or(|d| {
+            !valid_digest(d) || reference.digest.as_ref().is_some_and(|locked| locked != d)
+        })
+    {
+        return Ok(None);
+    }
+    let Ok(v) = crate::image_archive::verify(path, image, os, arch) else {
+        crate::tasks::check()?;
+        return Ok(None);
+    };
+    if m["sha256"].as_str() != Some(&v.sha256)
+        || m["configDigest"].as_str() != Some(&v.config_digest)
+    {
+        return Ok(None);
+    }
+    Ok(Some(PullResult {
+        reference: image.into(),
+        platform,
+        cache_file: path.to_string_lossy().into_owned(),
+        size_bytes: v.size,
+        digest: m["digest"].as_str().unwrap().into(),
+        source: m["source"].as_str().unwrap_or_default().into(),
+        cached: true,
+        elapsed_ms: 0,
+    }))
 }
 
 fn pull_image_sync(
@@ -608,17 +672,33 @@ pub fn pull_image_inner(
     registry: Option<&crate::models::RegistryConfig>,
 ) -> AppResult<PullResult> {
     let settings = store::load_settings(app)?;
-    let _auth = registry_login(app, registry)?;
     let _lock = crate::io_util::lock(&final_path.with_extension("lock"))?;
     let r = parse_reference(image)?;
     let start = Instant::now();
+    if let Some(hit) = verified_cache(final_path, image, os, arch)? {
+        emit(app, "cached", "缓存完整性校验通过，直接使用离线材料");
+        return Ok(PullResult {
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            ..hit
+        });
+    }
+    let _auth = registry_login(app, registry)?;
     let tmp = crate::io_util::unique_sibling(final_path);
     let _clean = crate::io_util::Cleanup(tmp.clone());
     let rewritten = crate::io_util::unique_sibling(final_path);
     let _rewrite_clean = crate::io_util::Cleanup(rewritten.clone());
     let platform = format!("{os}/{arch}");
+    let oci_platform = format!(
+        "{os}/{}",
+        if arch == "loongarch64" {
+            "loong64"
+        } else {
+            arch
+        }
+    );
     let mut errors = vec![];
     for cand in candidates(&settings, &r, registry) {
+        crate::tasks::check()?;
         // Resolve before pulling: a moving tag cannot change the recorded content underneath us.
         let digest = match query_digest(app, &cand) {
             Ok(d) if valid_digest(&d) => d,
@@ -636,36 +716,9 @@ pub fn pull_image_inner(
             continue;
         }
         let meta_path = final_path.with_extension("tar.meta.json");
-        if let Ok(raw) = fs::read_to_string(&meta_path) {
-            if let Ok(m) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if m["version"] == 2
-                    && m["digest"].as_str() == Some(&digest)
-                    && m["source"].as_str() == Some(&cand)
-                    && m["reference"]
-                        .as_str()
-                        .is_some_and(|r| same_reference(r, image))
-                    && m["platform"].as_str() == Some(&platform)
-                {
-                    if let Ok(v) = crate::image_archive::verify(final_path, image, os, arch) {
-                        if m["sha256"].as_str() == Some(&v.sha256) {
-                            return Ok(PullResult {
-                                reference: image.into(),
-                                platform,
-                                cache_file: final_path.to_string_lossy().into_owned(),
-                                size_bytes: v.size,
-                                digest,
-                                source: cand,
-                                cached: true,
-                                elapsed_ms: start.elapsed().as_millis() as u64,
-                            });
-                        }
-                    }
-                }
-            }
-        }
         let parsed = parse_reference(&cand)?;
         let immutable = format!("{}/{}@{digest}", parsed.registry, parsed.repo);
-        let total = total_download_hint(app, std::slice::from_ref(&immutable), &platform);
+        let total = total_download_hint(app, std::slice::from_ref(&immutable), &oci_platform);
         crate::io_util::require_space(final_path, total.saturating_mul(3).max(256 * 1024 * 1024))?;
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = done.clone();
@@ -675,9 +728,16 @@ pub fn pull_image_inner(
         let watch_arch = arch.to_string();
         let pull_task = PULL_TASK.with(|v| v.borrow().clone());
         let watcher = std::thread::spawn(move || {
+            let mut previous = 0;
+            let mut at = Instant::now();
             while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Ok(m) = fs::metadata(&watch_path) {
-                    let _=watch_app.emit("image-pull-progress",serde_json::json!({"taskId":pull_task,"reference":watch_ref,"arch":watch_arch,"bytes":m.len(),"total":total,"percent":if total>0 {(m.len() as f64/total as f64*100.0).min(99.0)}else{0.0},"speedBps":0}));
+                    let speed = (m.len().saturating_sub(previous) as f64
+                        / at.elapsed().as_secs_f64().max(0.001))
+                        as u64;
+                    previous = m.len();
+                    at = Instant::now();
+                    let _=watch_app.emit("image-pull-progress",serde_json::json!({"taskId":pull_task,"reference":watch_ref,"arch":watch_arch,"bytes":m.len(),"total":total,"percent":if total>0 {(m.len() as f64/total as f64*100.0).min(99.0)}else{0.0},"speedBps":speed}));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
@@ -688,7 +748,7 @@ pub fn pull_image_inner(
             &[
                 "pull",
                 "--platform",
-                &platform,
+                &oci_platform,
                 "--format=tarball",
                 &immutable,
                 &tmp.to_string_lossy(),
@@ -711,6 +771,7 @@ pub fn pull_image_inner(
         let v = crate::image_archive::verify(&rewritten, image, os, arch)?;
         let meta = serde_json::json!({"version":2,"reference":image,"platform":platform,"digest":digest,"source":cand,"pulledAt":store::now_rfc3339(),"sizeBytes":v.size,"sha256":v.sha256,"configDigest":v.config_digest});
         // A missing meta after a crash is a cache miss, never an accepted half-commit.
+        crate::tasks::check()?;
         fs::rename(&rewritten, final_path)?;
         crate::io_util::atomic_write(&meta_path, serde_json::to_string_pretty(&meta)?.as_bytes())?;
         crate::app_ops::__audit(app, "pull_image", &format!("{image} {platform} {digest}"));
@@ -733,8 +794,9 @@ pub fn pull_image_inner(
 pub fn rewrite_archive(src: &Path, dst: &Path, canonical_ref: &str) -> AppResult<()> {
     let f = File::open(src)?;
     let mut archive = tar::Archive::new(f);
-    let mut builder = tar::Builder::new(File::create(dst)?);
+    let mut builder = tar::Builder::new(crate::io_util::CheckedWriter(File::create(dst)?));
     for entry in archive.entries()? {
+        crate::tasks::check()?;
         let mut entry = entry?;
         let path = entry.path()?.to_path_buf();
         let name = path.to_string_lossy().replace('\\', "/");

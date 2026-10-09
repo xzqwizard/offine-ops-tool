@@ -21,6 +21,7 @@ pub struct VerifiedImage {
 struct HashWriter(Sha256);
 impl Write for HashWriter {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        crate::tasks::check().map_err(std::io::Error::other)?;
         self.0.update(b);
         Ok(b.len())
     }
@@ -47,6 +48,7 @@ pub fn verify(path: &Path, reference: &str, os: &str, arch: &str) -> AppResult<V
     let mut hashes = HashMap::new();
     let mut manifest = None;
     for entry in archive.entries()? {
+        crate::tasks::check()?;
         let mut e = entry?;
         let p = e.path()?.into_owned();
         if p.components()
@@ -90,10 +92,12 @@ pub fn verify(path: &Path, reference: &str, os: &str, arch: &str) -> AppResult<V
     let expected = load_reference(reference)?;
     let r = parse_reference(reference)?;
     let full = format!("{}/{}:{}", r.registry, r.repo, r.tag);
-    if !tags
-        .iter()
-        .any(|t| t.as_str() == Some(&expected) || t.as_str() == Some(&full))
-    {
+    if !tags.iter().any(|t| {
+        t.as_str().is_some_and(|tag| {
+            crate::images::same_reference(tag, &expected)
+                || crate::images::same_reference(tag, &full)
+        })
+    }) {
         return Err(bad("tar 标签与实例镜像引用不一致"));
     }
     let config = item["Config"]
@@ -141,9 +145,11 @@ pub fn verify(path: &Path, reference: &str, os: &str, arch: &str) -> AppResult<V
         }
         for (layer, diff) in layers.iter().zip(diffs) {
             let layer = layer.as_str().unwrap_or_default();
-            // Standard docker-save layer.tar is uncompressed. OCI blobs are verified above
-            // against the digest in their blob name (which can represent a compressed layer).
-            if layer.ends_with(".tar")
+            // Newer docker-save exports uncompressed layers under OCI blob paths.
+            let media_type = item["LayerSources"][format!("sha256:{}", hashes[layer])]["mediaType"]
+                .as_str()
+                .unwrap_or_default();
+            if (layer.ends_with(".tar") || media_type.ends_with(".tar"))
                 && diff.as_str() != Some(&format!("sha256:{}", hashes[layer]))
             {
                 return Err(bad("镜像数据层与 rootfs 校验和不一致"));

@@ -3,16 +3,34 @@ set -euo pipefail
 BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 source "$BASE_DIR/scripts/runtime.sh"
 root_required
+MODE=${1:-runtime}
+[ "$MODE" = runtime ] || [ "$MODE" = --before-install ] || die '用法: precheck.sh [--before-install]'
 [ "$(uname -m)" = {{ uname_arch | shq }} ] || die 'CPU 架构与交付包不匹配'
 command -v timeout >/dev/null && command -v sha256sum >/dev/null && command -v tar >/dev/null && command -v ss >/dev/null || die '缺少 coreutils/tar/iproute2'
-docker info >/dev/null
-docker compose version >/dev/null
-actual_docker=$(docker --version | awk '{print $3}' | tr -d ',')
-[ "$actual_docker" = {{ server.docker_version | shq }} ] || die 'Docker 版本与交付包不一致，需重新全量构建'
+[ -f /etc/os-release ] || die '目标缺少 OS 身份信息'
+source /etc/os-release
+actual_os=${ID,,}
+expected_os={{ server.os_family | shq }}
+case "$expected_os/$actual_os" in uos/uniontech|uos/deepin) actual_os=uos;; kylin/kylin-server) actual_os=kylin;; esac
+expected_version={{ server.os_version | shq }}
+# Some distributions expose VERSION_ID=V10/7, and put SP/minor releases in release files.
+# Match every version token rather than accepting the family or a major version alone.
+version_matches() {
+  [ "${VERSION_ID:-}" = "$expected_version" ] && return 0
+  local details="${VERSION_ID:-} ${VERSION:-} ${PRETTY_NAME:-}" file token
+  for file in /etc/kylin-release /etc/uos-release /etc/openEuler-release /etc/centos-release /etc/redhat-release /etc/neokylin-release; do
+    if [ -f "$file" ]; then details="$details $(cat "$file")"; fi
+  done
+  details=" $(printf '%s' "$details" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:].' ' ') "
+  local tokens
+  tokens=$(printf '%s' "$expected_version" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:].' ' ')
+  [ -n "$tokens" ] || return 1
+  for token in $tokens; do case "$details" in *" $token "*) ;; *) return 1;; esac; done
+}
+[ "$actual_os" = "$expected_os" ] && version_matches || die "目标 OS/版本不匹配：要求 $expected_os $expected_version，实际 ${ID:-} ${VERSION_ID:-} ${VERSION:-}"
 available_mem=$(awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo)
 [ "$available_mem" -ge {{ mem_need_gb * 1024 }} ] || die '内存不足'
-parent=$(docker info --format {% raw %}'{{.DockerRootDir}}'{% endraw %})
-[ "$parent" = {{ server.docker_data_root | shq }} ] || die '实际 Docker 数据目录与方案不一致，请调整方案后全量构建'
+parent={{ server.docker_data_root | shq }}
 while [ ! -d "$parent" ]; do parent=$(dirname "$parent"); done
 available=$(df -Pm "$parent" | awk 'END {print $4}')
 [ "$available" -ge {{ disk_need_mb }} ] || die 'Docker 数据盘剩余空间不足'
@@ -22,6 +40,19 @@ key=${req%%>=*}; required=${req##*>=}
 actual=$(sysctl -n "$key")
 [ "$actual" -ge "$required" ] || die "内核参数 $req 未满足；请由管理员配置"
 {% endfor %}
+if [ "$MODE" = --before-install ]; then
+  command -v flock >/dev/null && command -v systemctl >/dev/null || die '缺少 util-linux/systemd'
+  printf '安装前预检通过\n'; exit 0
+fi
+docker info >/dev/null
+docker compose version >/dev/null
+actual_docker=$(docker version --format {% raw %}'{{.Server.Version}}'{% endraw %})
+[ "$actual_docker" = {{ server.docker_version | shq }} ] || die 'Docker 版本与交付包不一致，需重新全量构建'
+parent=$(docker info --format {% raw %}'{{.DockerRootDir}}'{% endraw %})
+[ "$parent" = {{ server.docker_data_root | shq }} ] || die '实际 Docker 数据目录与方案不一致，请调整方案后全量构建'
+while [ ! -d "$parent" ]; do parent=$(dirname "$parent"); done
+available=$(df -Pm "$parent" | awk 'END {print $4}')
+[ "$available" -ge {{ disk_need_mb }} ] || die 'Docker 数据盘剩余空间不足'
 {% for p in local_ports %}
 # TCP and UDP are separate. Only this project/server's containers may own a published port.
 mapfile -t ids < <(docker ps --filter {{ ("publish=" ~ p.host ~ "/" ~ p.protocol) | shq }} --format {% raw %}'{{.ID}}'{% endraw %})

@@ -6,7 +6,11 @@ pub fn from_context(ctx: &Value) -> AppResult<String> {
     let mut services = serde_json::Map::new();
     for inst in ctx["instances"].as_array().into_iter().flatten() {
         let name = inst["instance_name"].as_str().unwrap_or_default();
-        let mut service = json!({"image":inst["image"],"hostname":name.replace('_', "-").to_ascii_lowercase(),"restart":"unless-stopped","pull_policy":"never","labels":{"offlinepreops.project":ctx["project_id"],"offlinepreops.server":ctx["server_id"]},"volumes":[{"type":"bind","source":format!("./data/{name}"),"target":inst["data_volume"].as_str().unwrap_or("/data").replace('$', "$$")} ]});
+        let data_dir = inst["data_dir"].as_str().unwrap_or(name);
+        let mut service = json!({"image":inst["image"],"hostname":name.replace('_', "-").to_ascii_lowercase(),"restart":"unless-stopped","pull_policy":"never","labels":{"offlinepreops.project":ctx["project_id"],"offlinepreops.server":ctx["server_id"],"offlinepreops.instance":inst["instance_id"].as_str().unwrap_or(name)},"volumes":[{"type":"bind","source":format!("./data/{data_dir}"),"target":inst["data_volume"].as_str().unwrap_or("/data").replace('$', "$$")} ]});
+        if inst["data_volume"].as_str() == Some("") {
+            service.as_object_mut().unwrap().remove("volumes");
+        }
         let ports:Vec<_>=inst["ports"].as_array().into_iter().flatten().filter(|p|p["expose"]==true).map(|p|json!({"target":p["container"],"published":p["host"].to_string(),"protocol":p["protocol"],"host_ip":ctx["server"]["ip"]})).collect();
         if !ports.is_empty() {
             service["ports"] = json!(ports);

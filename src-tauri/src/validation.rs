@@ -321,7 +321,10 @@ pub fn issues(p: &Project, cat: &CatalogFile, build: bool) -> Vec<ValidationIssu
                             .map(|s| s.arch.as_str())
                             .unwrap_or("");
                         if !t.supported_arches.is_empty()
-                            && !t.supported_arches.iter().any(|a| a == arch)
+                            && !t.supported_arches.iter().any(|a| {
+                                crate::image_archive::normalize_arch(a)
+                                    == crate::image_archive::normalize_arch(arch)
+                            })
                         {
                             issue(
                                 &mut out,

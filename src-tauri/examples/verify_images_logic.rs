@@ -1,5 +1,5 @@
 //! 镜像纯函数逻辑的手动验证（cargo run --example verify_images_logic）
-//! 因工具链布局 bug 无法常驻 cargo test，改动相关逻辑后跑一次本程序确认。
+//! 同时有集成测试覆盖；此示例用于手动核对标准引用解析。
 use offline_preops_tool_lib::images::{parse_reference, rewrite_repo_tags_for_test};
 
 fn main() {
@@ -19,9 +19,10 @@ fn main() {
         assert_eq!(r.tag, tag, "tag of {input}");
         println!("[ok] parse {input} -> {reg}/{repo}:{tag}");
     }
-    let r = parse_reference("registry.example.cn:5000/gov/app@sha256:abcd").unwrap();
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let r = parse_reference(&format!("registry.example.cn:5000/gov/app@{digest}")).unwrap();
     assert_eq!(r.registry, "registry.example.cn:5000");
-    assert_eq!(r.digest.as_deref(), Some("sha256:abcd"));
+    assert_eq!(r.digest.as_deref(), Some(digest.as_str()));
     println!("[ok] parse registry with port + digest");
 
     // rewrite_repo_tags

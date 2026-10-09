@@ -11,6 +11,7 @@ if [ -f "$BASE_DIR/.installed" ]; then
   [ "$(cat "$BASE_DIR/.installed")" = "$EXPECTED_BUILD" ] || die '目录已有其他版本，请使用 upgrade.sh'
 fi
 # Installer must run even when the engine exists, to install missing Compose.
+bash "$BASE_DIR/scripts/precheck.sh" --before-install
 bash "$BASE_DIR/docker-offline/install-docker.sh"
 bash "$BASE_DIR/scripts/precheck.sh"
 compose config -q
