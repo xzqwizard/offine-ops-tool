@@ -279,7 +279,19 @@ fn native_package_selection_requires_exact_os_roles_versions_and_hashes() {
         let path = root.join(dir).join("packages");
         fs::create_dir_all(&path).unwrap();
         let pkg = path.join(file);
-        fs::write(&pkg, b"!<arch>\n").unwrap();
+        fs::write(
+            &pkg,
+            deb_fixture(
+                match role {
+                    "engine" => "docker-ce",
+                    "cli" => "docker-ce-cli",
+                    _ => "containerd.io",
+                },
+                "27.5.1-1",
+                "amd64",
+            ),
+        )
+        .unwrap();
         let sha = std::collections::BTreeMap::from([(file, io_util::sha256_file(&pkg).unwrap())]);
         let components = std::collections::BTreeMap::from([(file, role)]);
         let meta = json!({"arch":"amd64","kind":"deb","dockerVersion":version,
@@ -304,6 +316,10 @@ fn native_package_selection_requires_exact_os_roles_versions_and_hashes() {
     );
     assert!(docker_pkgs::pick_pkg_dirs_at(&root, "amd64", "27.5.1", "ubuntu", "22.04").is_err());
     assert!(docker_pkgs::pick_pkg_dirs_at(&root, "arm64", "27.5.1", "ubuntu", "24.04").is_err());
+    let extra = root.join("engine/packages/undeclared.deb");
+    fs::write(&extra, b"!<arch>\n").unwrap();
+    assert!(docker_pkgs::pick_pkg_dirs_at(&root, "amd64", "27.5.1", "ubuntu", "24.04").is_err());
+    fs::remove_file(extra).unwrap();
     fs::write(engine, b"!<arch>\nmodified").unwrap();
     assert!(docker_pkgs::pick_pkg_dirs_at(&root, "amd64", "27.5.1", "ubuntu", "24.04").is_err());
 }
@@ -422,4 +438,119 @@ fn literal_credential_prefix_and_nonsecret_text_round_trip_with_legacy_compatibi
     assert_eq!(serde_json::to_string(&p).unwrap(), migrated);
     credentials::reveal_project(&mut p).unwrap();
     assert_eq!(p.instances[0].params["APP_SECRET"], json!("legacy secret"));
+}
+
+fn deb_fixture(package: &str, version: &str, arch: &str) -> Vec<u8> {
+    let gzip_tar = |name: &str, data: &[u8]| {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        let mut head = tar::Header::new_gnu();
+        head.set_size(data.len() as u64);
+        head.set_mode(0o644);
+        head.set_cksum();
+        tar.append_data(&mut head, name, data).unwrap();
+        tar.into_inner().unwrap().finish().unwrap()
+    };
+    let control = format!(
+        "Package: {package}\nVersion: {version}\nArchitecture: {arch}\nDescription: test fixture\n"
+    );
+    let mut result = b"!<arch>\n".to_vec();
+    for (name, body) in [
+        ("debian-binary", b"2.0\n".to_vec()),
+        ("control.tar.gz", gzip_tar("./control", control.as_bytes())),
+        (
+            "data.tar.gz",
+            gzip_tar("./usr/share/test", b"fixture payload"),
+        ),
+    ] {
+        result.extend(
+            format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                format!("{name}/"),
+                0,
+                0,
+                0,
+                "100644",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        result.extend(&body);
+        if body.len() % 2 != 0 {
+            result.push(b'\n');
+        }
+    }
+    result
+}
+
+#[test]
+fn native_control_metadata_and_truncated_packages_are_checked() {
+    let t = temp();
+    let pkg = t.0.join("native.deb");
+    let good = deb_fixture("docker-ce", "27.5.1-1", "amd64");
+    fs::write(&pkg, &good).unwrap();
+    let info = docker_pkgs::verify_native(&pkg, "deb").unwrap();
+    assert_eq!(
+        (
+            info.name.as_str(),
+            info.version.as_str(),
+            info.arch.as_str()
+        ),
+        ("docker-ce", "27.5.1-1", "amd64")
+    );
+    fs::write(&pkg, &good[..good.len() - 5]).unwrap();
+    assert!(docker_pkgs::verify_native(&pkg, "deb").is_err());
+    fs::write(&pkg, b"!<arch>\n").unwrap();
+    assert!(docker_pkgs::verify_native(&pkg, "deb").is_err());
+    let mut overflow = good;
+    overflow[56..66].copy_from_slice(b"9999999999");
+    fs::write(&pkg, overflow).unwrap();
+    assert!(docker_pkgs::verify_native(&pkg, "deb").is_err());
+}
+
+#[test]
+fn conflicting_material_basenames_cannot_overwrite_each_other() {
+    let t = temp();
+    for (group, sha) in [("a", "first"), ("b", "second")] {
+        let dir = t.0.join(group);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("meta.json"), serde_json::to_vec(&json!({"arch":"amd64","kind":"deb","dockerVersion":"27.5.1","files":["same.deb"],"sha256":{"same.deb":sha}})).unwrap()).unwrap();
+    }
+    assert!(docker_pkgs::package_inventory(&[t.0.join("a"), t.0.join("b")]).is_err());
+}
+
+fn valid_elf() -> Vec<u8> {
+    let mut bytes = vec![0; 128];
+    bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+    bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+    bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+    bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+    bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+    bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+    bytes[68..72].copy_from_slice(&5u32.to_le_bytes());
+    bytes[96..104].copy_from_slice(&128u64.to_le_bytes());
+    bytes[104..112].copy_from_slice(&128u64.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn compose_requires_complete_elf_and_persisted_integrity_metadata() {
+    let t = temp();
+    let file = t.0.join("docker-compose");
+    let elf = valid_elf();
+    fs::write(&file, &elf[..20]).unwrap();
+    assert!(docker_pkgs::verify_elf(&file, "amd64").is_err());
+    fs::write(&file, &elf).unwrap();
+    docker_pkgs::verify_elf(&file, "amd64").unwrap();
+    assert!(docker_pkgs::verify_compose_at(&t.0, "amd64").is_err());
+    let meta = json!({"arch":"amd64","version":"2.40.3","source":"local-test","sizeBytes":elf.len(),"sha256":io_util::sha256_file(&file).unwrap()});
+    fs::write(t.0.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+    docker_pkgs::verify_compose_at(&t.0, "amd64").unwrap();
+    let mut damaged = elf;
+    damaged[127] = 42;
+    fs::write(&file, damaged).unwrap();
+    assert!(docker_pkgs::verify_compose_at(&t.0, "amd64").is_err());
 }

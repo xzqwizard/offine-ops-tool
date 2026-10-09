@@ -4,9 +4,8 @@ use crate::store;
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{copy, Read};
+use std::io::copy;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 
@@ -26,6 +25,8 @@ pub struct EngineStatus {
     pub path: String,
     /// 下载安装的最后错误（界面展示）
     pub last_error: Option<String>,
+    pub source: Option<String>,
+    pub sha256: Option<String>,
 }
 
 fn bin_dir(app: &AppHandle) -> AppResult<PathBuf> {
@@ -53,33 +54,68 @@ fn host_asset_arch() -> &'static str {
 /// 探测已安装的 crane（crane version 输出版本号）
 #[tauri::command]
 pub fn engine_status(app: AppHandle) -> AppResult<EngineStatus> {
-    let path = crane_path(&app)?;
-    let marker = bin_dir(&app)?.join("crane-version.txt");
+    engine_status_for(&app)
+}
+fn engine_status_for(app: &AppHandle) -> AppResult<EngineStatus> {
+    let path = crane_path(app)?;
+    let marker = bin_dir(app)?.join("crane-version.txt");
     let version = fs::read_to_string(&marker)
         .ok()
         .map(|v| v.trim().to_string());
-    let installed = path.is_file();
+    let meta_path = path.with_file_name("crane-meta.json");
+    let meta = if meta_path.exists() {
+        Some(serde_json::from_slice::<serde_json::Value>(&fs::read(
+            meta_path,
+        )?)?)
+    } else {
+        None
+    };
+    let error = if path.is_file() {
+        meta.as_ref()
+            .filter(|m| {
+                m["sizeBytes"].as_u64() != path.metadata().ok().map(|m| m.len())
+                    || m["sha256"].as_str() != crate::io_util::sha256_file(&path).ok().as_deref()
+            })
+            .map(|_| "镜像引擎完整性校验失败，请重新安装".to_string())
+    } else {
+        None
+    };
+    let installed = path.is_file() && error.is_none();
     Ok(EngineStatus {
         installed,
         version,
         path: path.to_string_lossy().into_owned(),
-        last_error: None,
+        last_error: error,
+        source: meta
+            .as_ref()
+            .and_then(|m| m["source"].as_str().map(str::to_string)),
+        sha256: meta
+            .as_ref()
+            .and_then(|m| m["sha256"].as_str().map(str::to_string)),
     })
 }
 
 fn emit(app: &AppHandle, step: &str, detail: &str) {
     let _ = app.emit(
         "engine-install",
-        serde_json::json!({ "step": step, "detail": detail }),
+        serde_json::json!({ "step": step, "detail": detail, "taskId":crate::tasks::id() }),
     );
 }
 
 /// 下载并安装 crane 引擎（后台线程执行，幂等：已安装同版本则跳过）
 #[tauri::command]
-pub async fn engine_install(app: AppHandle, force: bool) -> AppResult<EngineStatus> {
-    tauri::async_runtime::spawn_blocking(move || engine_install_sync(&app, force))
-        .await
-        .map_err(|e| AppError::Io(format!("安装任务异常: {e}")))?
+pub async fn engine_install(
+    app: AppHandle,
+    force: bool,
+    task_id: Option<String>,
+) -> AppResult<EngineStatus> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _task = crate::tasks::Session::begin(task_id)?;
+        let _storage = store::storage_lock(&app)?;
+        engine_install_sync(&app, force)
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("安装任务异常: {e}")))?
 }
 
 fn engine_install_sync(app: &AppHandle, force: bool) -> AppResult<EngineStatus> {
@@ -97,7 +133,7 @@ fn engine_install_sync(app: &AppHandle, force: bool) -> AppResult<EngineStatus> 
     let current = fs::read_to_string(&marker)
         .ok()
         .map(|v| v.trim().to_string());
-    if !force && current.as_deref() == Some(tag.as_str()) && exe.is_file() {
+    if !force && current.as_deref() == Some(tag.as_str()) && engine_status_for(app)?.installed {
         emit(app, "done", &format!("已安装最新版 {tag}，跳过"));
         return engine_status_inner(&exe, &marker);
     }
@@ -125,11 +161,11 @@ fn engine_install_sync(app: &AppHandle, force: bool) -> AppResult<EngineStatus> 
             .unwrap_or(0)
     ));
     let _cleanup = crate::io_util::Cleanup(tmp.clone());
-    let _lock = crate::io_util::lock(&dir.join(".engine.lock"))?;
+    let _lock = crate::io_util::lock(&dir.with_file_name(".engine.lock"))?;
     crate::net::download(&settings, &format!("{base}/{asset_name}"), &tmp, 300)?;
 
     emit(app, "verify", "校验 SHA256…");
-    let actual = sha256_file(&tmp)?;
+    let actual = crate::io_util::sha256_file(&tmp)?;
     if !actual.eq_ignore_ascii_case(&expect) {
         let _ = fs::remove_file(&tmp);
         return Err(AppError::Invalid(format!(
@@ -138,30 +174,65 @@ fn engine_install_sync(app: &AppHandle, force: bool) -> AppResult<EngineStatus> 
     }
 
     emit(app, "extract", "解压 crane.exe…");
-    let exe_tmp = crate::io_util::unique_sibling(&exe);
-    let _exe_cleanup = crate::io_util::Cleanup(exe_tmp.clone());
+    let stage = crate::io_util::unique_sibling(&dir);
+    let _stage_cleanup = crate::io_util::Cleanup(stage.clone());
+    fs::create_dir_all(&stage)?;
+    let exe_tmp = stage.join("crane.exe");
     extract_crane(&tmp, &exe_tmp)?;
+    let verified_version = crate::tasks::output(
+        std::process::Command::new(&exe_tmp).arg("version"),
+        std::time::Duration::from_secs(10),
+        None,
+    )?;
+    if !verified_version.status.success()
+        || String::from_utf8_lossy(&verified_version.stdout)
+            .trim()
+            .trim_start_matches('v')
+            != tag.trim_start_matches('v')
+    {
+        return Err(AppError::Invalid("crane 实际版本与下载版本不符".into()));
+    }
+    let meta = serde_json::json!({"version":tag,"source":format!("{base}/{asset_name}"),"assetSha256":actual,"hostArch":host_asset_arch(),"sizeBytes":exe_tmp.metadata()?.len(),"sha256":crate::io_util::sha256_file(&exe_tmp)?});
 
-    // 原子替换
-    fs::rename(&exe_tmp, &exe)?;
-    let _ = fs::remove_file(&tmp);
-    crate::io_util::atomic_write(&marker, tag.as_bytes())?;
+    // Publish the executable, version and integrity record as one directory transaction.
+    crate::io_util::atomic_write(&stage.join("crane-version.txt"), tag.as_bytes())?;
+    crate::io_util::atomic_write(
+        &stage.join("crane-meta.json"),
+        &serde_json::to_vec_pretty(&meta)?,
+    )?;
+    crate::tasks::check()?;
+    crate::io_util::commit_directory(&stage, &dir)?;
 
     emit(app, "done", &format!("crane {tag} 安装完成"));
     engine_status_inner(&exe, &marker)
 }
 
-fn engine_status_inner(exe: &Path, marker: &Path) -> AppResult<EngineStatus> {
-    let out = std::process::Command::new(exe).arg("version").output();
+fn engine_status_inner(exe: &Path, _marker: &Path) -> AppResult<EngineStatus> {
+    let out = crate::tasks::output(
+        std::process::Command::new(exe).arg("version"),
+        std::time::Duration::from_secs(10),
+        None,
+    );
     let version = match out {
         Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).trim().to_string()),
-        _ => fs::read_to_string(marker).ok().map(|v| v.trim().into()),
+        Ok(o) => {
+            return Err(AppError::Invalid(format!(
+                "crane 版本验证失败: {}",
+                String::from_utf8_lossy(&o.stderr)
+            )))
+        }
+        Err(e) => return Err(e),
     };
     Ok(EngineStatus {
         installed: exe.is_file(),
         version,
         path: exe.to_string_lossy().into_owned(),
         last_error: None,
+        source: fs::read(exe.with_file_name("crane-meta.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|m| m["source"].as_str().map(str::to_string)),
+        sha256: Some(crate::io_util::sha256_file(exe)?),
     })
 }
 
@@ -186,25 +257,11 @@ fn extract_crane(archive: &Path, dest: &Path) -> AppResult<()> {
     Err(AppError::Io("压缩包中未找到 crane.exe".into()))
 }
 
-fn sha256_file(path: &Path) -> AppResult<String> {
-    let mut f = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 1024 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
 /// 构造已注入代理环境变量的 crane 命令（供 images 模块复用）
 pub fn crane_command(app: &AppHandle, args: &[&str]) -> AppResult<std::process::Command> {
     let settings = store::load_settings(app)?;
     let exe = crane_path(app)?;
-    if !exe.is_file() {
+    if !engine_status_for(app)?.installed {
         return Err(AppError::NotFound(
             "镜像引擎 crane 未安装，请先在「镜像库」页面下载安装".into(),
         ));

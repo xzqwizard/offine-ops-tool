@@ -5,6 +5,8 @@ export interface EngineStatus {
   version: string | null
   path: string
   lastError: string | null
+  source: string | null
+  sha256: string | null
 }
 
 export interface EngineInstallEvent {

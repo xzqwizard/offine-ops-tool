@@ -39,6 +39,19 @@ pub struct DockerPkgMeta {
     /// filename -> engine | cli | containerd | dependency
     #[serde(default)]
     pub components: std::collections::BTreeMap<String, String>,
+    /// filename -> download URL or operator-declared/local source.
+    #[serde(default)]
+    pub sources: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub native_packages: std::collections::BTreeMap<String, NativePackageInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativePackageInfo {
+    pub name: String,
+    pub version: String,
+    pub arch: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +67,7 @@ pub struct DockerPkgEntry {
     pub imported_at: String,
     pub os_family: String,
     pub os_version: String,
+    pub sources: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +77,20 @@ pub struct ComposePluginStatus {
     pub installed: bool,
     pub file: String,
     pub size_bytes: u64,
+    pub version: String,
+    pub source: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposePluginMeta {
+    pub arch: String,
+    pub version: String,
+    #[serde(default)]
+    pub source: String,
+    pub size_bytes: u64,
+    pub sha256: String,
 }
 
 fn pkg_root(app: &AppHandle) -> AppResult<PathBuf> {
@@ -198,6 +226,7 @@ pub fn os_pkg_class(os_family: &str) -> &'static str {
 #[tauri::command]
 pub fn list_docker_pkgs(app: AppHandle) -> AppResult<Vec<DockerPkgEntry>> {
     let root = pkg_root(&app)?;
+    let _lock = crate::io_util::lock(&root.join(".packages.lock"))?;
     let mut out = Vec::new();
     for entry in fs::read_dir(&root)?.flatten() {
         let dir = entry.path();
@@ -232,6 +261,7 @@ pub fn list_docker_pkgs(app: AppHandle) -> AppResult<Vec<DockerPkgEntry>> {
             imported_at: meta.imported_at,
             os_family: meta.os_family,
             os_version: meta.os_version,
+            sources: meta.sources,
         });
     }
     out.sort_by(|a, b| {
@@ -243,6 +273,7 @@ pub fn list_docker_pkgs(app: AppHandle) -> AppResult<Vec<DockerPkgEntry>> {
 #[tauri::command]
 pub fn list_compose_plugins(app: AppHandle) -> AppResult<Vec<ComposePluginStatus>> {
     let root = pkg_root(&app)?;
+    let _lock = crate::io_util::lock(&root.join(".packages.lock"))?;
     let mut out = Vec::new();
     let compose_dir = root.join("compose");
     if compose_dir.is_dir() {
@@ -250,11 +281,21 @@ pub fn list_compose_plugins(app: AppHandle) -> AppResult<Vec<ComposePluginStatus
             let f = arch_dir.path().join("docker-compose");
             if f.is_file() {
                 let arch_name = arch_dir.file_name().to_string_lossy().into_owned();
+                let validated = verify_compose_at(&arch_dir.path(), &arch_name);
                 out.push(ComposePluginStatus {
                     arch: arch_name,
-                    installed: true,
+                    installed: validated.is_ok(),
                     file: f.to_string_lossy().into_owned(),
                     size_bytes: f.metadata().map(|m| m.len()).unwrap_or(0),
+                    version: validated
+                        .as_ref()
+                        .map(|m| m.version.clone())
+                        .unwrap_or_default(),
+                    source: validated
+                        .as_ref()
+                        .map(|m| m.source.clone())
+                        .unwrap_or_default(),
+                    error: validated.err().map(|e| e.to_string()),
                 });
             }
         }
@@ -266,6 +307,9 @@ pub fn list_compose_plugins(app: AppHandle) -> AppResult<Vec<ComposePluginStatus
                 installed: false,
                 file: String::new(),
                 size_bytes: 0,
+                version: String::new(),
+                source: String::new(),
+                error: None,
             });
         }
     }
@@ -310,8 +354,11 @@ pub async fn import_docker_pkgs(
     app: AppHandle,
     paths: Vec<String>,
     default_arch: String,
+    task_id: Option<String>,
 ) -> AppResult<ImportResult> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _task = crate::tasks::Session::begin(task_id)?;
+        let _storage = store::storage_lock(&app)?;
         import_docker_pkgs_sync(&app, &paths, &default_arch)
     })
     .await
@@ -332,6 +379,7 @@ fn import_docker_pkgs_sync(
     };
 
     for path_str in paths {
+        crate::tasks::check()?;
         let src = PathBuf::from(path_str);
         if !src.is_file() {
             result.skipped.push(format!("{}（不是文件）", path_str));
@@ -361,10 +409,14 @@ fn import_docker_pkgs_sync(
             .or_else(|| parse_pkg_filename(&name));
         match parsed {
             Some((kind, arch, _v, _aux)) if kind == "compose" => {
-                verify_elf(&src, &arch)?;
+                let sidecar = src.with_file_name(format!("{name}.compose.json"));
+                let meta: ComposePluginMeta = serde_json::from_slice(&fs::read(&sidecar).map_err(|_| AppError::Invalid(format!("{name} 需 .compose.json 声明 arch/version/sizeBytes/sha256；请参考材料导入说明")))?)?;
+                if meta.arch != arch {
+                    return Err(AppError::Invalid("Compose 文件名与声明架构不一致".into()));
+                }
+                verify_compose_file(&src, &meta, &arch)?;
                 let dst = root.join("compose").join(&arch);
-                fs::create_dir_all(&dst)?;
-                crate::io_util::atomic_write(&dst.join("docker-compose"), &fs::read(&src)?)?;
+                publish_compose(&src, &dst, &meta)?;
                 result.compose_installed.push(format!("{name} → {arch}"));
             }
             Some((kind, arch, version, is_aux)) => {
@@ -398,11 +450,12 @@ fn import_docker_pkgs_sync(
                 {
                     return Err(AppError::Invalid("安装包版本无效".into()));
                 }
-                if kind == "static" {
+                let native = if kind == "static" {
                     verify_static(&src, &arch)?;
+                    None
                 } else {
-                    verify_native(&src, kind)?;
-                }
+                    Some(verify_native(&src, kind)?)
+                };
                 let sha = crate::io_util::sha256_file(&src)?;
                 if kind != "static"
                     && declared.as_ref().and_then(|m| m.sha256.get(&name)) != Some(&sha)
@@ -463,9 +516,6 @@ fn import_docker_pkgs_sync(
                     )
                 };
                 let dir = root.join(&id);
-                let pkgs_dir = dir.join("packages");
-                fs::create_dir_all(&pkgs_dir)?;
-                crate::io_util::copy_atomic(&src, &pkgs_dir.join(&name))?;
                 // 更新 meta（合并同组文件）
                 let mut meta = fs::read_to_string(dir.join("meta.json"))
                     .ok()
@@ -481,7 +531,21 @@ fn import_docker_pkgs_sync(
                         sha256: std::collections::BTreeMap::new(),
                         engine_version,
                         components: std::collections::BTreeMap::new(),
+                        sources: std::collections::BTreeMap::new(),
+                        native_packages: std::collections::BTreeMap::new(),
                     });
+                meta.sources.insert(
+                    name.clone(),
+                    declared
+                        .as_ref()
+                        .and_then(|m| m.sources.get(&name))
+                        .cloned()
+                        .unwrap_or_else(|| format!("local:{name}")),
+                );
+                if let Some(native) = native {
+                    validate_native_metadata(&native, &arch, &meta.engine_version, &component)?;
+                    meta.native_packages.insert(name.clone(), native);
+                }
                 meta.sha256.insert(name.clone(), sha);
                 if kind != "static" {
                     meta.components.insert(name.clone(), component);
@@ -489,10 +553,29 @@ fn import_docker_pkgs_sync(
                 if !meta.files.contains(&name) {
                     meta.files.push(name.clone());
                 }
+                let stage = crate::io_util::unique_sibling(&dir);
+                let _cleanup = crate::io_util::Cleanup(stage.clone());
+                fs::create_dir_all(stage.join("packages"))?;
+                if dir.exists() {
+                    let old: DockerPkgMeta =
+                        serde_json::from_slice(&fs::read(dir.join("meta.json"))?)?;
+                    validate_group(&dir, &old)?;
+                    for old_name in &old.files {
+                        if old_name != &name {
+                            crate::io_util::copy_atomic(
+                                &dir.join("packages").join(old_name),
+                                &stage.join("packages").join(old_name),
+                            )?;
+                        }
+                    }
+                }
+                crate::io_util::copy_atomic(&src, &stage.join("packages").join(&name))?;
                 crate::io_util::atomic_write(
-                    &dir.join("meta.json"),
+                    &stage.join("meta.json"),
                     serde_json::to_string_pretty(&meta)?.as_bytes(),
                 )?;
+                validate_group(&stage, &meta)?;
+                crate::io_util::commit_directory(&stage, &dir)?;
                 if !result.created_dirs.contains(&id) {
                     result.created_dirs.push(id);
                 }
@@ -520,7 +603,7 @@ fn import_docker_pkgs_sync(
 fn emit(app: &AppHandle, step: &str, detail: &str) {
     let _ = app.emit(
         "docker-pkg-download",
-        serde_json::json!({ "step": step, "detail": detail }),
+        serde_json::json!({ "step": step, "detail": detail, "taskId":crate::tasks::id() }),
     );
 }
 
@@ -530,10 +613,15 @@ pub async fn download_docker_static(
     app: AppHandle,
     arch: String,
     version: String,
+    task_id: Option<String>,
 ) -> AppResult<DockerPkgEntry> {
-    tauri::async_runtime::spawn_blocking(move || download_docker_static_sync(&app, &arch, &version))
-        .await
-        .map_err(|e| AppError::Io(format!("下载任务异常: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let _task = crate::tasks::Session::begin(task_id)?;
+        let _storage = store::storage_lock(&app)?;
+        download_docker_static_sync(&app, &arch, &version)
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("下载任务异常: {e}")))?
 }
 
 fn download_docker_static_sync(
@@ -562,6 +650,12 @@ fn download_docker_static_sync(
     let _cleanup = crate::io_util::Cleanup(task_dir.clone());
     let tmp = task_dir.join(format!("docker-{version}.tgz"));
     crate::net::download(&settings, &url, &tmp, 600)?;
+    crate::io_util::atomic_write(
+        &tmp.with_file_name(format!("docker-{version}.tgz.pkg.json")),
+        &serde_json::to_vec(
+            &serde_json::json!({"arch":arch,"kind":"static","dockerVersion":version,"sources":{format!("docker-{version}.tgz"):url}}),
+        )?,
+    )?;
     // tgz 内为 docker/ 目录，保持原样（install-docker.sh 会解压处理）
     let imported = import_docker_pkgs_sync(app, &[tmp.to_string_lossy().into_owned()], arch)?;
     let id = format!("pkg-{arch}-static-{version}");
@@ -585,6 +679,7 @@ fn download_docker_static_sync(
         imported_at: meta.imported_at,
         os_family: meta.os_family,
         os_version: meta.os_version,
+        sources: meta.sources,
     })
 }
 
@@ -593,10 +688,15 @@ fn download_docker_static_sync(
 pub async fn download_compose_plugin(
     app: AppHandle,
     arch: String,
+    task_id: Option<String>,
 ) -> AppResult<ComposePluginStatus> {
-    tauri::async_runtime::spawn_blocking(move || download_compose_plugin_sync(&app, &arch))
-        .await
-        .map_err(|e| AppError::Io(format!("下载任务异常: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let _task = crate::tasks::Session::begin(task_id)?;
+        let _storage = store::storage_lock(&app)?;
+        download_compose_plugin_sync(&app, &arch)
+    })
+    .await
+    .map_err(|e| AppError::Io(format!("下载任务异常: {e}")))?
 }
 
 fn download_compose_plugin_sync(app: &AppHandle, arch: &str) -> AppResult<ComposePluginStatus> {
@@ -640,21 +740,31 @@ fn download_compose_plugin_sync(app: &AppHandle, arch: &str) -> AppResult<Compos
             .unwrap_or(0)
     ));
     let _cleanup = crate::io_util::Cleanup(tmp.clone());
-    let _lock = crate::io_util::lock(&dst_dir.join(".compose.lock"))?;
+    let _lock = crate::io_util::lock(&root.join(".packages.lock"))?;
     crate::net::download(&settings, &url, &tmp, 300)?;
     let checksum = http_get_with_settings(&settings, &format!("{url}.sha256"), 30)?;
     let expected = checksum.split_whitespace().next().unwrap_or("");
     if expected != crate::io_util::sha256_file(&tmp)? {
         return Err(AppError::Invalid("Compose 下载 SHA256 不匹配".into()));
     }
-    verify_elf(&tmp, arch)?;
-    fs::rename(&tmp, dst_dir.join("docker-compose"))?;
+    let meta = ComposePluginMeta {
+        arch: arch.into(),
+        version: tag,
+        source: url,
+        size_bytes: tmp.metadata()?.len(),
+        sha256: expected.into(),
+    };
+    verify_compose_file(&tmp, &meta, arch)?;
+    publish_compose(&tmp, &dst_dir, &meta)?;
     let file = dst_dir.join("docker-compose");
     Ok(ComposePluginStatus {
         arch: arch.into(),
         installed: true,
         file: file.to_string_lossy().into_owned(),
         size_bytes: file.metadata().map(|m| m.len()).unwrap_or(0),
+        version: meta.version,
+        source: meta.source,
+        error: None,
     })
 }
 
@@ -757,6 +867,19 @@ fn validate_group(dir: &Path, m: &DockerPkgMeta) -> AppResult<()> {
     if m.files.is_empty() {
         return Err(AppError::Invalid("安装材料组为空".into()));
     }
+    let declared: std::collections::BTreeSet<_> = m.files.iter().cloned().collect();
+    if declared.len() != m.files.len() {
+        return Err(AppError::Invalid("材料清单包含重复文件".into()));
+    }
+    for entry in fs::read_dir(dir.join("packages"))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type()?.is_file() || !declared.contains(&name) {
+            return Err(AppError::Invalid(format!(
+                "材料组含未声明文件/目录 {name}，请清理后重新导入"
+            )));
+        }
+    }
     for name in &m.files {
         if Path::new(name)
             .file_name()
@@ -782,26 +905,63 @@ fn validate_group(dir: &Path, m: &DockerPkgMeta) -> AppResult<()> {
             {
                 return Err(AppError::Invalid("本机安装材料缺少有效组件角色".into()));
             }
-            verify_native(&p, &m.kind)?;
+            let native = verify_native(&p, &m.kind)?;
+            validate_native_metadata(&native, &m.arch, &m.engine_version, &m.components[name])?;
+            if m.native_packages.get(name).is_some_and(|saved| {
+                saved.name != native.name
+                    || saved.version != native.version
+                    || saved.arch != native.arch
+            }) {
+                return Err(AppError::Invalid("安装包实际元信息与入库记录不一致".into()));
+            }
         }
     }
     Ok(())
 }
 
+/// Only declared, validated files are deliverable. Equal basenames must have equal content.
+pub fn package_inventory(dirs: &[PathBuf]) -> AppResult<Vec<(PathBuf, String, String)>> {
+    let mut files = std::collections::BTreeMap::new();
+    for dir in dirs {
+        let m: DockerPkgMeta = serde_json::from_slice(&fs::read(dir.join("meta.json"))?)?;
+        for name in m.files {
+            let sha = m
+                .sha256
+                .get(&name)
+                .ok_or_else(|| AppError::Invalid("材料缺少 SHA256".into()))?
+                .clone();
+            if let Some((_, previous)) = files.get(&name) {
+                if previous != &sha {
+                    return Err(AppError::Invalid(format!(
+                        "安装材料同名文件 {name} 内容冲突"
+                    )));
+                }
+            } else {
+                files.insert(name.clone(), (dir.join("packages").join(name), sha));
+            }
+        }
+    }
+    Ok(files
+        .into_iter()
+        .map(|(name, (path, sha))| (path, name, sha))
+        .collect())
+}
+
 /// compose 插件路径（按 arch）
-pub fn compose_plugin_path(app: &AppHandle, arch: &str) -> Option<PathBuf> {
-    let root = pkg_root(app).ok()?;
-    let f = root.join("compose").join(arch).join("docker-compose");
-    verify_elf(&f, arch).is_ok().then_some(f)
+pub fn compose_plugin_path(app: &AppHandle, arch: &str) -> AppResult<PathBuf> {
+    let dir = pkg_root(app)?.join("compose").join(arch);
+    verify_compose_at(&dir, arch)?;
+    Ok(dir.join("docker-compose"))
 }
 
 pub fn verify_elf(path: &Path, arch: &str) -> AppResult<()> {
-    use std::io::Read;
-    let mut head = [0; 20];
-    std::fs::File::open(path)?.read_exact(&mut head)?;
-    verify_elf_header(&head, arch)
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    verify_elf_stream(file, size, arch)
 }
-fn verify_elf_header(h: &[u8; 20], arch: &str) -> AppResult<()> {
+fn verify_elf_stream(mut reader: impl std::io::Read, size: u64, arch: &str) -> AppResult<()> {
+    let mut h = [0; 64];
+    reader.read_exact(&mut h)?;
     let machine = u16::from_le_bytes([h[18], h[19]]);
     let expected = match arch {
         "amd64" => 62,
@@ -811,15 +971,109 @@ fn verify_elf_header(h: &[u8; 20], arch: &str) -> AppResult<()> {
         "sw64" => 0x9916,
         _ => 0,
     };
-    if &h[..4] != b"\x7fELF" || h[4] != 2 || h[5] != 1 || machine != expected || expected == 0 {
+    let u16_at = |n| u16::from_le_bytes(h[n..n + 2].try_into().unwrap());
+    let u64_at = |n| u64::from_le_bytes(h[n..n + 8].try_into().unwrap());
+    if &h[..4] != b"\x7fELF"
+        || h[4] != 2
+        || h[5] != 1
+        || h[6] != 1
+        || machine != expected
+        || expected == 0
+        || ![2, 3].contains(&u16_at(16))
+        || h[20..24] != [1, 0, 0, 0]
+        || u16_at(52) != 64
+        || u16_at(54) != 56
+        || u16_at(56) == 0
+        || u16_at(56) > 4096
+    {
         return Err(AppError::Invalid(format!(
             "不是 {arch} 的 64 位 Linux ELF 可执行文件"
         )));
     }
+    let phoff = u64_at(32);
+    let phend = phoff
+        .checked_add(u16_at(56) as u64 * 56)
+        .ok_or_else(|| AppError::Invalid("ELF 范围溢出".into()))?;
+    let shoff = u64_at(40);
+    if phoff < 64
+        || phend > size
+        || phoff > 16 * 1024 * 1024
+        || (u16_at(60) > 0
+            && (u16_at(58) != 64
+                || shoff < 64
+                || shoff
+                    .checked_add(u16_at(60) as u64 * 64)
+                    .is_none_or(|end| end > size)))
+    {
+        return Err(AppError::Invalid("ELF 文件截断或段表无效".into()));
+    }
+    let skipped = std::io::copy(
+        &mut std::io::Read::take(&mut reader, phoff - 64),
+        &mut std::io::sink(),
+    )?;
+    if skipped != phoff - 64 {
+        return Err(AppError::Invalid("ELF 文件截断".into()));
+    }
+    let mut executable = false;
+    for _ in 0..u16_at(56) {
+        let mut p = [0; 56];
+        reader.read_exact(&mut p)?;
+        let kind = u32::from_le_bytes(p[..4].try_into().unwrap());
+        let flags = u32::from_le_bytes(p[4..8].try_into().unwrap());
+        let off = u64::from_le_bytes(p[8..16].try_into().unwrap());
+        let len = u64::from_le_bytes(p[32..40].try_into().unwrap());
+        let mem = u64::from_le_bytes(p[40..48].try_into().unwrap());
+        if off.checked_add(len).is_none_or(|end| end > size) || (kind == 1 && mem < len) {
+            return Err(AppError::Invalid("ELF 加载段超出文件范围".into()));
+        }
+        executable |= kind == 1 && flags & 1 != 0 && len > 0;
+    }
+    if !executable {
+        return Err(AppError::Invalid("ELF 缺少可执行加载段".into()));
+    }
+    // Consume the whole stream to check truncation and gzip CRC of static archives.
+    let remaining = std::io::copy(&mut reader, &mut std::io::sink())?;
+    if remaining != size - phend {
+        return Err(AppError::Invalid("ELF 文件截断".into()));
+    }
     Ok(())
 }
+
+fn publish_compose(src: &Path, dst: &Path, meta: &ComposePluginMeta) -> AppResult<()> {
+    let stage = crate::io_util::unique_sibling(dst);
+    let _cleanup = crate::io_util::Cleanup(stage.clone());
+    fs::create_dir_all(&stage)?;
+    crate::io_util::copy_atomic(src, &stage.join("docker-compose"))?;
+    crate::io_util::atomic_write(&stage.join("meta.json"), &serde_json::to_vec_pretty(meta)?)?;
+    verify_compose_at(&stage, &meta.arch)?;
+    crate::io_util::commit_directory(&stage, dst)
+}
+pub fn verify_compose_at(dir: &Path, arch: &str) -> AppResult<ComposePluginMeta> {
+    let m: ComposePluginMeta =
+        serde_json::from_slice(&fs::read(dir.join("meta.json")).map_err(|_| {
+            AppError::Invalid("Compose 缺少校验元数据，请重新下载或带声明导入".into())
+        })?)?;
+    verify_compose_file(&dir.join("docker-compose"), &m, arch)?;
+    Ok(m)
+}
+fn verify_compose_file(path: &Path, m: &ComposePluginMeta, arch: &str) -> AppResult<()> {
+    if m.arch != arch
+        || m.version.is_empty()
+        || !m
+            .version
+            .trim_start_matches('v')
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.')
+        || m.size_bytes != path.metadata()?.len()
+        || m.sha256 != crate::io_util::sha256_file(path)?
+    {
+        return Err(AppError::Invalid(
+            "Compose 版本/架构/大小/SHA256 校验失败".into(),
+        ));
+    }
+    verify_elf(path, arch)
+}
 pub fn verify_static(path: &Path, arch: &str) -> AppResult<()> {
-    use std::io::Read;
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(std::fs::File::open(path)?));
     let mut found = std::collections::HashSet::new();
     for entry in tar.entries()? {
@@ -836,10 +1090,11 @@ pub fn verify_static(path: &Path, arch: &str) -> AppResult<()> {
             return Err(AppError::Invalid("静态包含不安全路径/链接".into()));
         }
         if e.header().entry_type().is_file() {
-            let mut h = [0; 20];
-            e.read_exact(&mut h)?;
-            verify_elf_header(&h, arch)?;
-            found.insert(p.to_string_lossy().into_owned());
+            let size = e.size();
+            verify_elf_stream(&mut e, size, arch)?;
+            if !found.insert(p.to_string_lossy().into_owned()) {
+                return Err(AppError::Invalid("静态包内有重复二进制".into()));
+            }
         }
     }
     if [
@@ -859,14 +1114,286 @@ pub fn verify_static(path: &Path, arch: &str) -> AppResult<()> {
             "静态包缺 Docker/containerd/runc 等必需二进制".into(),
         ));
     }
+    // Read past tar end markers so a damaged gzip trailer/CRC cannot be ignored.
+    std::io::copy(&mut tar.into_inner(), &mut std::io::sink())?;
     Ok(())
 }
-fn verify_native(path: &Path, kind: &str) -> AppResult<()> {
-    use std::io::Read;
+pub fn verify_native(path: &Path, kind: &str) -> AppResult<NativePackageInfo> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path)?;
+    let size = file.metadata()?.len();
     let mut h = [0; 8];
-    std::fs::File::open(path)?.read_exact(&mut h)?;
-    if kind == "rpm" && h[..4] != [0xed, 0xab, 0xee, 0xdb] || kind == "deb" && &h != b"!<arch>\n" {
+    file.read_exact(&mut h)?;
+    if !["rpm", "deb"].contains(&kind)
+        || kind == "rpm" && h[..4] != [0xed, 0xab, 0xee, 0xdb]
+        || kind == "deb" && &h != b"!<arch>\n"
+    {
         return Err(AppError::Invalid("安装包格式与声明不一致".into()));
     }
+    if kind == "deb" {
+        let mut control = None;
+        let mut members = std::collections::HashSet::new();
+        let mut position = 8;
+        while position < size {
+            crate::tasks::check()?;
+            let mut head = [0; 60];
+            file.read_exact(&mut head)?;
+            if &head[58..] != b"`\n" {
+                return Err(AppError::Invalid("DEB ar 文件头损坏".into()));
+            }
+            let name = std::str::from_utf8(&head[..16])
+                .map_err(|_| AppError::Invalid("DEB 文件名无效".into()))?
+                .trim()
+                .trim_end_matches('/');
+            let len: u64 = std::str::from_utf8(&head[48..58])
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or_else(|| AppError::Invalid("DEB 成员长度无效".into()))?;
+            position += 60;
+            if len == 0
+                || position
+                    .checked_add(len)
+                    .and_then(|n| n.checked_add(len % 2))
+                    .is_none_or(|end| end > size)
+                || !members.insert(name.to_string())
+            {
+                return Err(AppError::Invalid("DEB 文件截断或成员重复".into()));
+            }
+            if name == "debian-binary" {
+                let mut version = [0; 4];
+                if len != 4 {
+                    return Err(AppError::Invalid("DEB 格式版本无效".into()));
+                }
+                file.read_exact(&mut version)?;
+                if &version != b"2.0\n" {
+                    return Err(AppError::Invalid("DEB 格式版本无效".into()));
+                }
+            } else if name.starts_with("control.tar") || name.starts_with("data.tar") {
+                if len < 16 {
+                    return Err(AppError::Invalid("DEB 控制或数据归档截断".into()));
+                }
+                let mut magic = [0; 6];
+                file.read_exact(&mut magic)?;
+                let supported = match name.rsplit('.').next() {
+                    Some("gz") => magic[..2] == [0x1f, 0x8b],
+                    Some("xz") => magic == [0xfd, b'7', b'z', b'X', b'Z', 0],
+                    Some("zst") => magic[..4] == [0x28, 0xb5, 0x2f, 0xfd],
+                    Some("bz2") => &magic[..3] == b"BZh",
+                    Some("tar") => len >= 1024,
+                    _ => false,
+                };
+                if !supported {
+                    return Err(AppError::Invalid("DEB 归档格式与扩展名不符".into()));
+                }
+                if name.starts_with("control.tar") {
+                    if len > 4 * 1024 * 1024 {
+                        return Err(AppError::Invalid("DEB 控制归档过大".into()));
+                    }
+                    file.seek(SeekFrom::Start(position))?;
+                    control = Some(read_deb_control((&mut file).take(len), name)?);
+                }
+            } else {
+                return Err(AppError::Invalid("DEB 含未支持的成员".into()));
+            }
+            position += len + (len % 2);
+            file.seek(SeekFrom::Start(position))?;
+        }
+        if !members.contains("debian-binary")
+            || members
+                .iter()
+                .filter(|n| n.starts_with("control.tar"))
+                .count()
+                != 1
+            || members.iter().filter(|n| n.starts_with("data.tar")).count() != 1
+        {
+            return Err(AppError::Invalid("DEB 缺少控制/数据归档".into()));
+        }
+        return control.ok_or_else(|| AppError::Invalid("DEB 缺少控制元信息".into()));
+    } else if kind == "rpm" {
+        if h[4] != 3 || size < 128 {
+            return Err(AppError::Invalid("RPM lead 无效/截断".into()));
+        }
+        let mut offset = 96;
+        let mut fields = std::collections::BTreeMap::new();
+        for index in 0..2 {
+            crate::tasks::check()?;
+            file.seek(SeekFrom::Start(offset))?;
+            let mut head = [0; 16];
+            file.read_exact(&mut head)?;
+            if head[..4] != [0x8e, 0xad, 0xe8, 1] {
+                return Err(AppError::Invalid("RPM header 无效".into()));
+            }
+            let entries = u32::from_be_bytes(head[8..12].try_into().unwrap()) as u64;
+            let data = u32::from_be_bytes(head[12..].try_into().unwrap()) as u64;
+            if entries == 0 || entries > 100000 || data > 64 * 1024 * 1024 {
+                return Err(AppError::Invalid("RPM 元信息范围无效".into()));
+            }
+            let end = offset
+                .checked_add(16 + entries * 16 + data)
+                .filter(|end| *end < size)
+                .ok_or_else(|| AppError::Invalid("RPM 文件截断".into()))?;
+            let data_start = offset + 16 + entries * 16;
+            let mut records = vec![];
+            for _ in 0..entries {
+                let mut record = [0; 16];
+                file.read_exact(&mut record)?;
+                let at = u32::from_be_bytes(record[8..12].try_into().unwrap()) as u64;
+                if at >= data {
+                    return Err(AppError::Invalid("RPM 元信息越界".into()));
+                }
+                if index == 1 {
+                    records.push(record);
+                }
+            }
+            if index == 1 {
+                file.seek(SeekFrom::Start(data_start))?;
+                let mut store = vec![0; data as usize];
+                file.read_exact(&mut store)?;
+                for record in records {
+                    let tag = u32::from_be_bytes(record[..4].try_into().unwrap());
+                    let ty = u32::from_be_bytes(record[4..8].try_into().unwrap());
+                    let at = u32::from_be_bytes(record[8..12].try_into().unwrap()) as usize;
+                    let count = u32::from_be_bytes(record[12..16].try_into().unwrap());
+                    if [1000, 1001, 1022].contains(&tag) {
+                        if ty != 6 || count != 1 || fields.contains_key(&tag) {
+                            return Err(AppError::Invalid("RPM 包元信息类型无效/重复".into()));
+                        }
+                        let value = store[at..]
+                            .split(|b| *b == 0)
+                            .next()
+                            .filter(|s| {
+                                !s.is_empty() && s.len() < 4096 && at + s.len() < store.len()
+                            })
+                            .ok_or_else(|| AppError::Invalid("RPM 字符串元信息截断".into()))?;
+                        fields.insert(
+                            tag,
+                            std::str::from_utf8(value)
+                                .map_err(|_| AppError::Invalid("RPM 元信息编码无效".into()))?
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            offset = if index == 0 { (end + 7) & !7 } else { end };
+        }
+        if size - offset < 16 {
+            return Err(AppError::Invalid("RPM 缺少有效 payload".into()));
+        }
+        return Ok(NativePackageInfo {
+            name: fields
+                .remove(&1000)
+                .ok_or_else(|| AppError::Invalid("RPM 缺少包名".into()))?,
+            version: fields
+                .remove(&1001)
+                .ok_or_else(|| AppError::Invalid("RPM 缺少版本".into()))?,
+            arch: fields
+                .remove(&1022)
+                .ok_or_else(|| AppError::Invalid("RPM 缺少架构".into()))?,
+        });
+    }
+    Err(AppError::Invalid("安装包类型无效".into()))
+}
+
+fn validate_native_metadata(
+    info: &NativePackageInfo,
+    arch: &str,
+    engine_version: &str,
+    role: &str,
+) -> AppResult<()> {
+    if crate::image_archive::normalize_arch(&info.arch)
+        != crate::image_archive::normalize_arch(arch)
+        && !(role == "dependency" && ["all", "noarch"].contains(&info.arch.as_str()))
+    {
+        return Err(AppError::Invalid(format!(
+            "{} 实际架构 {} 与声明 {arch} 不符",
+            info.name, info.arch
+        )));
+    }
+    let version = info
+        .version
+        .rsplit(':')
+        .next()
+        .unwrap_or_default()
+        .split(['-', '+', '~'])
+        .next()
+        .unwrap_or_default();
+    if ["engine", "cli"].contains(&role) && version != engine_version {
+        return Err(AppError::Invalid(format!(
+            "{} 实际版本 {} 与兼容引擎 {engine_version} 不符",
+            info.name, info.version
+        )));
+    }
+    let engine =
+        ["docker-ce", "docker-engine", "moby-engine", "docker.io"].contains(&info.name.as_str());
+    let cli =
+        ["docker-ce-cli", "docker-cli", "moby-cli", "docker.io"].contains(&info.name.as_str());
+    let containerd = ["containerd.io", "containerd"].contains(&info.name.as_str());
+    if role == "engine" && !engine
+        || role == "cli" && !cli
+        || role == "containerd" && !containerd
+        || role == "dependency" && (engine || cli || containerd)
+    {
+        return Err(AppError::Invalid(format!(
+            "{} 实际包名不符合组件角色 {role}",
+            info.name
+        )));
+    }
     Ok(())
+}
+
+fn read_deb_control(reader: impl std::io::Read, name: &str) -> AppResult<NativePackageInfo> {
+    use std::io::Read;
+    let decoder: Box<dyn Read> = match name.rsplit('.').next() {
+        Some("gz") => Box::new(flate2::read::GzDecoder::new(reader)),
+        Some("xz") => Box::new(xz2::read::XzDecoder::new_stream(
+            reader,
+            xz2::stream::Stream::new_stream_decoder(64 * 1024 * 1024, 0)
+                .map_err(|e| AppError::Invalid(format!("XZ 解压初始化失败: {e}")))?,
+        )),
+        Some("zst") => Box::new(zstd::stream::read::Decoder::new(reader)?),
+        Some("bz2") => Box::new(bzip2::read::BzDecoder::new(reader)),
+        Some("tar") => Box::new(reader),
+        _ => return Err(AppError::Invalid("DEB 控制归档格式不支持".into())),
+    };
+    let mut bytes = vec![];
+    decoder.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err(AppError::Invalid("DEB 解压控制归档过大".into()));
+    }
+    let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+    let mut control = None;
+    for entry in archive.entries()? {
+        crate::tasks::check()?;
+        let mut entry = entry?;
+        if entry.path()?.file_name().is_some_and(|n| n == "control") {
+            if control.is_some() || !entry.header().entry_type().is_file() || entry.size() > 65536 {
+                return Err(AppError::Invalid("DEB control 重复/无效".into()));
+            }
+            let mut text = String::new();
+            entry.read_to_string(&mut text)?;
+            control = Some(text);
+        }
+    }
+    let text = control.ok_or_else(|| AppError::Invalid("DEB control 文件缺失".into()))?;
+    let mut fields = std::collections::BTreeMap::new();
+    for line in text.lines().filter(|line| !line.starts_with([' ', '\t'])) {
+        if let Some((key, value)) = line.split_once(':') {
+            if ["Package", "Version", "Architecture"].contains(&key)
+                && fields.insert(key, value.trim().to_string()).is_some()
+            {
+                return Err(AppError::Invalid("DEB control 字段重复".into()));
+            }
+        }
+    }
+    let mut get = |key| {
+        fields
+            .remove(key)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| AppError::Invalid(format!("DEB 缺少 {key}")))
+    };
+    Ok(NativePackageInfo {
+        name: get("Package")?,
+        version: get("Version")?,
+        arch: get("Architecture")?,
+    })
 }

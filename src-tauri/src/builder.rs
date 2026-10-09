@@ -915,52 +915,44 @@ fn build_server(
             &server.os_version,
         )?;
 
-        let mut copied = 0u32;
-        for pkg_dir in &pkg_dirs {
-            let pkgs_src = pkg_dir.join("packages");
-            for entry in fs::read_dir(&pkgs_src)? {
-                let entry = entry?;
-                if !entry.path().is_file() {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') {
-                    continue;
-                }
-                crate::io_util::require_space(
-                    &sdir,
-                    entry.metadata()?.len().saturating_mul(2) + 128 * 1024 * 1024,
-                )?;
-                fs::copy(
-                    entry.path(),
-                    sdir.join("docker-offline/packages").join(&name),
-                )?;
-                copied += 1;
+        let inventory = crate::docker_pkgs::package_inventory(&pkg_dirs)?;
+        let mut materials = vec![];
+        for (src, name, sha) in &inventory {
+            crate::io_util::require_space(
+                &sdir,
+                src.metadata()?.len().saturating_mul(2) + 128 * 1024 * 1024,
+            )?;
+            let dst = sdir.join("docker-offline/packages").join(name);
+            copy_file_with_progress(app, src, &dst, name)?;
+            if crate::io_util::sha256_file(&dst)? != *sha {
+                return Err(AppError::Invalid(format!("交付材料 {name} 复制后校验失败")));
             }
+            materials.push(json!({"file":name,"sha256":sha,"sizeBytes":dst.metadata()?.len()}));
         }
         emit(
             app,
             "docker-pkg",
             &format!(
-                "Docker 安装材料：{} 个组（{copied} 个文件）",
-                pkg_dirs.len()
+                "Docker 安装材料：{} 个组（{} 个文件）",
+                pkg_dirs.len(),
+                inventory.len()
             ),
         );
         // compose 插件（独立按 arch 匹配）
-        match crate::docker_pkgs::compose_plugin_path(app, &server.arch) {
-            Some(p) => {
-                fs::copy(
-                    &p,
-                    sdir.join("docker-offline/packages").join("docker-compose"),
-                )?;
-            }
-            None => {
-                return Err(AppError::Invalid(format!(
-                    "{} 缺少 {} 的 Compose 插件",
-                    server.name, server.arch
-                )))
-            }
+        let plugin = crate::docker_pkgs::compose_plugin_path(app, &server.arch)?;
+        let plugin_meta =
+            crate::docker_pkgs::verify_compose_at(plugin.parent().unwrap(), &server.arch)?;
+        let dst = sdir.join("docker-offline/packages/docker-compose");
+        copy_file_with_progress(app, &plugin, &dst, "Compose")?;
+        if crate::io_util::sha256_file(&dst)? != plugin_meta.sha256 {
+            return Err(AppError::Invalid("Compose 交付副本校验失败".into()));
         }
+        fs::write(
+            sdir.join("docker-offline/materials.json"),
+            serde_json::to_vec_pretty(
+                &json!({"packages":materials,"groups":pkg_dirs.iter().map(|p| fs::read(p.join("meta.json")).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).map_err(std::io::Error::other))).collect::<Result<Vec<_>,_>>()?,"compose":plugin_meta}),
+            )?,
+        )?;
     } // end if !is_upgrade
 
     // ---- 渲染并写文件 ----

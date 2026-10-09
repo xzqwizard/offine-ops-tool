@@ -11,6 +11,7 @@ export interface DockerPkgEntry {
   sizeBytes: number
   files: string[]
   importedAt: string
+  sources: Record<string, string>
 }
 
 export interface ComposePluginStatus {
@@ -18,6 +19,9 @@ export interface ComposePluginStatus {
   installed: boolean
   file: string
   sizeBytes: number
+  version: string
+  source: string
+  error: string | null
 }
 
 export interface ImportResult {
