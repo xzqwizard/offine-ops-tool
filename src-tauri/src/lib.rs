@@ -18,6 +18,7 @@ pub mod models;
 mod net;
 pub mod render_context;
 pub mod store;
+pub mod tasks;
 pub mod validation;
 pub mod xlsx_export;
 
@@ -46,6 +47,7 @@ pub fn run() {
             builder::build_offline_package,
             docker_versions::list_docker_versions,
             net::test_network,
+            tasks::cancel_task,
             engine::engine_status,
             engine::engine_install,
             images::inspect_image,

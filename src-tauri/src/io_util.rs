@@ -18,7 +18,22 @@ pub fn lock(path: &Path) -> AppResult<File> {
         .read(true)
         .write(true)
         .open(path)?;
-    f.lock_exclusive()?;
+    let start = std::time::Instant::now();
+    loop {
+        crate::tasks::check()?;
+        match f.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if start.elapsed().as_secs() > 300 {
+                    return Err(AppError::Io(
+                        "等待材料/存储锁超过 300 秒，请稍后重试".into(),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
     Ok(f)
 }
 
@@ -53,6 +68,7 @@ pub fn sha256_file(path: &Path) -> AppResult<String> {
     let mut h = Sha256::new();
     let mut buf = vec![0; 1024 * 1024];
     loop {
+        crate::tasks::check()?;
         let n = f.read(&mut buf)?;
         if n == 0 {
             break;
@@ -85,6 +101,16 @@ pub fn require_space(path: &Path, bytes: u64) -> AppResult<()> {
 
 /// Deletes only this guard's unique staging path, including on early error.
 pub struct Cleanup(pub PathBuf);
+pub struct CheckedWriter<W>(pub W);
+impl<W: Write> Write for CheckedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        crate::tasks::check().map_err(std::io::Error::other)?;
+        self.0.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
 impl Drop for Cleanup {
     fn drop(&mut self) {
         if self.0.is_dir() {
@@ -103,8 +129,42 @@ pub fn copy_atomic(src: &Path, dst: &Path) -> AppResult<()> {
     let _cleanup = Cleanup(tmp.clone());
     let mut reader = File::open(src)?;
     let mut writer = File::create(&tmp)?;
-    std::io::copy(&mut reader, &mut writer)?;
+    let mut buf = vec![0; 1024 * 1024];
+    loop {
+        crate::tasks::check()?;
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+    }
     writer.sync_all()?;
     fs::rename(tmp, dst)?;
+    Ok(())
+}
+
+/// Publish files and their metadata together under the caller's library lock.
+/// If publication fails, restore the previous directory and retain it on rollback failure.
+pub fn commit_directory(stage: &Path, dst: &Path) -> AppResult<()> {
+    let backup = unique_sibling(dst);
+    let had_old = dst.exists();
+    if had_old {
+        fs::rename(dst, &backup)?;
+    }
+    if let Err(e) = fs::rename(stage, dst) {
+        if had_old {
+            if let Err(rollback) = fs::rename(&backup, dst) {
+                return Err(AppError::Io(format!(
+                    "材料落位失败: {e}；旧材料恢复失败: {rollback}，保留于 {}",
+                    backup.display()
+                )));
+            }
+        }
+        return Err(e.into());
+    }
+    if had_old {
+        // Publication is committed; leftover backup cleanup must not report a failed write.
+        let _ = fs::remove_dir_all(backup);
+    }
     Ok(())
 }

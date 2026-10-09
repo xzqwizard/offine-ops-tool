@@ -2306,6 +2306,7 @@ dependencies = [
  "flate2",
  "fs2",
  "hex",
+ "libc",
  "minijinja",
  "rust_xlsxwriter",
  "serde",
