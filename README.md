@@ -9,10 +9,10 @@ Windows 桌面工具，用于整理服务器/中间件方案，准备 Docker 安
 | 方案和中间件目录 | 导入、复制、模板冻结、后端校验；本机凭据用 Windows DPAPI 加密 | 便携导出、ZIP 备份、构建快照不含仓库/代理/中间件密码；导入后需重新填写 |
 | 镜像 | 按来源/平台/digest 隔离缓存，验证 tar 标签、平台、层和校验和；缺镜像阻断构建 | 在线拉取需要 crane；本地 docker-save tar 不能证明远端仓库 digest |
 | 安装材料 | amd64/arm64 官方静态包与 Compose 在线下载；RPM/DEB 需同 OS、版本、架构和组件声明；其它架构手工导入 | 导入静态包校验 ELF；信创发行版、内核和包依赖需在目标机验收 |
-| 构建和现场脚本 | 完整包门禁、稳定身份、SHA256、升级前冷备、失败自动回退、按来源限制 Docker 端口 | Windows 模拟流程已覆盖；真实容器和防火墙由 Linux CI / 目标机验收 |
+| 构建和现场脚本 | 完整包门禁、稳定身份、SHA256、升级前冷备、失败自动回退、按来源限制 Docker 端口 | Linux 目标机已验证 TCP 来源限制及 PostgreSQL 恢复/升级/回滚；其它中间件需专项验收 |
 | 签名 | 尚未实现 | 开启签名的方案会被后端拒绝，不能误标为已签名交付 |
 
-`docs/代码审查与业务闭环核查-2026-10-02.md` 记录原始审查及本轮修复状态。方案设计见 `docs/方案设计.md`。
+本次审查、修复映射和验收证据见 [代码审查与业务闭环核查-2026-10-09](docs/代码审查与业务闭环核查-2026-10-09.md)。旧部署/安装材料的兼容处理见 [迁移与材料准备指南](docs/迁移与材料准备指南-2026-10-09.md)，当前能力见 [功能清单](docs/功能清单.md)。2026-10-02 报告保留历史记录。
 
 ## 开发和验证
 
@@ -30,7 +30,7 @@ cargo test --locked
 
 本地桌面运行：`pnpm tauri dev`。前端单独用 `pnpm dev` 可预览界面，但 Tauri 命令不会在普通浏览器中执行。
 
-GitHub Actions 的 `.github/workflows/verify.yml` 在 Ubuntu 上增加了真实 Docker 部署、重复部署、来源允许/拒绝、PostgreSQL 数据冷备/恢复、升级和回滚冒烟测试。此工作流的实际结果以首次 CI 运行记录为准。其它数据库、中间件、国产 OS/架构与生产防火墙后端仍需使用真实镜像/硬件和业务数据逐项验收。
+GitHub Actions 的 `.github/workflows/verify.yml` 在 Ubuntu 上分别执行 network、operations、identity 真实 Docker 场景，覆盖部署重跑、来源允许/拒绝与持久化、PostgreSQL SQL 冷备/恢复、改名升级及回滚、同 tag 内容并存与 tag 漂移恢复。审查修复已按功能点分批提交并推送至 `origin/main`；新工作流的远端状态以 [GitHub Actions](https://github.com/xzqwizard/offine-ops-tool/actions/workflows/verify.yml) 对应提交的结果为准。本次目标 Linux 隔离验收见审查报告。其它数据库、中间件、国产 OS/架构与生产防火墙后端仍需对应环境专项验收。
 
 ## RPM/DEB 材料声明
 
@@ -53,6 +53,8 @@ GitHub Actions 的 `.github/workflows/verify.yml` 在 Ubuntu 上增加了真实 
 
 ## 交付约束
 
-全量包每台服务器包含 `manifest.json`、`SHA256SUMS`、`deployment.env`、`docker-offline/`、`images/`、`stack/`、`scripts/` 和 `docs/`。增量包包含新编排/脚本/文档及变化镜像，必须绑定当前已部署构建号。失败构建会出现在历史中，但不能作为升级基线。打包模式默认快速 gzip；目录模式保留各服务器自身的 `SHA256SUMS`，不生成外层 `SHA256SUMS.all`。
+全量包每台服务器包含 `manifest.json`、`SHA256SUMS`、`deployment.env`、`docker-offline/`、`images/`、`stack/`、`scripts/` 和 `docs/`。运行镜像引用按实际 config SHA256 隔离，数据绑定目录按稳定实例 ID；manifest 同时记录原始来源和存储契约。增量包包含新编排/脚本/文档及变化镜像，必须绑定当前已部署构建号。旧基线、跨服务器移动或持久化兼容性变化需要显式迁移。失败构建不能作为升级基线。打包模式默认快速 gzip；目录模式保留各服务器自身的 `SHA256SUMS`，不生成外层 `SHA256SUMS.all`。
 
-Linux 现场按包内 `README.md` 和 `docs/OPS-GUIDE.md` 操作。冷备份在停止该方案服务后制作并校验；恢复会保留恢复前目录，管理员确认后清理。防火墙脚本仅支持 Docker IPv4 iptables `DOCKER-USER`，并需单独执行 `--apply`；无来源规则的发布端口将拒绝外部新连接。
+Linux 现场按包内 `README.md` 和 `docs/OPS-GUIDE.md` 操作。冷备按实际容器镜像 ID 和停止后的绑定目录制作并校验；恢复核对镜像及健康，保留恢复前目录。防火墙需 Docker IPv4 iptables `DOCKER-USER` 接入 FORWARD，同时覆盖宿主 INPUT 的代理路径；需单独执行 `--apply`，原生 Docker nftables 不支持。无来源规则的清单发布端口拒绝外部新连接，本机访问保留。预检在安装前进行，已有 Docker 不覆盖或重配。
+
+下载、构建和迁移纳入全局任务，支持跨页追踪、去重、取消及子进程截止时间。设置提供“复制并切换”存储根，校验后发布并保留旧根；普通保存仅切换目录。Compose 手工材料需要完整 `.compose.json` 声明，详见迁移指南。
