@@ -47,6 +47,7 @@ pub fn run() {
             builder::build_offline_package,
             docker_versions::list_docker_versions,
             net::test_network,
+            net::network_targets,
             tasks::cancel_task,
             engine::engine_status,
             engine::engine_install,

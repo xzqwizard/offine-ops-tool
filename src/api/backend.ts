@@ -115,16 +115,18 @@ export const backend = {
   },
 
   /** settings 传界面当前配置（未保存也可测）；缺省用已保存设置 */
-  async testNetwork(settings?: AppSettings): Promise<TestNetworkReport> {
-    return invoke<TestNetworkReport>('test_network', { settings: settings ?? null })
+  async networkTargets(settings: AppSettings): Promise<string[]> { return invoke('network_targets', { settings }) },
+  async cancelTask(taskId: string): Promise<void> { return invoke('cancel_task', { taskId }) },
+  async testNetwork(settings?: AppSettings, taskId?: string): Promise<TestNetworkReport> {
+    return invoke<TestNetworkReport>('test_network', { settings: settings ?? null, taskId: taskId ?? null })
   },
 
   async engineStatus(): Promise<EngineStatus> {
     return invoke<EngineStatus>('engine_status')
   },
 
-  async engineInstall(force: boolean): Promise<EngineStatus> {
-    return invoke<EngineStatus>('engine_install', { force })
+  async engineInstall(force: boolean, taskId?: string): Promise<EngineStatus> {
+    return invoke<EngineStatus>('engine_install', { force, taskId: taskId ?? null })
   },
 
   async inspectImage(image: string, registry?: RegistryConfig): Promise<ImageInspect> {
@@ -164,16 +166,16 @@ export const backend = {
     return invoke<void>('delete_docker_pkg', { dir })
   },
 
-  async importDockerPkgs(paths: string[], defaultArch: string): Promise<ImportResult> {
-    return invoke<ImportResult>('import_docker_pkgs', { paths, defaultArch })
+  async importDockerPkgs(paths: string[], defaultArch: string, taskId?: string): Promise<ImportResult> {
+    return invoke<ImportResult>('import_docker_pkgs', { paths, defaultArch, taskId: taskId ?? null })
   },
 
-  async downloadDockerStatic(arch: string, version: string): Promise<DockerPkgEntry> {
-    return invoke<DockerPkgEntry>('download_docker_static', { arch, version })
+  async downloadDockerStatic(arch: string, version: string, taskId?: string): Promise<DockerPkgEntry> {
+    return invoke<DockerPkgEntry>('download_docker_static', { arch, version, taskId: taskId ?? null })
   },
 
-  async downloadComposePlugin(arch: string): Promise<ComposePluginStatus> {
-    return invoke<ComposePluginStatus>('download_compose_plugin', { arch })
+  async downloadComposePlugin(arch: string, taskId?: string): Promise<ComposePluginStatus> {
+    return invoke<ComposePluginStatus>('download_compose_plugin', { arch, taskId: taskId ?? null })
   },
 
   async exportPortMatrixXlsx(project: Project, outputPath: string): Promise<string> {

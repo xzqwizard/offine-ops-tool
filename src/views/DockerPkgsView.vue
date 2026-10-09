@@ -1,15 +1,15 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog'
 import { backend, toAppError } from '@/api/backend'
 import type {
   DockerPkgEntry,
-  ComposePluginStatus,
-  DockerPkgDownloadEvent
+  ComposePluginStatus
 } from '@/types/dockerPkgs'
 import { OFFICIAL_DOCKER_ARCHES } from '@/types/project'
+import { useTaskStore } from '@/stores/tasks'
+const tasks = useTaskStore()
 
 const pkgs = ref<DockerPkgEntry[]>([])
 const composePlugins = ref<ComposePluginStatus[]>([])
@@ -17,7 +17,7 @@ const loading = ref(false)
 
 // 导入
 const importArch = ref('amd64')
-const importing = ref(false)
+const importing = computed(() => tasks.active.some(t => t.key === 'docker-material'))
 
 // 在线下载（版本从官方源拉取列表选择）
 const downloadArch = ref('amd64')
@@ -25,30 +25,15 @@ const downloadVersion = ref('')
 const dockerVersions = ref<string[]>([])
 const versionsLoading = ref(false)
 const versionsError = ref('')
-const downloading = ref(false)
-const downloadLogs = ref<string[]>([])
-
-let unlistenDownload: UnlistenFn | null = null
-let disposed = false
+const downloading = importing
+const downloadLogs = computed(() => tasks.latest('docker-material')?.logs ?? [])
+let versionsSeq = 0
 
 onMounted(async () => {
   loadDockerVersions(downloadArch.value)
   await refresh()
-  try {
-    const fn = await listen<DockerPkgDownloadEvent>('docker-pkg-download', (e) => {
-      downloadLogs.value.push(`[${e.payload.step}] ${e.payload.detail}`)
-    })
-    if (disposed) fn()
-    else unlistenDownload = fn
-  } catch {
-    /* 非 Tauri 环境忽略 */
-  }
 })
-
-onUnmounted(() => {
-  disposed = true
-  unlistenDownload?.()
-})
+watch(() => tasks.latest('docker-material')?.status, status => { if (status === 'complete') refresh() })
 
 // 切换架构自动刷新官方版本列表，默认选最新
 watch(downloadArch, (arch) => {
@@ -57,24 +42,28 @@ watch(downloadArch, (arch) => {
 })
 
 async function loadDockerVersions(arch: string) {
+  const seq = ++versionsSeq
   if (!OFFICIAL_DOCKER_ARCHES.includes(arch)) {
     dockerVersions.value = []
     versionsError.value = ''
+    versionsLoading.value = false
     return
   }
   versionsLoading.value = true
   versionsError.value = ''
   try {
     const list = await backend.listDockerVersions(arch)
+    if (seq !== versionsSeq || downloadArch.value !== arch) return
     dockerVersions.value = list
     if (list.length && !downloadVersion.value) {
       downloadVersion.value = list[0]
     }
   } catch (e) {
+    if (seq !== versionsSeq) return
     dockerVersions.value = []
     versionsError.value = toAppError(e).message
   } finally {
-    versionsLoading.value = false
+    if (seq === versionsSeq) versionsLoading.value = false
   }
 }
 
@@ -95,6 +84,7 @@ async function refresh() {
 const inTauri = '__TAURI_INTERNALS__' in window
 
 async function handleImport() {
+  if (importing.value) return
   if (!inTauri) {
     ElMessage.warning('文件选择仅支持桌面应用环境')
     return
@@ -113,19 +103,18 @@ async function handleImport() {
     })
     const paths = (Array.isArray(files) ? files : files ? [files] : []).filter(Boolean) as string[]
     if (!paths.length) return
-    importing.value = true
+    const arch = importArch.value
     try {
-      const result = await backend.importDockerPkgs(paths, importArch.value)
+      const result = await tasks.run('docker-material', '导入 Docker 材料', { paths, arch }, ['docker-pkg-download'], id => backend.importDockerPkgs(paths, arch, id))
       const parts: string[] = []
       if (result.createdDirs.length) parts.push(`新增 ${result.createdDirs.length} 组`)
       if (result.composeInstalled.length) parts.push(`compose 插件 ${result.composeInstalled.length} 个`)
       if (result.skipped.length) parts.push(`跳过 ${result.skipped.length} 个`)
       ElMessage.success(`导入完成：${parts.join('，') || '无变化'}`)
+      if (result.skipped.length) ElMessage.warning(result.skipped.join('；'))
       await refresh()
     } catch (e) {
       ElMessage.error(`导入失败: ${toAppError(e).message}`)
-    } finally {
-      importing.value = false
     }
   } catch (e) {
     ElMessage.error(`打开文件选择失败: ${toAppError(e).message}`)
@@ -133,35 +122,30 @@ async function handleImport() {
 }
 
 async function handleDownloadStatic() {
+  if (downloading.value) return
   const version = downloadVersion.value.trim()
   if (!version) {
     ElMessage.warning('请输入 Docker 版本（如 27.5.1）')
     return
   }
-  downloading.value = true
-  downloadLogs.value = []
+  const arch = downloadArch.value
   try {
-    const entry = await backend.downloadDockerStatic(downloadArch.value, version)
+    const entry = await tasks.run('docker-material', `下载 Docker ${version}/${arch}`, { arch, version }, ['docker-pkg-download'], id => backend.downloadDockerStatic(arch, version, id))
     ElMessage.success(`已下载：${entry.id}（${(entry.sizeBytes / 1048576).toFixed(1)} MB）`)
     await refresh()
   } catch (e) {
     ElMessage.error(`下载失败: ${toAppError(e).message}`)
-  } finally {
-    downloading.value = false
   }
 }
 
 async function handleDownloadCompose(arch: string) {
-  downloading.value = true
-  downloadLogs.value = []
+  if (downloading.value) return
   try {
-    await backend.downloadComposePlugin(arch)
+    await tasks.run('docker-material', `下载 Compose/${arch}`, { arch }, ['docker-pkg-download'], id => backend.downloadComposePlugin(arch, id))
     ElMessage.success(`compose 插件（${arch}）已就绪`)
     await refresh()
   } catch (e) {
     ElMessage.error(`下载失败: ${toAppError(e).message}`)
-  } finally {
-    downloading.value = false
   }
 }
 
@@ -228,8 +212,8 @@ const totalSize = computed(() => pkgs.value.reduce((s, p) => s + p.sizeBytes, 0)
             {{ importing ? '导入中…' : '选择文件导入（可多选 rpm/deb/tgz/compose）' }}
           </button>
           <div class="text-[10px] text-on-surface-variant/50 mt-2 leading-relaxed">
-            rpm/deb 从文件名自动识别架构与版本；官方静态包（docker-*.tgz）按左侧架构归组；
-            docker-compose-* 识别为 compose 插件；containerd 等附属包自动归入同架构依赖组
+            RPM/DEB 需同名 .pkg.json 声明 OS、兼容版本、组件及 SHA256，并核对包内元信息；
+            Compose 需同名 .compose.json 声明版本、架构、大小及 SHA256；静态包按所选架构核验全部必需二进制。
           </div>
         </div>
 
@@ -303,9 +287,9 @@ const totalSize = computed(() => pkgs.value.reduce((s, p) => s + p.sizeBytes, 0)
           class="flex items-center gap-3 bg-surface-container rounded-lg px-4 py-2 border border-outline-variant"
         >
           <span class="font-mono text-xs w-24">{{ c.arch }}</span>
-          <span v-if="c.installed" class="text-xs text-success">✓ 已就绪（{{ fmtSize(c.sizeBytes) }}）</span>
+          <span v-if="c.installed" class="text-xs text-success" :title="c.source">✓ {{ c.version }}（{{ fmtSize(c.sizeBytes) }}）</span>
           <template v-else>
-            <span class="text-xs text-on-surface-variant/50">未安装</span>
+            <span class="text-xs text-on-surface-variant/50" :title="c.error ?? ''">{{ c.error ? '校验失败，请重新导入或下载' : '未安装' }}</span>
             <button
               v-if="OFFICIAL_DOCKER_ARCHES.includes(c.arch)"
               class="text-xs text-primary hover:underline"
@@ -360,6 +344,9 @@ const totalSize = computed(() => pkgs.value.reduce((s, p) => s + p.sizeBytes, 0)
             <template #default="{ row }">
               <span class="font-mono text-xs">{{ fmtSize(row.sizeBytes) }}</span>
             </template>
+          </el-table-column>
+          <el-table-column label="来源" min-width="160" show-overflow-tooltip>
+            <template #default="{ row }">{{ Object.values(row.sources ?? {}).join('、') || '旧材料未记录来源' }}</template>
           </el-table-column>
           <el-table-column label="操作" width="70" align="center">
             <template #default="{ row }">

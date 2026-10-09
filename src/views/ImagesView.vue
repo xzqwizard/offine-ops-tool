@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { backend, toAppError } from '@/api/backend'
-import type { EngineStatus, CachedImage, ImagePullEvent } from '@/types/images'
+import type { EngineStatus, CachedImage } from '@/types/images'
+import { useTaskStore } from '@/stores/tasks'
+import { formatTime as fmtTime } from '@/utils/time'
 import { ARCH_OPTIONS } from '@/types/project'
 
 import { useProjectStore } from '@/stores/project'
@@ -13,12 +14,14 @@ const projectRegistry = computed(() => projectStore.project?.registry ?? undefin
 const engine = ref<EngineStatus | null>(null)
 
 // 拉取进度（百分比/速度，来自后端临时文件监视）
-const pullPercent = ref<number | null>(null)
-const pullSpeed = ref(0)
-const pullBytes = ref(0)
-const pullTotal = ref(0)
-const installing = ref(false)
-const installLogs = ref<string[]>([])
+const tasks = useTaskStore()
+const pullTask = computed(() => tasks.latest('image-pull'))
+const pullPercent = computed(() => pullTask.value?.progress?.percent ?? null)
+const pullSpeed = computed(() => pullTask.value?.progress?.speedBps ?? 0)
+const pullBytes = computed(() => pullTask.value?.progress?.bytes ?? 0)
+const pullTotal = computed(() => pullTask.value?.progress?.total ?? 0)
+const installing = computed(() => tasks.active.some(t => t.key === 'engine-install'))
+const installLogs = computed(() => tasks.latest('engine-install')?.logs ?? [])
 const cache = ref<CachedImage[]>([])
 const cacheUsage = ref<Map<string, string[]>>(new Map())
 const purging = ref(false)
@@ -26,51 +29,13 @@ const cacheLoading = ref(false)
 
 // 手动拉取表单
 const pullForm = ref({ image: '', arch: 'amd64' })
-const pulling = ref(false)
-const pullLogs = ref<string[]>([])
-
-let unlistenPull: UnlistenFn | null = null
-let unlistenProgress: UnlistenFn | null = null
-let disposed = false
-let activePullTask = ''
+const pulling = computed(() => tasks.active.some(t => t.key === 'image-pull'))
+const pullLogs = computed(() => pullTask.value?.logs ?? [])
+watch(() => tasks.latest('engine-install')?.result, result => { if (result) engine.value = result as EngineStatus })
+watch(() => pullTask.value?.status, status => { if (status === 'complete') refreshCache() })
 
 onMounted(async () => {
   await Promise.all([refreshEngine(), refreshCache()])
-  try {
-    const fn = await listen<ImagePullEvent>('image-pull', (e) => {
-      if (e.payload.taskId === activePullTask && pulling.value) pullLogs.value.push(e.payload.detail)
-    })
-    const fnProgress = await listen<{
-      taskId: string
-      reference: string
-      arch: string
-      bytes: number
-      total: number
-      percent: number
-      speedBps: number
-    }>('image-pull-progress', (e) => {
-      if (e.payload.taskId !== activePullTask || !pulling.value) return
-      pullPercent.value = e.payload.percent
-      pullSpeed.value = e.payload.speedBps
-      pullBytes.value = e.payload.bytes
-      pullTotal.value = e.payload.total
-    })
-    if (disposed) {
-      fn()
-      fnProgress()
-    } else {
-      unlistenPull = fn
-      unlistenProgress = fnProgress
-    }
-  } catch {
-    /* 非 Tauri 环境忽略 */
-  }
-})
-
-onUnmounted(() => {
-  disposed = true
-  unlistenPull?.()
-  unlistenProgress?.()
 })
 
 async function refreshEngine() {
@@ -99,22 +64,12 @@ async function refreshCache() {
 }
 
 async function installEngine(force = false) {
-  installing.value = true
-  installLogs.value = []
+  if (installing.value) return
   try {
-    const un = await listen<{ step: string; detail: string }>('engine-install', (e) => {
-      installLogs.value.push(`[${e.payload.step}] ${e.payload.detail}`)
-    })
-    try {
-      engine.value = await backend.engineInstall(force)
+      engine.value = await tasks.run('engine-install', '安装镜像引擎', { force }, ['engine-install'], id => backend.engineInstall(force, id))
       ElMessage.success(`crane ${engine.value.version ?? ''} 安装成功`)
-    } finally {
-      un()
-    }
   } catch (e) {
     ElMessage.error(`安装失败: ${toAppError(e).message}`)
-  } finally {
-    installing.value = false
   }
 }
 
@@ -125,27 +80,15 @@ async function handlePull() {
     return
   }
   if (pulling.value) return
-  activePullTask = crypto.randomUUID()
-  pulling.value = true
-  pullLogs.value = []
-  pullPercent.value = null
-  pullSpeed.value = 0
-  pullBytes.value = 0
-  pullTotal.value = 0
+  const registry = projectRegistry.value ? JSON.parse(JSON.stringify(projectRegistry.value)) : undefined
   try {
-    const r = await backend.pullImage(image.trim(), arch, projectRegistry.value ?? undefined, activePullTask)
-    if (r.cached) {
-      pullLogs.value.push(`缓存命中: ${r.cacheFile}`)
-    }
+    const r = await tasks.run('image-pull', `拉取镜像：${image.trim()}`, { image: image.trim(), arch }, ['image-pull', 'image-pull-progress'], id => backend.pullImage(image.trim(), arch, registry, id))
     ElMessage.success(
       r.cached ? '已存在于缓存' : `拉取完成（${r.source}，${(r.sizeBytes / 1048576).toFixed(1)} MB）`
     )
     await refreshCache()
   } catch (e) {
     ElMessage.error(`拉取失败: ${toAppError(e).message}`)
-  } finally {
-    pulling.value = false
-    pullPercent.value = null
   }
 }
 
@@ -217,9 +160,6 @@ function fmtSize(bytes: number): string {
   return `${(bytes / 1024).toFixed(0)} KB`
 }
 
-function fmtTime(iso: string): string {
-  return iso ? iso.replace('T', ' ').replace(/([+-]\d{2}:\d{2}|Z)$/, '') : '—'
-}
 </script>
 
 <template>
@@ -246,19 +186,22 @@ function fmtTime(iso: string): string {
             v-if="engine?.installed"
             class="px-4 py-1.5 rounded-lg text-xs font-bold border border-outline-variant text-on-surface-variant hover:border-primary hover:text-primary transition-colors"
             :disabled="installing"
-            @click="installEngine(true)"
+            @click="installEngine(false)"
           >
             检查更新
           </button>
           <button
             class="px-5 py-1.5 rounded-xl font-headline font-bold text-xs uppercase tracking-wider transition-all bg-gradient-to-br from-primary to-primary-dim text-on-primary hover:opacity-90 active:scale-95 disabled:opacity-30"
             :disabled="installing"
-            @click="installEngine(false)"
+            @click="installEngine(true)"
           >
             {{ installing ? '安装中…' : engine?.installed ? '重新下载' : '下载安装' }}
           </button>
         </div>
       </div>
+      <p v-if="engine?.lastError" class="text-xs text-error mt-2">{{ engine.lastError }}</p>
+      <p v-if="engine?.source" class="text-xs text-on-surface-variant mt-2 break-all">来源：{{ engine.source }}</p>
+      <p v-if="engine?.sha256" class="text-[10px] text-on-surface-variant mt-1 font-mono break-all">SHA256：{{ engine.sha256 }}</p>
       <div
         v-if="installLogs.length"
         class="mt-3 bg-surface-dim rounded-lg p-3 font-mono text-xs leading-relaxed overflow-y-auto max-h-32"

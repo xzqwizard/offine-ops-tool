@@ -107,10 +107,11 @@ pub fn http_get_with_settings(
     url: &str,
     timeout_secs: u64,
 ) -> AppResult<String> {
-    let output = curl_command(settings)
-        .args(["-fsSL", "--max-time", &timeout_secs.to_string(), url])
-        .output()
-        .map_err(|e| AppError::Io(e.to_string()))?;
+    let output = crate::tasks::output(
+        curl_command(settings).args(["-fsSL", "--max-time", &timeout_secs.to_string(), url]),
+        std::time::Duration::from_secs(timeout_secs + 5),
+        None,
+    )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let mut msg = stderr.trim().to_string();
@@ -153,7 +154,11 @@ fn probe(settings: &AppSettings, url: &str) -> ConnectivityResult {
         args.push(proxy);
     }
     args.push(url.into());
-    let out = curl_command(settings).args(&args).output();
+    let out = crate::tasks::output(
+        curl_command(settings).args(&args),
+        std::time::Duration::from_secs(20),
+        None,
+    );
     let latency = start.elapsed().as_millis() as u64;
     match out {
         Ok(o) if o.status.success() => {
@@ -202,7 +207,7 @@ pub struct TestNetworkReport {
 fn emit_test(app: &AppHandle, target: &str, state: &str, result: Option<&ConnectivityResult>) {
     let _ = app.emit(
         "net-test",
-        serde_json::json!({ "target": target, "state": state, "result": result }),
+        serde_json::json!({ "target": target, "state": state, "result": result, "taskId": crate::tasks::id() }),
     );
 }
 
@@ -216,28 +221,18 @@ fn emit_test(app: &AppHandle, target: &str, state: &str, result: Option<&Connect
 pub async fn test_network(
     app: AppHandle,
     settings: Option<AppSettings>,
+    task_id: Option<String>,
 ) -> AppResult<TestNetworkReport> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _task = crate::tasks::Session::begin(task_id)?;
         let settings = match settings {
             Some(s) => s,
             None => store::load_settings(&app)?,
         };
-        let proxy_used = proxy_url(&settings); // 探测开关判定用完整 URL
-        let mut targets: Vec<String> = Vec::new();
-        if proxy_used.is_some() {
-            targets.push("https://www.google.com/".into());
-        }
-        targets.push("https://auth.docker.io/token".into());
-        targets.push("https://registry-1.docker.io/v2/".into());
-        for mirror in &settings.registry_mirrors {
-            let host = crate::validation::normalize_host(mirror)?;
-            let url = format!("https://{host}/v2/");
-            if !targets.contains(&url) {
-                targets.push(url);
-            }
-        }
+        let targets = network_targets(settings.clone())?;
         let mut results = Vec::new();
         for url in targets {
+            crate::tasks::check()?;
             emit_test(&app, &url, "running", None);
             let r = probe(&settings, &url);
             emit_test(&app, &url, "done", Some(&r));
@@ -251,6 +246,24 @@ pub async fn test_network(
     })
     .await
     .map_err(|e| AppError::Io(format!("测试任务异常: {e}")))?
+}
+
+#[tauri::command]
+pub fn network_targets(settings: AppSettings) -> AppResult<Vec<String>> {
+    let mut targets = vec![];
+    if proxy_url(&settings).is_some() {
+        targets.push("https://www.google.com/".into());
+    }
+    targets.push("https://auth.docker.io/token".into());
+    targets.push("https://registry-1.docker.io/v2/".into());
+    for mirror in settings.registry_mirrors {
+        let host = crate::validation::normalize_host(&mirror)?;
+        let url = format!("https://{host}/v2/");
+        if !targets.contains(&url) {
+            targets.push(url);
+        }
+    }
+    Ok(targets)
 }
 
 pub fn curl_command(settings: &AppSettings) -> std::process::Command {
@@ -277,18 +290,21 @@ pub fn download(
     if !url.starts_with("https://") {
         return Err(AppError::Invalid("下载必须使用 HTTPS".into()));
     }
-    let out = curl_command(settings)
-        .args([
-            "-fsSL",
-            "--retry",
-            "2",
-            "--max-time",
-            &timeout.to_string(),
-            "-o",
-        ])
-        .arg(path)
-        .arg(url)
-        .output()?;
+    let out = crate::tasks::output(
+        curl_command(settings)
+            .args([
+                "-fsSL",
+                "--retry",
+                "2",
+                "--max-time",
+                &timeout.to_string(),
+                "-o",
+            ])
+            .arg(path)
+            .arg(url),
+        std::time::Duration::from_secs(timeout.saturating_mul(3) + 30),
+        None,
+    )?;
     if !out.status.success() {
         let _ = std::fs::remove_file(path);
         return Err(AppError::Io(format!(

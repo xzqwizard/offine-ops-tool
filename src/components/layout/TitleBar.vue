@@ -2,8 +2,8 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { useProjectStore } from '@/stores/project'
-import { useBuildTaskStore } from '@/stores/buildTask'
-import { ElMessage } from 'element-plus'
+import { useTaskStore } from '@/stores/tasks'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { toAppError } from '@/api/backend'
 import pkg from '../../../package.json'
 import ThemeSwitcher from './ThemeSwitcher.vue'
@@ -36,14 +36,29 @@ onMounted(async () => {
     event.preventDefault()
     if (closing) return
     closing = true
+    const tasks = useTaskStore()
+    tasks.closing = true
     try {
-      if (useBuildTaskStore().busy) ElMessage.info('等待构建任务结束后关闭')
-      await useBuildTaskStore().waitForIdle()
+      if (tasks.busy) {
+        try {
+          await ElMessageBox.confirm(`还有 ${tasks.active.length} 个任务运行。等待完成后关闭，或取消任务后关闭。`, '关闭应用', { confirmButtonText: '等待完成', cancelButtonText: '取消任务并关闭', distinguishCancelAndClose: true })
+          await tasks.waitForIdle()
+        } catch (action) {
+          if (action === 'close') return
+          if (action !== 'cancel') throw action
+          await tasks.cancelAll()
+        }
+      }
       await useProjectStore().flushPending()
       allowClose = true
       await appWindow?.close()
-    } catch (e) { ElMessage.error(`关闭前保存失败: ${toAppError(e).message}`) }
-    finally { closing = false }
+    } catch (e) {
+      allowClose = false
+      ElMessage.error(`关闭前保存失败: ${toAppError(e).message}`)
+    } finally {
+      closing = false
+      if (!allowClose) tasks.closing = false
+    }
   })
   if (disposed) closeUnlisten()
   try {

@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import type { Project } from '@/types/project'
-const mocks = vi.hoisted(() => ({ load: vi.fn(), save: vi.fn(), list: vi.fn(), build: vi.fn(), listen: vi.fn() }))
-vi.mock('@/api/backend', () => ({ backend: { loadProject: mocks.load, saveProject: mocks.save, listProjects: mocks.list, buildOfflinePackage: mocks.build }, toAppError: (e: unknown) => e instanceof Error ? e : new Error(String(e)) }))
+const mocks = vi.hoisted(() => ({ load: vi.fn(), save: vi.fn(), list: vi.fn(), build: vi.fn(), listen: vi.fn(), cancel: vi.fn() }))
+vi.mock('@/api/backend', () => ({ backend: { loadProject: mocks.load, saveProject: mocks.save, listProjects: mocks.list, buildOfflinePackage: mocks.build, cancelTask: mocks.cancel }, toAppError: (e: unknown) => e instanceof Error ? e : new Error(String(e)) }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: mocks.listen }))
 import { useProjectStore } from '@/stores/project'
 import { useBuildTaskStore } from '@/stores/buildTask'
@@ -11,6 +11,7 @@ import { isIpv4 } from '@/utils/validate'
 import { applyInstanceTemplate, replaceInstance } from '@/utils/projectDraft'
 import type { MiddlewareTemplate } from '@/types/catalog'
 import { platformMatches } from '@/utils/platform'
+import { useTaskStore } from '@/stores/tasks'
 function project(id: string): Project { return { schemaVersion: 1, id, name: id, customer: '', createdAt: '', updatedAt: '', buildConfig: { packageFormat: 'dir', recompressImages: false, sign: false }, servers: [], instances: [], networkRules: [], registry: null } }
 function deferred<T>() { let resolve!: (v: T) => void; const promise = new Promise<T>(r => { resolve = r }); return { promise, resolve } }
 beforeEach(() => {
@@ -20,6 +21,7 @@ beforeEach(() => {
   mocks.list.mockResolvedValue([])
   mocks.save.mockImplementation(async p => p)
   mocks.listen.mockResolvedValue(() => undefined)
+  mocks.cancel.mockResolvedValue(undefined)
 })
 describe('project persistence', () => {
   it('keeps the latest project when loads finish in reverse order', async () => {
@@ -113,6 +115,48 @@ it('isolates batch instance settings and detaches shared settings without changi
   expect(p.templateSnapshots.find(t => t.id === edited.templateId)?.dataVolume).toBe('/new-data')
   p.instances[0] = edited
   expect(applyInstanceTemplate(p, [edited], { ...template, id: edited.templateId })[0].templateId).toBe(edited.templateId)
+})
+it('retains global task state, rejects duplicates, and filters foreign events', async () => {
+  const job = deferred<string>(); let receive!: (event: any) => void
+  mocks.listen.mockImplementation(async (_name, callback) => { receive = callback; return () => undefined })
+  const tasks = useTaskStore()
+  const run = tasks.run('download', 'test download', { arch: 'amd64' }, ['progress'], async () => job.promise)
+  await vi.waitFor(() => expect(mocks.listen).toHaveBeenCalledOnce())
+  expect(() => tasks.run('download', 'duplicate', {}, [], async () => '')).toThrow('正在运行')
+  const id = tasks.records[0].id
+  receive({ payload: { taskId: 'foreign', detail: 'ignore' } }); expect(tasks.records[0].logs).toEqual([])
+  receive({ payload: { taskId: id, step: 'copy', detail: 'own progress' } }); expect(tasks.records[0].logs).toEqual(['copy: own progress'])
+  await tasks.cancel(id); expect(mocks.cancel).toHaveBeenCalledWith(id)
+  job.resolve('done'); await run
+  expect(tasks.records[0].status).toBe('complete'); expect(tasks.records[0].result).toBe('done'); expect(tasks.busy).toBe(false)
+})
+it('keeps a long-running task tracked when completed task history reaches its limit', async () => {
+  const tasks = useTaskStore(), job = deferred<string>()
+  const running = tasks.run('long-download', 'long download', {}, [], async () => job.promise)
+  const id = tasks.records[0].id
+  for (let n = 0; n < 55; n++) await tasks.run('short-query', 'short query', {}, [], async () => n)
+  expect(tasks.records).toHaveLength(50)
+  expect(tasks.active.map(t => t.id)).toEqual([id])
+  expect(tasks.busy).toBe(true)
+  await tasks.cancel(id)
+  expect(mocks.cancel).toHaveBeenCalledWith(id)
+  expect(tasks.active[0].status).toBe('cancelling')
+  job.resolve('done'); await running
+  expect(tasks.records).toHaveLength(50)
+  expect(tasks.busy).toBe(false)
+})
+it('blocks new tasks during window shutdown while allowing existing jobs to finish or cancel', async () => {
+  const tasks = useTaskStore(), job = deferred<string>()
+  const running = tasks.run('download', 'download', {}, [], async () => job.promise)
+  const id = tasks.records[0].id
+  tasks.closing = true
+  expect(() => tasks.run('new-query', 'new query', {}, [], async () => '')).toThrow('正在关闭')
+  await tasks.cancel(id)
+  expect(mocks.cancel).toHaveBeenCalledWith(id)
+  job.resolve('done'); await tasks.waitForIdle(); await running
+  tasks.closing = false
+  await tasks.run('new-query', 'new query', {}, [], async () => 'resumed')
+  expect(tasks.records[0].result).toBe('resumed')
 })
 it('runs one immutable build and filters progress by task and project', async () => {
   const pending = deferred<any>(); mocks.build.mockReturnValue(pending.promise)

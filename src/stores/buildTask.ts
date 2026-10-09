@@ -1,9 +1,9 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { listen } from '@tauri-apps/api/event'
+import { useTaskStore } from '@/stores/tasks'
 import { backend } from '@/api/backend'
 import type { Project } from '@/types/project'
-import type { BuildResult, BuildProgressEvent } from '@/types/build'
+import type { BuildResult } from '@/types/build'
 
 export const useBuildTaskStore = defineStore('buildTask', () => {
   const busy = ref(false)
@@ -13,23 +13,21 @@ export const useBuildTaskStore = defineStore('buildTask', () => {
     if (busy.value) throw new Error('已有构建任务运行')
     busy.value = true
     const snapshot: Project = JSON.parse(JSON.stringify(project))
-    const taskId = crypto.randomUUID()
     const record = { logs: [] as string[], result: null as BuildResult | null }
     records.value[snapshot.id] = record
     pending = (async () => {
-      let unlisten: (() => void) | undefined
       try {
-        await prepare?.()
-        unlisten = await listen<BuildProgressEvent>('build-progress', ({ payload }) => {
-          if (payload.taskId === taskId && payload.projectId === snapshot.id) {
+        const result = await useTaskStore().run('build', `构建：${snapshot.name}`, { projectId: snapshot.id, baseline }, ['build-progress'], async taskId => {
+          await prepare?.()
+          return backend.buildOfflinePackage(snapshot, autoPull, baseline, taskId)
+        }, payload => {
+          if (payload.projectId === snapshot.id) {
             records.value[snapshot.id].logs.push(`${payload.step}: ${payload.detail}`)
           }
         })
-        const result = await backend.buildOfflinePackage(snapshot, autoPull, baseline, taskId)
         records.value[snapshot.id].result = result
         return result
       } finally {
-        unlisten?.()
         busy.value = false
         pending = null
       }
