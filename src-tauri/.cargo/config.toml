@@ -1,7 +1,6 @@
 # windows-gnu 工具链链接方案（lld）说明：
-# 本机 WinLibs GCC 16.1 的 GNU ld 2.47 链接的大型测试二进制存在
-# "stdout 为管道时进程以 STATUS_ENTRYPOINT_NOT_FOUND 退出"的工具链级问题，
-# rust-lld 更严格可靠（且会暴露资源重复错误），故统一用 lld 链接。
+# 部分 MinGW GNU ld 组合在大型测试二进制上存在启动兼容性问题，
+# 此配置使用 rust-lld（同时检查重复资源）。MSVC 发布使用标准 Cargo 配置。
 # - lld 禁止重复资源：gcc specs 默认注入 default-manifest.o 会与 Tauri 内嵌
 #   清单冲突，build.rs 注入 -specs= 指向 .cargo/mingw-specs-nodm.txt
 #   （由 `gcc -dumpspecs` 去除 default-manifest 注入生成）规避。

@@ -21,6 +21,24 @@ build-out/
 # Logs
 *.log
 
+# Local application data and CLI output
+/data/
+/build-cli-result.txt
+
+# Local credentials; publish placeholders only
+.env
+.env.*
+!.env.example
+!.env.*.example
+.git-credentials
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+/.secrets/
+
 # 工具链
 .zcodeignore
 

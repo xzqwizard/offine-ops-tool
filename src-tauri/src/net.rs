@@ -8,7 +8,7 @@ use tauri::{AppHandle, Emitter};
 /// 统一的外网访问入口：所有 HTTP 请求走系统 curl（自动应用代理设置），
 /// 所有外部子进程（crane 等）注入标准代理环境变量。
 ///
-/// 解析生效的代理 URL，如 `http://127.0.0.1:7890`、`socks5h://user:pass@host:port`。
+/// 解析生效的代理 URL，如 `http://proxy.example.com:8080`、`socks5h://user:pass@host:port`。
 /// 未启用或配置不完整返回 None（直连）。用户名/密码做百分号编码（含 @:/# 等字符的
 /// 密码不编码会生成非法 URL）。
 pub fn proxy_url(settings: &AppSettings) -> Option<String> {
