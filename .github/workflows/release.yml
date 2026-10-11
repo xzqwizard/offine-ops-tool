@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已存在的版本标签（如 v0.2.0）；留空只构建当前分支，不发布 Release'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      publish: ${{ steps.version.outputs.publish }}
+    env:
+      # MSVC 静态 CRT，便携包无需额外安装 VC++ Redistributable。
+      RUSTFLAGS: '-C target-feature=+crt-static'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.17.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Check release version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag || '' }}
+        run: |
+          if ($env:RELEASE_TAG) {
+            $metadata = node scripts/release-version.mjs check $env:RELEASE_TAG
+          } else {
+            $metadata = node scripts/release-version.mjs check
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Release version check failed.' }
+          $metadata = $metadata | ConvertFrom-Json
+          "version=$($metadata.version)" >> $env:GITHUB_OUTPUT
+          "tag=$($metadata.tag)" >> $env:GITHUB_OUTPUT
+          "prerelease=$($metadata.prerelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "publish=$(([bool]$env:RELEASE_TAG).ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: Use hosted-runner Cargo defaults
+        # 此文件是本地 MinGW 链接和国内镜像配置；GitHub 使用标准 MSVC 和 crates.io。
+        run: Remove-Item -LiteralPath src-tauri/.cargo/config.toml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile --registry https://registry.npmjs.org
+      - name: Test frontend
+        run: pnpm test
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - name: Lint Rust
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc
+      - name: Build offline installer
+        run: pnpm tauri build --ci --target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.release.conf.json -- --locked
+      - name: Package release assets
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/package-release.ps1 -Version $env:RELEASE_VERSION
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-${{ steps.version.outputs.tag }}
+          path: |
+            out/release/*-setup.exe
+            out/release/*-portable.zip
+            out/release/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.build.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-${{ needs.build.outputs.tag }}
+          path: release
+      - name: Verify asset checksums
+        working-directory: release
+        run: sha256sum --check SHA256SUMS.txt
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          RELEASE_PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          if draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft); then
+            if [ "$draft" != "true" ]; then
+              echo "Release $RELEASE_TAG is already published; use a new version tag."
+              exit 1
+            fi
+          else
+            args=(--draft --verify-tag --title "OfflinePreOpsTool $RELEASE_TAG" --notes-file .github/RELEASE_NOTES.md --generate-notes)
+            if [ "$RELEASE_PRERELEASE" = "true" ]; then args+=(--prerelease); fi
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "${args[@]}"
+          fi
+          gh release upload "$RELEASE_TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
+          latest=true
+          if [ "$RELEASE_PRERELEASE" = "true" ]; then latest=false; fi
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft=false --prerelease="$RELEASE_PRERELEASE" --latest="$latest"

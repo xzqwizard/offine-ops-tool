@@ -32,6 +32,10 @@ cargo test --locked
 
 GitHub Actions 的 `.github/workflows/verify.yml` 在 Ubuntu 上分别执行 network、operations、identity 真实 Docker 场景，覆盖部署重跑、来源允许/拒绝与持久化、PostgreSQL SQL 冷备/恢复、改名升级及回滚、同 tag 内容并存与 tag 漂移恢复。审查修复已按功能点分批提交并推送至 `origin/main`；新工作流的远端状态以 [GitHub Actions](https://github.com/xzqwizard/offine-ops-tool/actions/workflows/verify.yml) 对应提交的结果为准。本次目标 Linux 隔离验收见审查报告。其它数据库、中间件、国产 OS/架构与生产防火墙后端仍需对应环境专项验收。
 
+## 版本发布
+
+推送与应用版本一致的 `vX.Y.Z` 标签后，GitHub Actions 自动生成 Windows x64 安装包（内置 WebView2 离线安装程序）、便携 ZIP 和 SHA256 校验文件，并发布到 [GitHub Releases](https://github.com/xzqwizard/offine-ops-tool/releases)。用 `pnpm release:version 0.2.0` 同步版本号，提交并推送后再推送 `v0.2.0` 标签。预发布标签如 `v0.3.0-rc.1` 自动标记为 Pre-release。首次启用、无发布试构建和完整发版步骤见 [版本发布指南](docs/版本发布.md)。
+
 ## RPM/DEB 材料声明
 
 导入每个本地 RPM/DEB 时，在同目录提供 `<文件名>.pkg.json`。每个文件独立声明；同一 Docker 版本及 OS 的材料需包括 `engine`、`cli`、`containerd` 三类角色，其他依赖填 `dependency`。`engineVersion` 是精确匹配的 Docker 版本；附件组的 `dockerVersion` 填 `deps`。SHA256 填实际文件的 64 位十六进制值。
