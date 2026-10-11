@@ -8,7 +8,7 @@ const lockVersion = /(^\[\[package\]\]\r?\nname = "offline-preops-tool"\r?\nvers
 
 function validateVersion(version) {
   const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(version)
-  if (!match || match.slice(1, 4).some(part => Number(part) > 65535)) {
+  if (!match || match[0] !== version || match.slice(1, 4).some(part => Number(part) > 65535)) {
     throw new Error('版本号须为 X.Y.Z 或 X.Y.Z-rc.1，各数字不超过 65535，不支持构建元数据。')
   }
   if (match[4]?.split('.').some(part => /^\d+$/.test(part) && part.length > 1 && part.startsWith('0'))) {
