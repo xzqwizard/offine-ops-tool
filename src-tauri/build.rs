@@ -1,18 +1,21 @@
 fn main() {
-    // 主程序不使用 Tauri 内嵌 manifest（new_without_app_manifest），
+    // Windows 主程序不使用 Tauri 内嵌 manifest（new_without_app_manifest），
     // 改为下方全局注入统一清单：否则仅 bin 有 manifest，而 lib 单元测试/
     // 集成测试/示例产物缺失清单时，加载器绑定 comctl32 5.82，缺少
     // TaskDialogIndirect 等入口 → 进程以 STATUS_ENTRYPOINT_NOT_FOUND 静默失败。
     let target = std::env::var("TARGET").unwrap_or_default();
     let gnu = target.contains("windows-gnu");
-    let attrs = if gnu {
+    let msvc = target.contains("windows-msvc");
+    let attrs = if gnu || msvc {
         tauri_build::Attributes::default()
             .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest())
     } else {
         tauri_build::Attributes::default()
     };
     tauri_build::try_build(attrs).expect("tauri_build failed");
-    if target.contains("windows-msvc") {
+    if msvc {
+        // 与 GNU 一样只注入一份清单，避免 Tauri 资源与链接器生成的
+        // MANIFEST:EMBED 同时包含资源 ID 1，触发 CVT1100/LNK1123。
         println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
         println!("cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'");
     }
