@@ -8,8 +8,8 @@ pub fn bash() -> String {
     candidates.extend(
         [
             "D:/Environment/Git/usr/bin/bash.exe",
-            "C:/Program Files/Git/bin/bash.exe",
             "C:/Program Files/Git/usr/bin/bash.exe",
+            "C:/Program Files/Git/bin/bash.exe",
             "/bin/bash",
         ]
         .map(str::to_string),
@@ -29,7 +29,9 @@ pub fn bash() -> String {
             Path::new(p).is_file()
                 && Command::new(p)
                     .arg("-c")
-                    .arg("command -v tar sha256sum awk >/dev/null && uname -s")
+                    // Git's bin/bash.exe launcher prepends system directories to PATH,
+                    // hiding fixture commands such as id/docker. Require the real Bash.
+                    .arg("test \"$PATH\" = /usr/bin:/bin && command -v tar sha256sum awk >/dev/null && uname -s")
                     .env("PATH", "/usr/bin:/bin")
                     .output()
                     .is_ok_and(|o| {
@@ -40,5 +42,5 @@ pub fn bash() -> String {
                                 || kernel.starts_with("MSYS"))
                     })
         })
-        .expect("Bash 测试未执行：Windows 需 Git Bash/coreutils（WSL 启动器不兼容 Windows 路径），或设置 PREOPS_BASH；不能静默跳过")
+        .expect("Bash 测试未执行：Windows 需 Git usr/bin/bash.exe/coreutils（bin/bash.exe 启动器会重排 PATH，WSL 启动器不兼容 Windows 路径），或设置 PREOPS_BASH；不能静默跳过")
 }
