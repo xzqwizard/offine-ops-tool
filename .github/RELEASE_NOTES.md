@@ -7,3 +7,7 @@
 程序内置中间件目录和部署脚本模板；crane、Docker 安装材料和业务镜像需在应用中另行准备。安装包内置的 WebView2 用于桌面程序界面，与应用生成的 Linux 离线部署包无关。
 
 当前安装包未做 Windows 代码签名。版本升级前建议通过设置中的备份功能保存应用数据。
+
+应用数据备份不含镜像、安装材料、构建产物或现场业务数据；备份/导出排除被识别的密码，但仍可能含项目名称、地址、用户名和路径。换机器或 Windows 用户后需重新填写密码。部署包包含实际运行参数与密码，请保护其访问权限。
+
+使用指南见 [项目 README](https://github.com/xzqwizard/offine-ops-tool#readme)，分享日志或示例前请阅读 [数据与隐私说明](https://github.com/xzqwizard/offine-ops-tool/blob/main/docs/数据与隐私.md)。

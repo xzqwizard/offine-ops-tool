@@ -11,7 +11,7 @@ const PROJECT_FILE: &str = "project.json";
 // ==================== 路径解析 ====================
 
 /// 软件所在目录（便携式布局）：数据跟随程序目录而非用户目录，
-/// 整个目录拷走即迁移。开发模式下位于 target/<profile>/。
+/// 开发模式下位于 target/<profile>/；跨机器迁移需处理自定义根和 DPAPI 凭据。
 fn app_base_dir() -> AppResult<PathBuf> {
     let exe =
         std::env::current_exe().map_err(|e| AppError::Io(format!("无法定位程序位置: {e}")))?;

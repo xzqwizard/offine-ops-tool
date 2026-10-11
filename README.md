@@ -1,64 +1,75 @@
 # OfflinePreOpsTool
 
-Windows 桌面工具，用于整理服务器/中间件方案，准备 Docker 安装材料和镜像，在有外网的办公机生成每台服务器的离线全量包或增量升级包。目标 Linux 主机使用包内脚本部署、巡检、冷备份和恢复。
+Windows 桌面工具，用于在联网电脑上整理服务器与中间件方案，准备镜像和 Docker 安装材料，为每台 Linux 服务器生成离线部署包。目标机通过包内脚本完成部署、状态检查、冷备份、恢复及增量升级。
 
-## 当前能力
+## 下载与运行
 
-| 环节 | 当前实现 | 验证边界 |
+从 [GitHub Releases](https://github.com/xzqwizard/offine-ops-tool/releases) 下载已发布版本；若列表为空，表示尚未发布可下载版本。
+
+| 文件 | 使用方式 |
+|---|---|
+| `*-setup.exe` | Windows 10/11 x64 安装包，内置 WebView2 离线安装程序 |
+| `*-portable.zip` | 完整解压到可写目录，运行 `OfflinePreOpsTool.exe`；需已安装 WebView2 Runtime |
+| `SHA256SUMS.txt` | 用 `Get-FileHash <文件路径> -Algorithm SHA256` 核对下载文件 |
+
+程序内置中间件目录和部署模板；crane、Docker/Compose 安装材料、业务镜像需另行准备。当前 Windows 包未配置代码签名，应用内自动更新尚未实现。
+
+## 基本流程
+
+1. 新建方案，填写服务器的 IPv4、OS/版本、架构、资源、Docker 版本及目录。
+2. 从内置目录或自定义配置添加中间件，配置持久化目录、参数、发布端口和访问来源。
+3. 在镜像库安装 crane 并拉取镜像，或导入可信的 `docker save` 归档；为每种目标环境准备 Docker 与 Compose 材料。
+4. 通过校验后构建全量包，将对应服务器的包和校验文件传入目标环境。
+5. 在目标机按包内 `README.md` 核验 SHA256 并部署；日常操作见包内 `docs/OPS-GUIDE.md`。
+
+增量升级需选择已成功构建、与现场部署一致的基线。旧部署的数据目录和材料兼容处理见 [迁移与材料准备指南](docs/迁移与材料准备指南-2026-10-09.md)。
+
+## 能力与边界
+
+| 环节 | 已实现能力 | 使用边界 |
 |---|---|---|
-| 方案和中间件目录 | 导入、复制、模板冻结、后端校验；本机凭据用 Windows DPAPI 加密 | 便携导出、ZIP 备份、构建快照不含仓库/代理/中间件密码；导入后需重新填写 |
-| 镜像 | 按来源/平台/digest 隔离缓存，验证 tar 标签、平台、层和校验和；缺镜像阻断构建 | 在线拉取需要 crane；本地 docker-save tar 不能证明远端仓库 digest |
-| 安装材料 | amd64/arm64 官方静态包与 Compose 在线下载；RPM/DEB 需同 OS、版本、架构和组件声明；其它架构手工导入 | 导入静态包校验 ELF；信创发行版、内核和包依赖需在目标机验收 |
-| 构建和现场脚本 | 完整包门禁、稳定身份、SHA256、升级前冷备、失败自动回退、按来源限制 Docker 端口 | Linux 目标机已验证 TCP 来源限制及 PostgreSQL 恢复/升级/回滚；其它中间件需专项验收 |
-| 签名 | 尚未实现 | 开启签名的方案会被后端拒绝，不能误标为已签名交付 |
+| 方案与目录 | 导入、复制、模板冻结、自动保存、后端校验 | 导出/恢复后需重新填写密码 |
+| 镜像 | 按来源、平台、digest 隔离缓存，校验标签、config、层和归档 | 在线拉取使用 crane；本地 tar 不能证明远端 digest |
+| 安装材料 | amd64/arm64 官方静态 Docker 与 Compose 下载；声明式 RPM/DEB 导入 | 其它架构需手工准备；发行版依赖需在目标环境验收 |
+| 构建与运维 | 完整性门禁、稳定实例身份、SHA256、冷备恢复、升级失败自动回退 | 无探针仅检查稳定运行；备份不含容器可写层及匿名卷 |
+| 网络规则 | Docker IPv4 iptables 下按来源限制发布端口 | 需显式执行 `apply-firewall.sh --apply`；原生 Docker nftables 不支持 |
+| 签名 | 尚未实现，启用签名会拒绝构建 | SHA256 校验不能替代签名和来源认证 |
 
-本次审查、修复映射和验收证据见 [代码审查与业务闭环核查-2026-10-09](docs/代码审查与业务闭环核查-2026-10-09.md)。旧部署/安装材料的兼容处理见 [迁移与材料准备指南](docs/迁移与材料准备指南-2026-10-09.md)，当前能力见 [功能清单](docs/功能清单.md)。2026-10-02 报告保留历史记录。
+配置支持 amd64、arm64、loongarch64、mips64el、sw64；实际可用性取决于目标镜像、安装材料、OS 与内核。Linux CI 覆盖 TCP 来源限制及 PostgreSQL 备份、恢复、升级、回滚、镜像身份场景，其它中间件和平台需专项验证。
 
-## 开发和验证
+## 数据与隐私
 
-Windows 开发机需要 Node 22、pnpm 10、Rust 1.97.1、Tauri 2 的系统依赖。当前仓库的 Windows GNU 构建使用 MinGW windres、GCC specs、rust-lld 和 WebView2；`src-tauri/.cargo/config.toml` 说明了本机链接设置。MSVC 与 Linux 走标准 Tauri 构建路径。Linux CI 另需 WebKitGTK 4.1、GTK、librsvg、appindicator 等系统包。
+默认配置和数据位于程序旁的 `data/`，五类存储根可分别调整。本机仓库/代理密码及被识别为秘密的中间件参数使用 Windows DPAPI，与 Windows 用户绑定；换机器不能依赖直接复制密文恢复凭据。
+
+方案导出、ZIP 数据备份和构建快照会排除上述密码，但仍可能包含项目/客户名称、服务器地址、仓库地址、用户名和本地路径。**部署包的 Compose 含运行所需密码；部署包及业务备份应按敏感材料管理。** 提交 Issue、日志或示例前请按 [数据与隐私说明](docs/数据与隐私.md) 手动检查。
+
+## 文档
+
+- [使用说明](docs/项目说明.md)：首次使用、构建、现场操作及数据管理。
+- [功能清单](docs/功能清单.md)：各模块的具体行为和限制。
+- [迁移与材料准备](docs/迁移与材料准备指南-2026-10-09.md)：旧部署迁移、材料声明与故障恢复。
+- [项目结构](docs/项目结构.md) / [架构设计](docs/方案设计.md)：源码职责、数据流与设计约定。
+- [版本发布](docs/版本发布.md)：维护者的标签发版与试构建流程。
+- 历史审查：[2026-10-02](docs/代码审查与业务闭环核查-2026-10-02.md)、[2026-10-09](docs/代码审查与业务闭环核查-2026-10-09.md)。报告前部是当时快照，后续修复见各报告记录。
+
+## 开发与验证
+
+需要 Node.js 22、pnpm 10、Rust 1.97.1 和 [Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/)。Windows 发布使用 MSVC；开发环境及 GNU 工具链说明见 [项目结构](docs/项目结构.md)。
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm test
 pnpm build
-cd src-tauri
-cargo fmt -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml --locked
+pnpm tauri dev
 ```
 
-本地桌面运行：`pnpm tauri dev`。前端单独用 `pnpm dev` 可预览界面，但 Tauri 命令不会在普通浏览器中执行。
+`pnpm dev` 可在浏览器预览前端，桌面命令需 Tauri 环境。[Verify 工作流](https://github.com/xzqwizard/offine-ops-tool/actions/workflows/verify.yml) 执行代码检查、依赖审计及独立 Linux Docker 场景；Windows 包由 [Release 工作流](https://github.com/xzqwizard/offine-ops-tool/actions/workflows/release.yml) 构建。验证结果以对应提交的运行记录为准。
 
-GitHub Actions 的 `.github/workflows/verify.yml` 在 Ubuntu 上分别执行 network、operations、identity 真实 Docker 场景，覆盖部署重跑、来源允许/拒绝与持久化、PostgreSQL SQL 冷备/恢复、改名升级及回滚、同 tag 内容并存与 tag 漂移恢复。审查修复已按功能点分批提交并推送至 `origin/main`；新工作流的远端状态以 [GitHub Actions](https://github.com/xzqwizard/offine-ops-tool/actions/workflows/verify.yml) 对应提交的结果为准。本次目标 Linux 隔离验收见审查报告。其它数据库、中间件、国产 OS/架构与生产防火墙后端仍需对应环境专项验收。
+## 版本发布与许可
 
-## 版本发布
+维护者用 `pnpm release:version <版本>` 同步应用版本，提交代码并确认 Verify 成功后，推送对应 `vX.Y.Z` 标签。工作流自动构建 Windows x64 安装包、便携 ZIP 和 SHA256 文件并发布 Release；带预发布后缀的标签标记为 Pre-release。详细步骤见 [版本发布指南](docs/版本发布.md)。
 
-推送与应用版本一致的 `vX.Y.Z` 标签后，GitHub Actions 自动生成 Windows x64 安装包（内置 WebView2 离线安装程序）、便携 ZIP 和 SHA256 校验文件，并发布到 [GitHub Releases](https://github.com/xzqwizard/offine-ops-tool/releases)。用 `pnpm release:version 0.2.0` 同步版本号，提交并推送后再推送 `v0.2.0` 标签。预发布标签如 `v0.3.0-rc.1` 自动标记为 Pre-release。首次启用、无发布试构建和完整发版步骤见 [版本发布指南](docs/版本发布.md)。
-
-## RPM/DEB 材料声明
-
-导入每个本地 RPM/DEB 时，在同目录提供 `<文件名>.pkg.json`。每个文件独立声明；同一 Docker 版本及 OS 的材料需包括 `engine`、`cli`、`containerd` 三类角色，其他依赖填 `dependency`。`engineVersion` 是精确匹配的 Docker 版本；附件组的 `dockerVersion` 填 `deps`。SHA256 填实际文件的 64 位十六进制值。
-
-```json
-{
-  "arch": "amd64",
-  "kind": "deb",
-  "dockerVersion": "27.5.1",
-  "engineVersion": "27.5.1",
-  "osFamily": "ubuntu",
-  "osVersion": "24.04",
-  "sha256": { "docker-ce_27.5.1_amd64.deb": "<64位十六进制 SHA256>" },
-  "components": { "docker-ce_27.5.1_amd64.deb": "engine" }
-}
-```
-
-文件名不符合官方惯例时由声明确定类型、版本和角色；不匹配的 OS、组件不齐或校验失败会阻断全量包构建。官方静态包与 Compose 插件仍可通过应用下载；在线源暂仅提供 amd64/arm64。其它架构必须准备并验证对应的 64 位 Linux 静态包、Compose 插件或同发行版原生包。
-
-## 交付约束
-
-全量包每台服务器包含 `manifest.json`、`SHA256SUMS`、`deployment.env`、`docker-offline/`、`images/`、`stack/`、`scripts/` 和 `docs/`。运行镜像引用按实际 config SHA256 隔离，数据绑定目录按稳定实例 ID；manifest 同时记录原始来源和存储契约。增量包包含新编排/脚本/文档及变化镜像，必须绑定当前已部署构建号。旧基线、跨服务器移动或持久化兼容性变化需要显式迁移。失败构建不能作为升级基线。打包模式默认快速 gzip；目录模式保留各服务器自身的 `SHA256SUMS`，不生成外层 `SHA256SUMS.all`。
-
-Linux 现场按包内 `README.md` 和 `docs/OPS-GUIDE.md` 操作。冷备按实际容器镜像 ID 和停止后的绑定目录制作并校验；恢复核对镜像及健康，保留恢复前目录。防火墙需 Docker IPv4 iptables `DOCKER-USER` 接入 FORWARD，同时覆盖宿主 INPUT 的代理路径；需单独执行 `--apply`，原生 Docker nftables 不支持。无来源规则的清单发布端口拒绝外部新连接，本机访问保留。预检在安装前进行，已有 Docker 不覆盖或重配。
-
-下载、构建和迁移纳入全局任务，支持跨页追踪、去重、取消及子进程截止时间。设置提供“复制并切换”存储根，校验后发布并保留旧根；普通保存仅切换目录。Compose 手工材料需要完整 `.compose.json` 声明，详见迁移指南。
+本项目采用 [Apache License 2.0](LICENSE)。

@@ -25,8 +25,8 @@ import type {
 } from '@/types/dockerPkgs'
 
 /**
- * 后端适配层：前端唯一的后端调用入口。
- * 若未来切换桌面框架（如 Electron），仅需替换此文件实现。
+ * Tauri invoke 封装：前端统一的后端调用入口。
+ * 修改命令签名时需同步 Rust 注册和前端类型。
  */
 export const backend = {
   async validateProject(project: Project): Promise<import('@/utils/validate').ValidationIssue[]> {
